@@ -1,0 +1,54 @@
+[project]
+name = "meteora-volume-bot"
+version = "0.1.0"
+description = "Research and controlled execution system for Meteora DLMM pools"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic>=1.17,<2",
+    "asyncpg>=0.30,<1",
+    "fastapi>=0.115,<0.300",
+    "httpx>=0.28,<1",
+    "jinja2>=3.1,<4",
+    "orjson>=3.10,<4",
+    "prometheus-client>=0.21,<1",
+    "pydantic>=2.10,<3",
+    "pyyaml>=6,<7",
+    "sqlalchemy[asyncio]>=2.0,<3",
+    "structlog>=24.4,<26",
+    "tenacity>=9,<10",
+    "uvicorn[standard]>=0.34,<1",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15,<2",
+    "pytest>=8.3,<10",
+    "ruff>=0.11,<1",
+    "types-pyyaml>=6.0,<7",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["src"]
+
+[tool.alembic]
+script_location = "%(here)s/migrations"
+prepend_sys_path = ["."]

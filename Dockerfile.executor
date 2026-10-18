@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:22-bookworm-slim AS build
+
+WORKDIR /app
+COPY executor/package.json executor/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY executor/tsconfig.json ./
+COPY executor/src ./src
+RUN npm run build
+
+FROM node:22-bookworm-slim
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+COPY --chown=node:node executor/package.json executor/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts
+COPY --from=build --chown=node:node /app/dist ./dist
+
+USER node
+EXPOSE 3000
+CMD ["npm", "start"]

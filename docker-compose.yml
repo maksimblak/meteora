@@ -1,0 +1,104 @@
+name: meteora-volume-bot
+
+x-python-service: &python-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: &python-environment
+    APP_ENV: development
+    DATABASE_URL: postgresql+asyncpg://meteora@postgres:5432/meteora
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: meteora
+      POSTGRES_USER: meteora
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meteora -d meteora"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  migrate:
+    <<: *python-service
+    command: ["uv", "run", "alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *python-service
+    command:
+      - uv
+      - run
+      - uvicorn
+      - src.core.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  worker:
+    <<: *python-service
+    command: ["uv", "run", "python", "-m", "src.core.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  executor:
+    profiles: ["live"]
+    build:
+      context: .
+      dockerfile: Dockerfile.executor
+    expose:
+      - "3000"
+
+  check:
+    <<: *python-service
+    profiles: ["test"]
+    environment:
+      <<: *python-environment
+      TEST_DATABASE_URL: postgresql+asyncpg://meteora@postgres:5432/meteora
+    command:
+      - sh
+      - -ec
+      - |
+        umask 077
+        printf '%s' "$${DATABASE_URL}" > /tmp/database-url
+        export DATABASE_URL_FILE=/tmp/database-url
+        unset DATABASE_URL
+        uv run alembic upgrade head
+        uv run alembic upgrade head
+        uv run ruff check src tests migrations
+        uv run mypy src
+        uv run pytest -q -p no:cacheprovider --basetemp /tmp/pytest
+        npm run check --prefix executor
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
