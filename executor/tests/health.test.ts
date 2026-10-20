@@ -21,4 +21,22 @@ describe("executor health", () => {
     expect(ready.statusCode).toBe(503);
     expect(ready.json()).toEqual({ status: "not_ready" });
   });
+
+  it("keeps LIVE unready without a dedicated RPC and wallet", async () => {
+    const server = buildServer(
+      { logger: false },
+      {
+        configuredMode: "LIVE",
+        internalToken: "internal-token",
+        modeToken: "mode-token",
+        liveDependenciesReady: false,
+      },
+    );
+    servers.push(server);
+
+    const ready = await server.inject({ method: "GET", url: "/health/ready" });
+
+    expect(ready.statusCode).toBe(503);
+    expect(ready.json()).toEqual({ status: "not_ready" });
+  });
 });

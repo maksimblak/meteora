@@ -1,0 +1,170 @@
+import { afterEach, describe, expect, it } from "vitest";
+
+import { parseDlmmCommandV1, type DlmmCommandV1 } from "../src/contracts.js";
+import {
+  ExecutionEngine,
+  type LivePromotionEvidence,
+  type BuiltCommand,
+  type RpcTransport,
+  type SdkBoundary,
+} from "../src/engine.js";
+import { buildServer } from "../src/server.js";
+
+const servers: Array<ReturnType<typeof buildServer>> = [];
+const commandId = "10000000-0000-4000-8000-000000000001";
+const livePromotion: LivePromotionEvidence = {
+  promotionId: "50000000-0000-4000-8000-000000000001",
+  rulesetVersion: "rules-2026-10-18",
+  approvalCycles: 10,
+  receiptsReconciled: true,
+  riskInvariantsPreserved: true,
+  dedicatedRpcReady: true,
+  walletReady: true,
+  checklistCompleted: true,
+  operatorConfirmationId: "operator-confirmation-1",
+  promotedAt: "2026-10-18T11:00:00.000Z",
+  expiresAt: "2030-01-02T03:04:05.000Z",
+};
+const payload = parseDlmmCommandV1({
+  schema_version: 1,
+  command_id: commandId,
+  idempotency_key: "plan-101-open-v1",
+  correlation_id: "20000000-0000-4000-8000-000000000001",
+  ruleset_version: "rules-2026-10-18",
+  mode: "LIVE",
+  operation: "OPEN",
+  pool_address: "11111111111111111111111111111111",
+  wallet_address: "11111111111111111111111111111111",
+  position_address: "11111111111111111111111111111111",
+  expires_at: "2030-01-02T03:04:05Z",
+  max_slippage_bps: 50,
+  strategy: "SPOT",
+  min_bin_id: -4,
+  max_bin_id: 7,
+  amount_x: "1000",
+  amount_y: "2000",
+});
+
+class FakeSdk implements SdkBoundary {
+  async build(command: DlmmCommandV1): Promise<BuiltCommand> {
+    return { command, opaqueTransactions: [{}] };
+  }
+}
+
+class FakeRpc implements RpcTransport {
+  statusCalls = 0;
+
+  async simulate(): Promise<{
+    computeUnits: number;
+    networkFeeLamports: bigint;
+    priorityFeeLamports: bigint;
+    priceImpactBps: number;
+    blockhash: string;
+    lastValidBlockHeight: number;
+    logs: string[];
+  }> {
+    return {
+      computeUnits: 900,
+      networkFeeLamports: 5000n,
+      priorityFeeLamports: 0n,
+      priceImpactBps: 10,
+      blockhash: "safe-blockhash",
+      lastValidBlockHeight: 123,
+      logs: [],
+    };
+  }
+
+  async submit(): Promise<string> {
+    return "signature-1";
+  }
+
+  async status(): Promise<{ state: "CONFIRMED"; slot: number }> {
+    this.statusCalls += 1;
+    return { state: "CONFIRMED", slot: 42 };
+  }
+}
+
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map((server) => server.close()));
+});
+
+describe("executor HTTP boundary", () => {
+  it("rejects commands without the internal token before parsing or submitting", async () => {
+    const server = buildServer({ logger: false }, { internalToken: "configured-in-memory" });
+    servers.push(server);
+
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/commands",
+      payload: { schema_version: 1 },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({ error: "unauthorized" });
+  });
+
+  it("keeps shadow readiness independent from wallet and live RPC", async () => {
+    const server = buildServer(
+      { logger: false },
+      { internalToken: "configured-in-memory", configuredMode: "SHADOW" },
+    );
+    servers.push(server);
+
+    const response = await server.inject({ method: "GET", url: "/health/ready" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ status: "ready", mode: "SHADOW" });
+  });
+
+  it("reconciles command status through RPC without resubmitting", async () => {
+    const rpc = new FakeRpc();
+    const engine = new ExecutionEngine({
+      sdk: new FakeSdk(),
+      rpc,
+      clock: { now: (): Date => new Date("2026-10-18T12:00:00Z") },
+      submissionEnabled: true,
+      allowedMode: "LIVE",
+      livePromotion,
+    });
+    const server = buildServer(
+      { logger: false },
+      {
+        engine,
+        internalToken: "internal-token",
+        modeToken: "mode-token",
+        configuredMode: "LIVE",
+        liveDependenciesReady: true,
+      },
+    );
+    servers.push(server);
+
+    const headers = { "x-internal-token": "internal-token" };
+    expect(
+      (await server.inject({ method: "POST", url: "/v1/simulations", headers, payload })).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await server.inject({
+          method: "POST",
+          url: "/v1/commands",
+          headers: {
+            ...headers,
+            "x-mode-token": "mode-token",
+            "idempotency-key": payload.idempotency_key,
+          },
+          payload,
+        })
+      ).statusCode,
+    ).toBe(202);
+
+    const response = await server.inject({
+      method: "GET",
+      url: `/v1/commands/${commandId}`,
+      headers,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ state: "CONFIRMED", signature: "signature-1" });
+    expect(rpc.statusCalls).toBe(1);
+  });
+});
