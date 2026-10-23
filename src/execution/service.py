@@ -20,6 +20,7 @@ from src.execution.contracts import (
     ChainReceiptV1,
     ChainState,
     DlmmCommandV1,
+    DlmmOperation,
     ExecutionPhase,
     ExecutionPreview,
     ExecutionState,
@@ -31,10 +32,28 @@ from src.execution.contracts import (
     canonical_command_digest,
     canonical_simulation_digest,
 )
+from src.modes.models import KillSwitchPolicy
+
+_EXIT_OPERATIONS = frozenset({DlmmOperation.REMOVE, DlmmOperation.CLOSE})
+_UNRESOLVED = frozenset(
+    {ExecutionPhase.SUBMITTING, ExecutionPhase.SUBMITTED, ExecutionPhase.UNKNOWN}
+)
 
 
 class ExecutionBlocked(RuntimeError):
     """The command failed a fail-closed execution invariant."""
+
+
+class ExecutionOutcomeUnknown(ExecutionBlocked):
+    """The command may already be broadcast: it is never resent, only reconciled."""
+
+
+class GatewayRejected(ExecutionBlocked):
+    """The gateway provably did not execute the request: nothing was broadcast."""
+
+    def __init__(self, code: str, message: str | None = None) -> None:
+        super().__init__(message or code)
+        self.code = code
 
 
 class ExecutionGateway(Protocol):
@@ -48,6 +67,16 @@ class ExecutionGateway(Protocol):
     ) -> GatewayReceiptV1: ...
 
     async def status(self, signature: str) -> ChainReceiptV1: ...
+
+
+class ReceiptLookup(Protocol):
+    """Command-level status (``GET /v1/commands/{id}``): the gateway's reconciled receipt."""
+
+    async def lookup(self, command_id: UUID) -> GatewayReceiptV1 | None: ...
+
+
+class KillSwitchProbe(Protocol):
+    async def kill_switch_active(self) -> bool: ...
 
 
 class PlanResolver(Protocol):
@@ -312,7 +341,14 @@ class ExecutionService:
         simulation_ttl: timedelta = timedelta(minutes=2),
         approval_verifier: ApprovalVerifier | None = None,
         live_promotion: LivePromotionEvidence | None = None,
+        receipts: ReceiptLookup | None = None,
+        kill_switch: KillSwitchProbe | None = None,
+        kill_switch_policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT,
     ) -> None:
+        """``kill_switch`` is re-read immediately before every submit; without it
+        nothing is ever submitted. ``receipts`` reconciles by command id (including a
+        submit that timed out before any signature was known)."""
+
         if simulation_ttl <= timedelta(0):
             raise ValueError("simulation_ttl must be positive")
         self._gateway = gateway
@@ -323,6 +359,9 @@ class ExecutionService:
         self._simulation_ttl = simulation_ttl
         self._approval_verifier = approval_verifier
         self._live_promotion = live_promotion
+        self._receipts = receipts
+        self._kill_switch = kill_switch
+        self._kill_switch_policy = kill_switch_policy
 
     async def prepare(self, plan_id: UUID) -> ExecutionPreview:
         command = await self._plans.resolve(plan_id)
@@ -430,9 +469,8 @@ class ExecutionService:
     async def execute(self, command_id: UUID) -> GatewayReceiptV1:
         record = await self._require_record(command_id)
         if record.receipt is not None:
-            if (
-                record.receipt.state in {GatewayState.SUBMITTED, GatewayState.UNKNOWN}
-                and record.receipt.signature is not None
+            if record.receipt.state in {GatewayState.SUBMITTED, GatewayState.UNKNOWN} and (
+                record.receipt.signature is not None or self._receipts is not None
             ):
                 reconciled = await self.reconcile(command_id)
                 if reconciled.receipt is None:  # pragma: no cover - contract guard
@@ -444,8 +482,12 @@ class ExecutionService:
             if record.phase is ExecutionPhase.SUBMITTING:
                 record.phase = ExecutionPhase.UNKNOWN
                 await self._store.put(record)
-            raise ExecutionBlocked(
-                "submit outcome is unknown; operator recovery is required"
+            if self._receipts is not None:
+                reconciled = await self.reconcile(command_id)
+                if reconciled.receipt is not None:
+                    return reconciled.receipt
+            raise ExecutionOutcomeUnknown(
+                "submit outcome is unknown; it is reconciled, never resent"
             )
         if record.phase in {ExecutionPhase.FAILED, ExecutionPhase.EXPIRED}:
             raise ExecutionBlocked("execution is in a terminal state")
@@ -460,28 +502,68 @@ class ExecutionService:
         record.phase = ExecutionPhase.SUBMITTING
         await self._store.put(record)
 
+        # Last check before the irreversible call: nothing was sent yet, so a block
+        # here is a definitive FAILED, never an unknown outcome.
+        try:
+            await self._require_kill_switch_clear(record.command)
+        except ExecutionBlocked:
+            record.phase = ExecutionPhase.FAILED
+            await self._store.put(record)
+            raise
         try:
             receipt = await self._gateway.submit(
                 record.command,
                 record.command.idempotency_key,
                 record.approval,
             )
-        except Exception:
-            record.phase = ExecutionPhase.UNKNOWN
+        except GatewayRejected:
+            record.phase = ExecutionPhase.FAILED
             await self._store.put(record)
             raise
-        self._validate_receipt_binding(record, receipt)
+        except Exception as error:
+            record.phase = ExecutionPhase.UNKNOWN
+            await self._store.put(record)
+            raise ExecutionOutcomeUnknown(
+                "submit outcome is unknown; it is reconciled, never resent"
+            ) from error
+        try:
+            self._validate_receipt_binding(record, receipt)
+        except ExecutionBlocked as error:
+            record.phase = ExecutionPhase.UNKNOWN
+            await self._store.put(record)
+            raise ExecutionOutcomeUnknown(str(error)) from error
         record.receipt = receipt
         record.phase = self._phase_from_gateway(receipt.state)
         await self._store.put(record)
         return receipt
 
+    async def get_state(self, command_id: UUID) -> ExecutionState | None:
+        record = await self._store.get(command_id)
+        return None if record is None else self._state(record)
+
     async def reconcile(self, command_id: UUID) -> ExecutionState:
+        """Settle an unresolved command from the gateway; never resubmits.
+
+        With ``receipts`` the gateway's own receipt for the command id is adopted
+        (it works without any signature, e.g. after a submit timeout); otherwise
+        every known signature is looked up with ``status``.
+        """
+
         record = await self._require_record(command_id)
+        if record.receipt is not None and record.receipt.state in {
+            GatewayState.CONFIRMED,
+            GatewayState.FAILED,
+        }:
+            return self._state(record)
+        if self._receipts is not None and record.phase in _UNRESOLVED:
+            found = await self._receipts.lookup(command_id)
+            if found is not None:
+                return await self._adopt_receipt(record, found)
+            if record.receipt is None or record.receipt.signature is None:
+                # The gateway holds no submission for it: the outcome stays unknown.
+                return self._state(record)
         if record.receipt is None or record.receipt.signature is None:
             raise ExecutionBlocked("command has no submitted signature")
-        if record.receipt.state in {GatewayState.CONFIRMED, GatewayState.FAILED}:
-            return self._state(record)
 
         statuses: list[ChainReceiptV1] = []
         lookup_failed = False
@@ -512,6 +594,34 @@ class ExecutionService:
         record.phase = self._phase_from_gateway(state)
         await self._store.put(record)
         return self._state(record)
+
+    async def _adopt_receipt(
+        self, record: ExecutionRecord, receipt: GatewayReceiptV1
+    ) -> ExecutionState:
+        self._validate_receipt_binding(record, receipt)
+        if record.receipt is not None and not set(record.receipt.signatures) <= set(
+            receipt.signatures
+        ):
+            raise ExecutionBlocked("gateway receipt lost signatures that were already known")
+        record.receipt = receipt
+        record.phase = self._phase_from_gateway(receipt.state)
+        await self._store.put(record)
+        return self._state(record)
+
+    async def _require_kill_switch_clear(self, command: DlmmCommandV1) -> None:
+        """Active kill switch: no entry ever; an exit only under ``ORDERLY_EXIT``."""
+
+        if self._kill_switch is None:
+            raise ExecutionBlocked("kill switch state is not wired; submit refused")
+        try:
+            active = await self._kill_switch.kill_switch_active()
+        except Exception as error:
+            raise ExecutionBlocked("kill switch state is unavailable") from error
+        if active and not (
+            command.operation in _EXIT_OPERATIONS
+            and self._kill_switch_policy is KillSwitchPolicy.ORDERLY_EXIT
+        ):
+            raise ExecutionBlocked("kill switch is active")
 
     def _validate_for_submit(self, record: ExecutionRecord) -> None:
         now = self._clock.now()

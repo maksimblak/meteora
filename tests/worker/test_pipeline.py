@@ -29,9 +29,11 @@ from src.modes import InMemoryModeRepository, KillSwitchPolicy, ModeService, Pen
 from src.persistence.memory import InMemoryRecoverableExecutionStore
 from src.providers.fixtures import FixtureFailure
 from src.worker.execution import (
+    BinAnchor,
+    CommandResolver,
     EntryStatus,
+    GatewayFillBook,
     GatewaySubmitter,
-    RegisteredPlanResolver,
     SubmitStatus,
     build_entry_command,
 )
@@ -276,16 +278,23 @@ class FakeGateway:
         return ChainReceiptV1(signature=signature, state=ChainState.CONFIRMED, checked_at=NOW)
 
 
+class ClearKillSwitch:
+    async def kill_switch_active(self) -> bool:
+        return False
+
+
 def _live_submitter(gateway: FakeGateway, harness: Harness) -> GatewaySubmitter:
     from src.execution.contracts import LivePromotionEvidence
 
-    resolver = RegisteredPlanResolver()
+    store = InMemoryRecoverableExecutionStore()
+    resolver = CommandResolver(store)
     service = ExecutionService(
         gateway=gateway,
-        store=InMemoryRecoverableExecutionStore(),
+        store=store,
         plans=resolver,
         clock=harness.clock,
         allowed_mode=TradingMode.LIVE,
+        kill_switch=ClearKillSwitch(),
         live_promotion=LivePromotionEvidence(
             promotion_id=UUID(int=1),
             ruleset_version="rules-1",
@@ -300,7 +309,8 @@ def _live_submitter(gateway: FakeGateway, harness: Harness) -> GatewaySubmitter:
             expires_at=NOW + timedelta(hours=1),
         ),
     )
-    return GatewaySubmitter(service, resolver)
+    book = GatewayFillBook(harness.accounting, store, harness.clock, harness.policy.shadow_costs)
+    return GatewaySubmitter(service, resolver, book)
 
 
 def _live_command(harness: Harness) -> tuple[DlmmCommandV1, Any]:
@@ -323,6 +333,7 @@ def _live_command(harness: Harness) -> tuple[DlmmCommandV1, Any]:
         wallet_address=WALLET,
         position_address=shadow_address(f"position:{plan_id}"),
         max_slippage_bps=100,
+        anchor=BinAnchor(active_bin_id=8_000, base_decimals=6, quote_decimals=6),
     )
     return command, market
 

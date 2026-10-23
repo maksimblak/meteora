@@ -1,6 +1,6 @@
-"""The money path of an admitted entry plan.
+"""The money path: admitted entries, their durable continuation and gateway exits.
 
-Order of guarantees (each step fails closed and never re-orders):
+Order of guarantees of an entry (each step fails closed and never re-orders):
 
 1. ``claim_entry`` - PENDING -> EXECUTING under the kill-switch / daily-stop guards;
 2. *guard* - the durable mode state is re-read; kill switch, daily stop or a mode
@@ -8,46 +8,77 @@ Order of guarantees (each step fails closed and never re-orders):
 3. *audit* - position context and a ``CommandSubmitted`` record are made durable;
    an unaudited command is never sent and the failure raises a critical alert;
 4. *submit* - the submitter calls the guard again immediately before the one
-   irreversible step (shadow fill or gateway submit, after any simulation);
-5. *settle* - CONFIRMED -> ``confirm_entry``; FAILED/BLOCKED -> ``fail_entry``;
-   an unknown outcome stays EXECUTING for restart recovery and is never resent.
+   irreversible step (shadow fill or gateway submit, after any simulation), and the
+   execution service re-reads the kill switch right before ``gateway.submit``;
+5. *settle* - CONFIRMED -> ``confirm_entry``; FAILED/BLOCKED -> ``fail_entry`` only
+   while the durable execution record proves nothing left; an unknown outcome stays
+   EXECUTING (capacity reserved) until it is reconciled and is never resent.
+
+Non-SHADOW work that outlives one cycle continues from durable state only:
+``GatewayEntrySettler`` executes approved entries and settles reconciled ones,
+``GatewayPositionManager`` exits and reduces non-SHADOW positions through a fresh
+simulation and the gateway, one bounded sequence of attempts per position.
 """
 
 import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
 from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from src.accounting.models import CostModel
+from src.accounting.models import CostModel, Fill, LedgerEntry, ShadowReceipt
 from src.accounting.repository import AccountingRepository
-from src.accounting.service import ShadowBroker
+from src.accounting.service import AccountingService, ShadowBroker, position_aggregate_id
 from src.core.clock import Clock
 from src.domain.models.events import AuditEvent, EventType
 from src.domain.models.trading import TradingMode
 from src.domain.risk.models import SizedPlan
+from src.domain.strategy import PositionActionKind
 from src.execution.contracts import (
     DlmmCommandV1,
     DlmmOperation,
+    ExecutionPhase,
+    ExecutionState,
+    GatewayReceiptV1,
     GatewayState,
     LiquidityStrategy,
     canonical_command_digest,
 )
-from src.execution.service import ExecutionBlocked, ExecutionService
+from src.execution.service import (
+    ExecutionBlocked,
+    ExecutionRecord,
+    ExecutionService,
+    ExecutionStore,
+    GatewayRejected,
+)
 from src.market.models import PoolSnapshot
-from src.modes.models import PendingPlan, PendingPlanStatus
+from src.modes.models import KillSwitchPolicy, PendingPlan, PendingPlanStatus
 from src.modes.repository import ModeRepository
 from src.observability.alerts import CriticalAlertReporter
 from src.observability.logging import error_fields, get_logger
 from src.observability.metrics import WorkerMetrics
-from src.persistence.contracts import AuditLog, PositionContext, PositionContextStore
+from src.persistence.contracts import (
+    AuditLog,
+    PositionContext,
+    PositionContextStore,
+    SnapshotHistory,
+)
+from src.portfolio.models import PositionStatus, ShadowPosition
 from src.worker.policy import PipelinePolicy
 
 _BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _BPS = Decimal(10_000)
+UNRESOLVED_PHASES = frozenset(
+    {ExecutionPhase.SUBMITTING, ExecutionPhase.SUBMITTED, ExecutionPhase.UNKNOWN}
+)
+_EXECUTABLE_PHASES = frozenset({ExecutionPhase.APPROVED, ExecutionPhase.SIMULATED})
+_SPENT_PHASES = frozenset({ExecutionPhase.FAILED, ExecutionPhase.EXPIRED})
+POSITION_ACTION_ATTEMPTS = 5
+POSITION_ACTION_TTL = timedelta(minutes=2)
+REDUCE_BPS = 5_000
 
 
 def shadow_address(seed: str) -> str:
@@ -75,6 +106,52 @@ def entry_position_address(plan_id: UUID) -> str:
     return shadow_address(f"position:{plan_id}")
 
 
+def position_action_key(position_id: str, attempt: int) -> str:
+    return f"position-action:{position_id}:{attempt}"
+
+
+def position_action_command_id(position_id: str, attempt: int) -> UUID:
+    return uuid5(
+        NAMESPACE_URL, f"meteora-volume-bot:{position_action_key(position_id, attempt)}"
+    )
+
+
+# --- entry command ------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BinAnchor:
+    """On-chain facts a non-SHADOW entry needs that ``PoolSnapshot`` does not carry.
+
+    Without them the strategy's *relative* bin offsets cannot become absolute bin ids
+    and sized capital cannot become token base units, so a gateway entry fails closed.
+    """
+
+    active_bin_id: int
+    base_decimals: int
+    quote_decimals: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.base_decimals <= 18 and 0 <= self.quote_decimals <= 18):
+            raise ValueError("token decimals must be in [0, 18]")
+
+
+type AnchorSource = Callable[[PoolSnapshot], BinAnchor | None]
+
+
+def snapshot_anchor(market: PoolSnapshot) -> BinAnchor | None:
+    """Default source: the market snapshot has neither an active bin id nor decimals."""
+
+    del market
+    return None
+
+
+class EntryCommandUnavailable(ValueError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 def build_entry_command(
     *,
     plan_id: UUID,
@@ -90,12 +167,32 @@ def build_entry_command(
     wallet_address: str,
     position_address: str,
     max_slippage_bps: int,
+    anchor: BinAnchor | None = None,
 ) -> DlmmCommandV1:
-    """Split the sized capital evenly between Y and X at the observed price."""
+    """Split the sized capital evenly between Y and X at the observed price.
+
+    SHADOW keeps the strategy's relative bins (the shadow broker models them). Any
+    other mode needs a ``BinAnchor``: bins become ``active_bin_id + offset`` and X is
+    expressed in its own base units through both token decimals. Without the anchor
+    the command is refused - an offset is never sent as an absolute bin id.
+    """
 
     amount_y = size_base_units // 2
+    if mode is TradingMode.SHADOW:
+        min_bin_id, max_bin_id = lower_bin_offset, upper_bin_offset
+        scale = Decimal(1)
+    else:
+        if anchor is None:
+            raise EntryCommandUnavailable("ENTRY_ANCHOR_UNAVAILABLE")
+        if market.price <= 0:
+            raise EntryCommandUnavailable("MARKET_PRICE_UNAVAILABLE")
+        min_bin_id = anchor.active_bin_id + lower_bin_offset
+        max_bin_id = anchor.active_bin_id + upper_bin_offset
+        scale = Decimal(10) ** (anchor.base_decimals - anchor.quote_decimals)
     amount_x = int(
-        (Decimal(size_base_units - amount_y) / market.price).to_integral_value(rounding=ROUND_FLOOR)
+        (Decimal(size_base_units - amount_y) / market.price * scale).to_integral_value(
+            rounding=ROUND_FLOOR
+        )
     )
     try:
         correlation = UUID(correlation_id)
@@ -114,11 +211,22 @@ def build_entry_command(
         expires_at=expires_at,
         max_slippage_bps=max_slippage_bps,
         strategy=LiquidityStrategy(strategy_kind),
-        min_bin_id=lower_bin_offset,
-        max_bin_id=upper_bin_offset,
+        min_bin_id=min_bin_id,
+        max_bin_id=max_bin_id,
         amount_x=str(amount_x),
         amount_y=str(amount_y),
     )
+
+
+def _anchor_refusal(anchor: BinAnchor | None) -> str | None:
+    if anchor is None:
+        return "ENTRY_ANCHOR_UNAVAILABLE"
+    if anchor.base_decimals != anchor.quote_decimals:
+        # Positions are valued as quantity_x * price + quantity_y: exact only when both
+        # tokens share decimals. A position whose P&L and daily stop would be wrong is
+        # never opened.
+        return "ACCOUNTING_UNITS_UNSUPPORTED"
+    return None
 
 
 # --- submitters --------------------------------------------------------------------------
@@ -168,65 +276,271 @@ class ShadowSubmitter:
         return SubmitResult(SubmitStatus.CONFIRMED, position_id=receipt.position.position_id)
 
 
-class RegisteredPlanResolver:
-    """``PlanResolver`` for ``ExecutionService``: the command is keyed by its own id."""
+class CommandResolver:
+    """``PlanResolver`` keyed by command id; the durable record wins over a staged one.
 
-    def __init__(self) -> None:
-        self._commands: dict[UUID, DlmmCommandV1] = {}
+    A command is staged only for the ``prepare`` call that persists it; afterwards
+    every resolution comes from the execution store, so a restarted worker works on
+    exactly the persisted payload.
+    """
 
-    def register(self, command: DlmmCommandV1) -> UUID:
-        self._commands[command.command_id] = command
+    def __init__(self, store: ExecutionStore) -> None:
+        self._store = store
+        self._staged: dict[UUID, DlmmCommandV1] = {}
+
+    def stage(self, command: DlmmCommandV1) -> UUID:
+        self._staged[command.command_id] = command
         return command.command_id
 
+    def discard(self, command_id: UUID) -> None:
+        self._staged.pop(command_id, None)
+
     async def resolve(self, plan_id: UUID) -> DlmmCommandV1:
+        record = await self._store.get(plan_id)
+        if record is not None:
+            return record.command
         try:
-            return self._commands[plan_id]
+            return self._staged[plan_id]
         except KeyError as error:
             raise ExecutionBlocked("plan not found") from error
+
+
+class ModeKillSwitch:
+    """``KillSwitchProbe`` over the durable mode state, re-read on every call."""
+
+    def __init__(self, modes: ModeRepository) -> None:
+        self._modes = modes
+
+    async def kill_switch_active(self) -> bool:
+        return self._modes.mode_state().kill_switch_active
+
+
+class GatewayFillBook:
+    """Books a CONFIRMED gateway command into T04 accounting, once per idempotency key.
+
+    The fill is the bound simulation's measured price impact at ``price``; network
+    and tip costs use the policy cost model (lamport fees are not quote units).
+    """
+
+    def __init__(
+        self,
+        accounting: AccountingRepository,
+        executions: ExecutionStore,
+        clock: Clock,
+        costs: CostModel,
+    ) -> None:
+        self._accounting = accounting
+        self._executions = executions
+        self._clock = clock
+        self._costs = costs
+        self._service = AccountingService()
+
+    async def book(self, command_id: UUID, price: Decimal) -> ShadowReceipt:
+        record = await self._executions.get(command_id)
+        if record is None:
+            raise ValueError("execution record not found")
+        receipt = record.receipt
+        if receipt is None or receipt.state is not GatewayState.CONFIRMED:
+            raise ValueError("only a confirmed gateway command is booked")
+        command = record.command
+        existing = self._accounting.receipt_for(command.idempotency_key)
+        if existing is not None:
+            if existing.command_digest != receipt.command_digest:
+                raise ValueError("idempotency key is bound to another command")
+            return existing
+        if command.position_address is None:  # pragma: no cover - contract invariant
+            raise ValueError("lifecycle commands require position_address")
+        current = self._accounting.position_for(command.position_address)
+        now = self._clock.now()
+        fill = Fill(
+            filled_at=now,
+            price=price,
+            slippage_bps=record.simulation.price_impact_bps or 0,
+            network_fee_base_units=self._costs.network_fee_base_units,
+            jito_tip_base_units=self._costs.jito_tip_base_units,
+            fee_income_base_units=Decimal(0),
+        )
+        step = self._service.apply_fill(current, command, fill)
+        valuation = self._service.value_at(step.position, price, now)
+        entry = LedgerEntry(
+            entry_id=str(uuid5(NAMESPACE_URL, f"ledger:{command.idempotency_key}")),
+            command_id=str(command.command_id),
+            idempotency_key=command.idempotency_key,
+            correlation_id=str(command.correlation_id),
+            position_id=step.position.position_id,
+            kind=step.kind,
+            occurred_at=now,
+            price=price,
+            capital_delta_base_units=step.capital_delta_base_units,
+            cost_basis_delta_base_units=step.cost_basis_delta_base_units,
+            realized_pnl_base_units=step.realized_pnl_base_units,
+            divergence_realized_base_units=step.divergence_realized_base_units,
+            fee_income_base_units=fill.fee_income_base_units,
+            slippage_base_units=step.slippage_base_units,
+            network_base_units=fill.network_fee_base_units,
+            jito_base_units=fill.jito_tip_base_units,
+        )
+        events = _booking_events(command, receipt, step.position, now)
+        booked = ShadowReceipt(
+            command=command,
+            command_digest=receipt.command_digest,
+            fill=fill,
+            # A gateway fill is the bound simulation's fill: its digest is the binding.
+            fill_digest=receipt.simulation_digest,
+            applied_at=now,
+            phase=ExecutionPhase.CONFIRMED,
+            gateway_receipt=receipt,
+            position=step.position,
+            valuation=valuation,
+            ledger_entry_ids=(entry.entry_id,),
+            event_types=tuple(event.event_type for event in events),
+        )
+        outcome = (
+            self._service.close(step.position, booked)
+            if step.position.status is PositionStatus.CLOSED
+            else None
+        )
+        return self._accounting.commit(
+            booked,
+            (entry,),
+            outcome,
+            events,
+            expected_version=None if current is None else current.version,
+        )
+
+
+def _booking_events(
+    command: DlmmCommandV1, receipt: GatewayReceiptV1, position: ShadowPosition, now: datetime
+) -> tuple[AuditEvent, ...]:
+    def event(kind: EventType, aggregate_id: UUID, payload: dict[str, object]) -> AuditEvent:
+        return AuditEvent(
+            event_id=uuid5(NAMESPACE_URL, f"event:{command.idempotency_key}:{kind.value}"),
+            occurred_at=now,
+            aggregate_id=aggregate_id,
+            correlation_id=command.correlation_id,
+            causation_id=command.command_id,
+            schema_version=1,
+            event_type=kind,
+            payload=payload,
+        )
+
+    events = [
+        event(
+            EventType.COMMAND_CONFIRMED,
+            command.command_id,
+            {
+                "mode": command.mode.value,
+                "operation": command.operation.value,
+                "idempotency_key": command.idempotency_key,
+                "position_id": position.position_id,
+                "signatures": list(receipt.signatures),
+            },
+        )
+    ]
+    aggregate = position_aggregate_id(position.position_id)
+    if command.operation is DlmmOperation.OPEN:
+        events.append(
+            event(
+                EventType.POSITION_OPENED,
+                aggregate,
+                {"position_id": position.position_id, "mode": position.mode.value},
+            )
+        )
+    elif position.status is PositionStatus.CLOSED:
+        events.append(
+            event(
+                EventType.POSITION_CLOSED,
+                aggregate,
+                {"position_id": position.position_id, "mode": position.mode.value},
+            )
+        )
+    return tuple(events)
+
+
+async def execute_command(service: ExecutionService, command: DlmmCommandV1) -> SubmitResult:
+    """Execute once; a block is definitive only while the durable record proves that
+    nothing left (no receipt, not SUBMITTING/SUBMITTED/UNKNOWN)."""
+
+    try:
+        receipt = await service.execute(command.command_id)
+    except ExecutionBlocked as error:
+        try:
+            state = await service.get_state(command.command_id)
+        except Exception:
+            return SubmitResult(SubmitStatus.PENDING, detail="EXECUTION_STATE_UNAVAILABLE")
+        return settled_result(state, command, blocked=str(error))
+    except Exception:
+        return SubmitResult(SubmitStatus.PENDING, detail="SUBMIT_OUTCOME_UNKNOWN")
+    return _receipt_result(receipt, command)
+
+
+def settled_result(
+    state: ExecutionState | None, command: DlmmCommandV1, *, blocked: str
+) -> SubmitResult:
+    if state is None:
+        return SubmitResult(SubmitStatus.FAILED, detail=blocked)
+    if state.receipt is not None:
+        return _receipt_result(state.receipt, command)
+    if state.phase in UNRESOLVED_PHASES:
+        return SubmitResult(SubmitStatus.PENDING, detail=state.phase.value)
+    return SubmitResult(SubmitStatus.FAILED, detail=blocked)
+
+
+def _receipt_result(receipt: GatewayReceiptV1, command: DlmmCommandV1) -> SubmitResult:
+    if receipt.state is GatewayState.CONFIRMED:
+        return SubmitResult(SubmitStatus.CONFIRMED, position_id=command.position_address)
+    if receipt.state is GatewayState.FAILED:
+        return SubmitResult(SubmitStatus.FAILED, detail="CHAIN_FAILED")
+    return SubmitResult(SubmitStatus.PENDING, detail=receipt.state.value)
 
 
 class GatewaySubmitter:
     """APPROVAL / LIVE through the T05 execution service and the internal gateway.
 
     APPROVAL stops after the simulated preview (an operator approval is the manual
-    step of that stage); LIVE submits only after the guard re-checks the durable
-    kill switch *after* simulation, immediately before the irreversible call.
+    step of that stage; ``GatewayEntrySettler`` executes it once approved); LIVE
+    submits only after the guard re-checks the durable state *after* simulation.
     """
 
-    def __init__(self, service: ExecutionService, resolver: RegisteredPlanResolver) -> None:
+    def __init__(
+        self, service: ExecutionService, resolver: CommandResolver, book: GatewayFillBook
+    ) -> None:
         self._service = service
         self._resolver = resolver
+        self._book = book
+        self._log = get_logger("worker.gateway")
 
     async def submit(
         self, command: DlmmCommandV1, market: PoolSnapshot, guard: SubmitGuard
     ) -> SubmitResult:
-        del market
-        key = self._resolver.register(command)
         try:
             guard()
         except Exception as error:
             return SubmitResult(SubmitStatus.BLOCKED, detail=str(error))
+        self._resolver.stage(command)
         try:
-            await self._service.prepare(key)
+            preview = await self._service.prepare(command.command_id)
         except ExecutionBlocked as error:
             return SubmitResult(SubmitStatus.FAILED, detail=str(error))
-        if command.mode is TradingMode.APPROVAL:
+        finally:
+            self._resolver.discard(command.command_id)
+        if preview.phase is ExecutionPhase.AWAITING_APPROVAL:
             return SubmitResult(SubmitStatus.PENDING, detail="AWAITING_APPROVAL")
         try:
             guard()
         except Exception as error:
             return SubmitResult(SubmitStatus.BLOCKED, detail=str(error))
-        try:
-            receipt = await self._service.execute(command.command_id)
-        except ExecutionBlocked as error:
-            return SubmitResult(SubmitStatus.FAILED, detail=str(error))
-        except Exception:
-            return SubmitResult(SubmitStatus.PENDING, detail="SUBMIT_OUTCOME_UNKNOWN")
-        if receipt.state is GatewayState.CONFIRMED:
-            return SubmitResult(SubmitStatus.CONFIRMED, position_id=command.position_address)
-        if receipt.state is GatewayState.FAILED:
-            return SubmitResult(SubmitStatus.FAILED, detail="CHAIN_FAILED")
-        return SubmitResult(SubmitStatus.PENDING, detail=receipt.state.value)
+        result = await execute_command(self._service, command)
+        if result.status is SubmitStatus.CONFIRMED:
+            try:
+                await self._book.book(command.command_id, market.price)
+            except Exception as error:
+                # The fill is real: confirm it anyway, the position cycle books it later.
+                self._log.error(
+                    "gateway_fill_not_booked", command_id=str(command.command_id),
+                    **error_fields(error),
+                )
+        return result
 
 
 # --- entry executor ----------------------------------------------------------------------
@@ -261,6 +575,28 @@ class EntryBlocked(RuntimeError):
         self.reason = reason
 
 
+def entry_guard(modes: EntryStore, clock: Clock, mode: TradingMode, plan_id: UUID) -> SubmitGuard:
+    """Re-read the durable state: the plan is still EXECUTING, no stop, same mode."""
+
+    def guard() -> None:
+        try:
+            state = modes.mode_state()
+            plan = modes.entry_plan(plan_id)
+        except Exception as error:
+            raise EntryBlocked("MODE_STATE_UNAVAILABLE") from error
+        if plan is None or plan.status is not PendingPlanStatus.EXECUTING:
+            raise EntryBlocked("PLAN_NOT_EXECUTING")
+        today = clock.now().astimezone(UTC).date()
+        if state.kill_switch_active:
+            raise EntryBlocked("KILL_SWITCH_ACTIVE")
+        if state.daily_stop_active_on(today):
+            raise EntryBlocked("DAILY_STOP_REACHED")
+        if state.mode is not mode:
+            raise EntryBlocked("MODE_CHANGED")
+
+    return guard
+
+
 class EntryExecutor:
     def __init__(
         self,
@@ -274,6 +610,7 @@ class EntryExecutor:
         metrics: WorkerMetrics,
         policy: PipelinePolicy,
         wallet_address: str,
+        anchors: AnchorSource = snapshot_anchor,
     ) -> None:
         self._modes = modes
         self._audit = audit
@@ -284,6 +621,7 @@ class EntryExecutor:
         self._metrics = metrics
         self._policy = policy
         self._wallet = wallet_address
+        self._anchors = anchors
         self._log = get_logger("worker.entries")
 
     async def execute(
@@ -306,6 +644,13 @@ class EntryExecutor:
                     EntryStatus.NOT_CONFIGURED, plan_id, "EXECUTION_GATEWAY_NOT_CONFIGURED"
                 ),
             )
+        anchor: BinAnchor | None = None
+        if mode is not TradingMode.SHADOW:
+            anchor = self._anchors(market)
+            refusal = _anchor_refusal(anchor)
+            if refusal is not None:
+                self._cancel(plan_id)
+                return self._finish(mode, EntryResult(EntryStatus.BLOCKED, plan_id, refusal))
         try:
             self._modes.claim_entry(plan_id, self._clock.now())
         except ValueError as error:
@@ -316,22 +661,29 @@ class EntryExecutor:
 
         plan = sized.plan
         position_address = entry_position_address(plan_id)
-        command = build_entry_command(
-            plan_id=plan_id,
-            mode=mode,
-            market=market,
-            size_base_units=sized.size_base_units,
-            strategy_kind=plan.strategy.value,
-            lower_bin_offset=plan.lower_bin_offset,
-            upper_bin_offset=plan.upper_bin_offset,
-            expires_at=plan.expires_at,
-            correlation_id=str(correlation_id),
-            ruleset_version=plan.ruleset_version,
-            wallet_address=self._wallet,
-            position_address=position_address,
-            max_slippage_bps=self._policy.max_slippage_bps,
-        )
-        guard = self._guard(mode, plan_id)
+        try:
+            command = build_entry_command(
+                plan_id=plan_id,
+                mode=mode,
+                market=market,
+                size_base_units=sized.size_base_units,
+                strategy_kind=plan.strategy.value,
+                lower_bin_offset=plan.lower_bin_offset,
+                upper_bin_offset=plan.upper_bin_offset,
+                expires_at=plan.expires_at,
+                correlation_id=str(correlation_id),
+                ruleset_version=plan.ruleset_version,
+                wallet_address=self._wallet,
+                position_address=position_address,
+                max_slippage_bps=self._policy.max_slippage_bps,
+                anchor=anchor,
+            )
+        except EntryCommandUnavailable as unavailable:
+            self._fail(plan_id)
+            return self._finish(
+                mode, EntryResult(EntryStatus.BLOCKED, plan_id, unavailable.reason)
+            )
+        guard = entry_guard(self._modes, self._clock, mode, plan_id)
         try:
             guard()
         except EntryBlocked as blocked:
@@ -376,36 +728,7 @@ class EntryExecutor:
             self._log.error("submit_outcome_unknown", plan_id=str(plan_id), **error_fields(error))
             result = SubmitResult(SubmitStatus.PENDING, detail="SUBMIT_OUTCOME_UNKNOWN")
         if result.status is SubmitStatus.CONFIRMED and result.position_id is not None:
-            try:
-                self._modes.confirm_entry(plan_id, result.position_id)
-            except ValueError as error:
-                # A fill exists that the entry bookkeeping refuses: never hide it.
-                self._log.critical("fill_not_tracked", plan_id=str(plan_id), **error_fields(error))
-                self._alerts.raise_alert(
-                    "ENTRY_FILL_UNTRACKED",
-                    f"position {result.position_id} was filled but plan {plan_id} "
-                    "could not be confirmed; reconcile before trading continues",
-                    dedupe_key=f"untracked:{plan_id}",
-                )
-                return self._finish(
-                    mode,
-                    EntryResult(
-                        EntryStatus.FAILED,
-                        plan_id,
-                        "ENTRY_FILL_UNTRACKED",
-                        position_id=result.position_id,
-                        command_id=command.command_id,
-                    ),
-                )
-            return self._finish(
-                mode,
-                EntryResult(
-                    EntryStatus.OPENED,
-                    plan_id,
-                    position_id=result.position_id,
-                    command_id=command.command_id,
-                ),
-            )
+            return self._finish(mode, self._confirm(plan_id, result.position_id, command))
         if result.status is SubmitStatus.PENDING:
             return self._finish(
                 mode,
@@ -423,24 +746,10 @@ class EntryExecutor:
             EntryResult(EntryStatus.FAILED, plan_id, result.detail, command_id=command.command_id),
         )
 
-    def _guard(self, mode: TradingMode, plan_id: UUID) -> SubmitGuard:
-        def guard() -> None:
-            try:
-                state = self._modes.mode_state()
-                plan = self._modes.entry_plan(plan_id)
-            except Exception as error:
-                raise EntryBlocked("MODE_STATE_UNAVAILABLE") from error
-            if plan is None or plan.status is not PendingPlanStatus.EXECUTING:
-                raise EntryBlocked("PLAN_NOT_EXECUTING")
-            today = self._clock.now().astimezone(UTC).date()
-            if state.kill_switch_active:
-                raise EntryBlocked("KILL_SWITCH_ACTIVE")
-            if state.daily_stop_active_on(today):
-                raise EntryBlocked("DAILY_STOP_REACHED")
-            if state.mode is not mode:
-                raise EntryBlocked("MODE_CHANGED")
-
-        return guard
+    def _confirm(self, plan_id: UUID, position_id: str, command: DlmmCommandV1) -> EntryResult:
+        return confirm_filled_entry(
+            self._modes, self._alerts, plan_id, position_id, command.command_id
+        )
 
     async def _blocked(
         self,
@@ -475,11 +784,7 @@ class EntryExecutor:
             self._log.warning("plan_cancel_skipped", plan_id=str(plan_id), **error_fields(error))
 
     def _fail(self, plan_id: UUID) -> None:
-        try:
-            self._modes.fail_entry(plan_id)
-        except Exception as error:
-            # Left EXECUTING: it keeps its capacity reserved until recovery settles it.
-            self._log.error("entry_fail_not_recorded", plan_id=str(plan_id), **error_fields(error))
+        fail_entry_plan(self._modes, plan_id)
 
     def _finish(self, mode: TradingMode, result: EntryResult) -> EntryResult:
         self._metrics.execution(mode, result.status.value)
@@ -490,6 +795,49 @@ class EntryExecutor:
             reason=result.reason,
         )
         return result
+
+
+def confirm_filled_entry(
+    modes: ModeRepository,
+    alerts: CriticalAlertReporter,
+    plan_id: UUID,
+    position_id: str,
+    command_id: UUID,
+) -> EntryResult:
+    """EXECUTING -> OPENED; a fill the bookkeeping refuses is never hidden."""
+
+    try:
+        modes.confirm_entry(plan_id, position_id)
+    except ValueError as error:
+        get_logger("worker.entries").critical(
+            "fill_not_tracked", plan_id=str(plan_id), **error_fields(error)
+        )
+        alerts.raise_alert(
+            "ENTRY_FILL_UNTRACKED",
+            f"position {position_id} was filled but plan {plan_id} "
+            "could not be confirmed; reconcile before trading continues",
+            dedupe_key=f"untracked:{plan_id}",
+        )
+        return EntryResult(
+            EntryStatus.FAILED,
+            plan_id,
+            "ENTRY_FILL_UNTRACKED",
+            position_id=position_id,
+            command_id=command_id,
+        )
+    return EntryResult(
+        EntryStatus.OPENED, plan_id, position_id=position_id, command_id=command_id
+    )
+
+
+def fail_entry_plan(modes: ModeRepository, plan_id: UUID) -> None:
+    try:
+        modes.fail_entry(plan_id)
+    except Exception as error:
+        # Left EXECUTING: it keeps its capacity reserved until recovery settles it.
+        get_logger("worker.entries").error(
+            "entry_fail_not_recorded", plan_id=str(plan_id), **error_fields(error)
+        )
 
 
 def _claim_reason(error: ValueError) -> str:
@@ -558,3 +906,480 @@ def audit_event(
         event_type=kind,
         payload=payload,
     )
+
+
+# --- durable continuation of gateway entries ----------------------------------------------
+
+
+class GatewayEntryStore(EntryStore, Protocol):
+    def entry_plans(self) -> tuple[PendingPlan, ...]: ...
+
+
+class GatewayEntrySettler:
+    """Continue every EXECUTING non-SHADOW entry from its durable execution record.
+
+    * APPROVED (the operator's one-shot approval) or SIMULATED (a LIVE worker died
+      between simulation and submit) -> guard -> ``execute`` exactly once;
+    * SUBMITTING / SUBMITTED / UNKNOWN -> reconcile with the gateway, never resend;
+    * CONFIRMED -> book the fill and confirm the entry.
+
+    AWAITING_APPROVAL waits for the operator; recovery fails it once it expires.
+    Runs inside the entry job, under the same lease as new entries and recovery's
+    settlement, so no second executor works on the same plan.
+    """
+
+    def __init__(
+        self,
+        *,
+        modes: GatewayEntryStore,
+        executions: ExecutionStore,
+        service: ExecutionService,
+        book: GatewayFillBook,
+        contexts: PositionContextStore,
+        alerts: CriticalAlertReporter,
+        clock: Clock,
+        metrics: WorkerMetrics,
+    ) -> None:
+        self._modes = modes
+        self._executions = executions
+        self._service = service
+        self._book = book
+        self._contexts = contexts
+        self._alerts = alerts
+        self._clock = clock
+        self._metrics = metrics
+        self._log = get_logger("worker.entries")
+
+    async def run(self) -> tuple[EntryResult, ...]:
+        results: list[EntryResult] = []
+        for plan in self._modes.entry_plans():
+            if plan.status is not PendingPlanStatus.EXECUTING:
+                continue
+            record = await self._executions.get_by_idempotency_key(
+                entry_idempotency_key(plan.plan_id)
+            )
+            if record is None or record.command.mode is TradingMode.SHADOW:
+                continue
+            result = await self._advance(plan, record)
+            if result is not None:
+                self._metrics.execution(record.command.mode, result.status.value)
+                self._log.info(
+                    "gateway_entry_continued",
+                    plan_id=str(plan.plan_id),
+                    status=result.status.value,
+                    reason=result.reason,
+                )
+                results.append(result)
+        return tuple(results)
+
+    async def _advance(self, plan: PendingPlan, record: ExecutionRecord) -> EntryResult | None:
+        command = record.command
+        if record.phase in _EXECUTABLE_PHASES:
+            try:
+                entry_guard(self._modes, self._clock, command.mode, plan.plan_id)()
+            except EntryBlocked as blocked:
+                fail_entry_plan(self._modes, plan.plan_id)
+                return EntryResult(
+                    EntryStatus.BLOCKED,
+                    plan.plan_id,
+                    blocked.reason,
+                    command_id=command.command_id,
+                )
+            outcome = await execute_command(self._service, command)
+        elif record.phase in UNRESOLVED_PHASES:
+            try:
+                state = await self._service.reconcile(command.command_id)
+            except Exception as error:
+                self._log.warning(
+                    "gateway_entry_reconcile_failed",
+                    plan_id=str(plan.plan_id),
+                    **error_fields(error),
+                )
+                return None
+            outcome = settled_result(state, command, blocked=record.phase.value)
+        elif record.phase is ExecutionPhase.CONFIRMED:
+            outcome = SubmitResult(SubmitStatus.CONFIRMED, position_id=command.position_address)
+        else:
+            return None
+        return await self._settle(plan, command, outcome)
+
+    async def _settle(
+        self, plan: PendingPlan, command: DlmmCommandV1, outcome: SubmitResult
+    ) -> EntryResult:
+        if outcome.status is SubmitStatus.CONFIRMED and outcome.position_id is not None:
+            context = await self._contexts.get(outcome.position_id)
+            if context is not None:
+                try:
+                    await self._book.book(command.command_id, context.entry_price)
+                except Exception as error:
+                    self._log.error(
+                        "gateway_fill_not_booked",
+                        plan_id=str(plan.plan_id),
+                        **error_fields(error),
+                    )
+            return confirm_filled_entry(
+                self._modes, self._alerts, plan.plan_id, outcome.position_id, command.command_id
+            )
+        if outcome.status is SubmitStatus.PENDING:
+            return EntryResult(
+                EntryStatus.PENDING, plan.plan_id, outcome.detail, command_id=command.command_id
+            )
+        fail_entry_plan(self._modes, plan.plan_id)
+        return EntryResult(
+            EntryStatus.FAILED, plan.plan_id, outcome.detail, command_id=command.command_id
+        )
+
+
+# --- non-SHADOW positions through the gateway ---------------------------------------------
+
+
+class PositionActionStatus(StrEnum):
+    EXITED = "EXITED"
+    REDUCED = "REDUCED"
+    PENDING = "PENDING"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    HELD = "HELD"
+    FAILED = "FAILED"
+    EXHAUSTED = "EXHAUSTED"
+    OPERATOR_REQUIRED = "OPERATOR_REQUIRED"
+
+
+@dataclass(frozen=True, slots=True)
+class PositionActionResult:
+    position_id: str
+    status: PositionActionStatus
+    attempt: int | None = None
+    detail: str | None = None
+
+
+class GatewayPositionManager:
+    """Exit (CLOSE) and reduce (REMOVE) non-SHADOW positions through the gateway.
+
+    Each position has one durable sequence of at most ``attempts`` commands keyed
+    ``position-action:{position_id}:{n}``. Only the latest attempt is ever live: an
+    unresolved one is reconciled (never resent), an approved one is executed once,
+    and a new attempt - always with a fresh simulation - starts only after the
+    previous one provably ended. A reduction happens at most once per position.
+    Without a reachable gateway the position stays open under a critical alert.
+    """
+
+    def __init__(
+        self,
+        *,
+        modes: ModeRepository,
+        accounting: AccountingRepository,
+        contexts: PositionContextStore,
+        history: SnapshotHistory,
+        executions: ExecutionStore,
+        service: ExecutionService,
+        resolver: CommandResolver,
+        book: GatewayFillBook,
+        alerts: CriticalAlertReporter,
+        clock: Clock,
+        metrics: WorkerMetrics,
+        policy: PipelinePolicy,
+        attempts: int = POSITION_ACTION_ATTEMPTS,
+        reduce_bps: int = REDUCE_BPS,
+    ) -> None:
+        if attempts <= 0 or not 0 < reduce_bps < 10_000:
+            raise ValueError("attempts must be positive and reduce_bps inside (0, 10000)")
+        self._modes = modes
+        self._accounting = accounting
+        self._contexts = contexts
+        self._history = history
+        self._executions = executions
+        self._service = service
+        self._resolver = resolver
+        self._book = book
+        self._alerts = alerts
+        self._clock = clock
+        self._metrics = metrics
+        self._policy = policy
+        self._attempts = attempts
+        self._reduce_bps = reduce_bps
+        self._log = get_logger("worker.positions.gateway")
+
+    async def book_confirmed_entries(self) -> None:
+        """Book entries confirmed outside this worker's settlement (restart recovery)."""
+
+        for position_id in self._modes.open_positions():
+            if self._accounting.position_for(position_id) is not None:
+                continue
+            context = await self._contexts.get(position_id)
+            if context is None or context.mode is TradingMode.SHADOW:
+                continue
+            record = await self._executions.get_by_idempotency_key(
+                entry_idempotency_key(context.plan_id)
+            )
+            if record is None or record.phase is not ExecutionPhase.CONFIRMED:
+                continue
+            try:
+                await self._book.book(record.command.command_id, context.entry_price)
+            except Exception as error:
+                self._log.error(
+                    "gateway_fill_not_booked", position_id=position_id, **error_fields(error)
+                )
+                self._alerts.raise_alert(
+                    "GATEWAY_FILL_UNBOOKED",
+                    f"confirmed entry of position {position_id} could not be booked",
+                    dedupe_key=f"unbooked:{position_id}",
+                )
+
+    async def apply(
+        self, actions: Mapping[str, PositionActionKind]
+    ) -> tuple[PositionActionResult, ...]:
+        """``actions``: this cycle's monitor decision per position id."""
+
+        results: list[PositionActionResult] = []
+        for position_id in self._modes.open_positions():
+            position = self._accounting.position_for(position_id)
+            if (
+                position is None
+                or position.mode is TradingMode.SHADOW
+                or position.status is not PositionStatus.OPEN
+            ):
+                continue
+            result = await self._advance(position, actions.get(position_id))
+            if result is not None:
+                self._metrics.execution(position.mode, f"POSITION_{result.status.value}")
+                self._log.info(
+                    "gateway_position_action",
+                    position_id=position_id,
+                    status=result.status.value,
+                    attempt=result.attempt,
+                    detail=result.detail,
+                )
+                results.append(result)
+        return tuple(results)
+
+    async def _advance(
+        self, position: ShadowPosition, action: PositionActionKind | None
+    ) -> PositionActionResult | None:
+        position_id = position.position_id
+        history = await self._sequence(position_id)
+        for attempt, record in enumerate(history, start=1):
+            if _partially_executed(record):
+                return self._operator_required(position_id, record, attempt)
+        if history:
+            result = await self._continue(position, history[-1], len(history))
+            if result is not None:
+                return result
+        if action not in (PositionActionKind.EXIT, PositionActionKind.REDUCE):
+            return None
+        operation = DlmmOperation.CLOSE
+        if action is PositionActionKind.REDUCE:
+            if any(
+                record.command.operation is DlmmOperation.REMOVE
+                and record.phase is ExecutionPhase.CONFIRMED
+                for record in history
+            ):
+                return None
+            operation = DlmmOperation.REMOVE
+        attempt = len(history) + 1
+        if attempt > self._attempts:
+            self._alerts.raise_alert(
+                "POSITION_ACTION_ATTEMPTS_EXHAUSTED",
+                f"position {position_id} needs an operator: {self._attempts} gateway "
+                "attempts ended without an exit",
+                dedupe_key=f"exhausted:{position_id}",
+            )
+            return PositionActionResult(position_id, PositionActionStatus.EXHAUSTED)
+        state = self._modes.mode_state()
+        if (
+            state.kill_switch_active
+            and self._policy.kill_switch_policy is KillSwitchPolicy.HOLD_AND_ALERT
+        ):
+            return PositionActionResult(position_id, PositionActionStatus.HELD, attempt)
+        return await self._start(position, operation, attempt)
+
+    async def _continue(
+        self, position: ShadowPosition, record: ExecutionRecord, attempt: int
+    ) -> PositionActionResult | None:
+        """Drive the latest attempt; ``None`` means it has ended and frees the slot."""
+
+        position_id = position.position_id
+        if record.phase in UNRESOLVED_PHASES:
+            try:
+                state = await self._service.reconcile(record.command.command_id)
+            except Exception as error:
+                return self._unavailable(position_id, attempt, error)
+            outcome = settled_result(state, record.command, blocked=record.phase.value)
+            return await self._outcome(position, record.command, outcome, attempt)
+        if record.phase in _EXECUTABLE_PHASES:
+            outcome = await execute_command(self._service, record.command)
+            return await self._outcome(position, record.command, outcome, attempt)
+        if record.phase is ExecutionPhase.AWAITING_APPROVAL:
+            if record.command.expires_at > self._clock.now():
+                return PositionActionResult(
+                    position_id, PositionActionStatus.AWAITING_APPROVAL, attempt
+                )
+            return None
+        if record.phase is ExecutionPhase.CONFIRMED:
+            settled = await self._settle(position, record.command, attempt)
+            if settled.status is PositionActionStatus.REDUCED:
+                return None  # the reduction is booked: the slot is free for an exit
+            return settled
+        return None  # FAILED / EXPIRED: the attempt ended without a transaction
+
+    async def _start(
+        self, position: ShadowPosition, operation: DlmmOperation, attempt: int
+    ) -> PositionActionResult:
+        position_id = position.position_id
+        context = await self._contexts.get(position_id)
+        if context is None:
+            self._alerts.raise_alert(
+                "POSITION_CONTEXT_MISSING",
+                f"open position {position_id} has no durable context",
+                dedupe_key=f"context:{position_id}",
+            )
+            return PositionActionResult(
+                position_id, PositionActionStatus.FAILED, attempt, "CONTEXT_MISSING"
+            )
+        command = DlmmCommandV1(
+            command_id=position_action_command_id(position_id, attempt),
+            idempotency_key=position_action_key(position_id, attempt),
+            correlation_id=_correlation(context.correlation_id),
+            ruleset_version=position.ruleset_version,
+            mode=position.mode,
+            operation=operation,
+            pool_address=position.pool_address,
+            wallet_address=context.wallet_address,
+            position_address=position_id,
+            expires_at=self._clock.now() + POSITION_ACTION_TTL,
+            max_slippage_bps=context.max_slippage_bps,
+            min_bin_id=context.min_bin_id,
+            max_bin_id=context.max_bin_id,
+            remove_bps=10_000 if operation is DlmmOperation.CLOSE else self._reduce_bps,
+        )
+        self._resolver.stage(command)
+        try:
+            preview = await self._service.prepare(command.command_id)
+        except GatewayRejected as error:
+            return self._unavailable(position_id, attempt, error)
+        except ExecutionBlocked as error:
+            # A failed or too-expensive simulation: this attempt ended, nothing was sent.
+            failed = SubmitResult(SubmitStatus.FAILED, detail=str(error))
+            return await self._outcome(position, command, failed, attempt)
+        except Exception as error:
+            return self._unavailable(position_id, attempt, error)
+        finally:
+            self._resolver.discard(command.command_id)
+        if preview.phase is ExecutionPhase.AWAITING_APPROVAL:
+            return PositionActionResult(
+                position_id, PositionActionStatus.AWAITING_APPROVAL, attempt
+            )
+        outcome = await execute_command(self._service, command)
+        return await self._outcome(position, command, outcome, attempt)
+
+    async def _outcome(
+        self,
+        position: ShadowPosition,
+        command: DlmmCommandV1,
+        outcome: SubmitResult,
+        attempt: int,
+    ) -> PositionActionResult:
+        position_id = position.position_id
+        if outcome.status is SubmitStatus.CONFIRMED:
+            return await self._settle(position, command, attempt)
+        if outcome.status is SubmitStatus.PENDING:
+            return PositionActionResult(
+                position_id, PositionActionStatus.PENDING, attempt, outcome.detail
+            )
+        try:
+            record = await self._executions.get(command.command_id)
+        except Exception as error:
+            # The next cycle re-reads the sequence before any new attempt.
+            self._log.error("execution_record_unavailable", **error_fields(error))
+            record = None
+        if record is not None and _partially_executed(record):
+            return self._operator_required(position_id, record, attempt)
+        self._alerts.raise_alert(
+            "POSITION_ACTION_FAILED",
+            f"gateway {command.operation.value} of position {position_id} failed "
+            f"(attempt {attempt}): {outcome.detail}",
+            dedupe_key=f"action-failed:{position_id}:{attempt}",
+        )
+        return PositionActionResult(
+            position_id, PositionActionStatus.FAILED, attempt, outcome.detail
+        )
+
+    async def _settle(
+        self, position: ShadowPosition, command: DlmmCommandV1, attempt: int
+    ) -> PositionActionResult:
+        position_id = position.position_id
+        market = await self._history.history(
+            position.pool_address, until=self._clock.now(), limit=1
+        )
+        if not market:
+            return PositionActionResult(
+                position_id, PositionActionStatus.PENDING, attempt, "MARKET_PRICE_UNAVAILABLE"
+            )
+        booked = await self._book.book(command.command_id, market[-1].price)
+        if booked.position.status is PositionStatus.CLOSED:
+            try:
+                self._modes.close_position(position_id)
+            except ValueError as error:
+                self._log.warning(
+                    "position_already_closed", position_id=position_id, **error_fields(error)
+                )
+            return PositionActionResult(position_id, PositionActionStatus.EXITED, attempt)
+        return PositionActionResult(position_id, PositionActionStatus.REDUCED, attempt)
+
+    def _operator_required(
+        self, position_id: str, record: ExecutionRecord, attempt: int
+    ) -> PositionActionResult:
+        """A partly landed command: no automatic attempt for this position any more."""
+
+        self._alerts.raise_alert(
+            "POSITION_PARTIALLY_EXECUTED",
+            f"gateway {record.command.operation.value} of position {position_id} failed "
+            f"after part of its transactions was broadcast (attempt {attempt}); "
+            "the position needs an operator before any further automatic action",
+            dedupe_key=f"partial:{position_id}",
+        )
+        return PositionActionResult(
+            position_id, PositionActionStatus.OPERATOR_REQUIRED, attempt, "PARTIALLY_EXECUTED"
+        )
+
+    def _unavailable(
+        self, position_id: str, attempt: int, error: Exception
+    ) -> PositionActionResult:
+        self._log.error("gateway_unavailable", position_id=position_id, **error_fields(error))
+        self._alerts.raise_alert(
+            "EXIT_GATEWAY_UNAVAILABLE",
+            f"position {position_id} stays open: the execution gateway is unavailable",
+            dedupe_key=f"exit-gateway-unavailable:{position_id}",
+        )
+        return PositionActionResult(
+            position_id, PositionActionStatus.FAILED, attempt, "GATEWAY_UNAVAILABLE"
+        )
+
+    async def _sequence(self, position_id: str) -> list[ExecutionRecord]:
+        records: list[ExecutionRecord] = []
+        for attempt in range(1, self._attempts + 1):
+            record = await self._executions.get_by_idempotency_key(
+                position_action_key(position_id, attempt)
+            )
+            if record is None:
+                break
+            records.append(record)
+        return records
+
+
+def _partially_executed(record: ExecutionRecord) -> bool:
+    """FAILED, yet some of several transactions were broadcast: part may have landed."""
+
+    receipt = record.receipt
+    return (
+        receipt is not None
+        and receipt.state is GatewayState.FAILED
+        and receipt.transaction_count > 1
+        and bool(receipt.signatures)
+    )
+
+
+def _correlation(value: str) -> UUID:
+    try:
+        return UUID(value)
+    except ValueError:
+        return uuid5(NAMESPACE_URL, f"correlation:{value}")

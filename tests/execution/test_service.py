@@ -14,6 +14,7 @@ from src.execution.contracts import (
     ChainReceiptV1,
     ChainState,
     DlmmCommandV1,
+    DlmmOperation,
     ExecutionPhase,
     GatewayReceiptV1,
     GatewayState,
@@ -26,6 +27,8 @@ from src.execution.contracts import (
 )
 from src.execution.service import (
     ExecutionBlocked,
+    ExecutionOutcomeUnknown,
+    ExecutionRecord,
     ExecutionService,
     HmacApprovalVerifier,
     InMemoryExecutionStore,
@@ -33,6 +36,7 @@ from src.execution.service import (
     StaticPlanResolver,
     sign_operator_approval,
 )
+from src.modes.models import KillSwitchPolicy
 
 NOW = datetime(2026, 10, 18, 12, tzinfo=UTC)
 PLAN_ID = UUID("30000000-0000-4000-8000-000000000001")
@@ -116,6 +120,19 @@ def command(
             "amount_y": "2000",
         }
     )
+
+
+class KillSwitch:
+    def __init__(self, active: bool = False) -> None:
+        self.active = active
+        self.reads = 0
+
+    async def kill_switch_active(self) -> bool:
+        self.reads += 1
+        return self.active
+
+
+CLEAR = KillSwitch()
 
 
 class RecordingGateway:
@@ -284,6 +301,7 @@ async def _assert_shadow_mode_physically_never_calls_submit() -> None:
         plans=StaticPlanResolver({PLAN_ID: value}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.SHADOW,
+        kill_switch=CLEAR,
     )
 
     await service.prepare(PLAN_ID)
@@ -306,6 +324,7 @@ async def _assert_simulation_failure_reaches_a_terminal_phase_without_submit() -
         plans=StaticPlanResolver({PLAN_ID: command(TradingMode.LIVE)}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
     )
 
     with pytest.raises(ExecutionBlocked, match="simulation failed"):
@@ -330,6 +349,7 @@ async def _assert_approval_ttl_and_fresh_simulation_are_required() -> None:
         plans=StaticPlanResolver({PLAN_ID: command()}),
         clock=clock,
         allowed_mode=TradingMode.APPROVAL,
+        kill_switch=CLEAR,
         simulation_ttl=timedelta(seconds=30),
         approval_verifier=HmacApprovalVerifier(APPROVAL_SECRET),
     )
@@ -362,6 +382,7 @@ async def _assert_stale_simulation_is_rejected_even_with_current_approval() -> N
         plans=StaticPlanResolver({PLAN_ID: command()}),
         clock=clock,
         allowed_mode=TradingMode.APPROVAL,
+        kill_switch=CLEAR,
         simulation_ttl=timedelta(seconds=30),
         approval_verifier=HmacApprovalVerifier(APPROVAL_SECRET),
     )
@@ -394,6 +415,7 @@ async def _assert_resimulation_invalidates_the_old_approval() -> None:
         plans=StaticPlanResolver({PLAN_ID: command()}),
         clock=clock,
         allowed_mode=TradingMode.APPROVAL,
+        kill_switch=CLEAR,
         simulation_ttl=timedelta(seconds=30),
         approval_verifier=HmacApprovalVerifier(APPROVAL_SECRET),
     )
@@ -439,6 +461,7 @@ async def _assert_changed_command_cannot_reuse_a_prepared_idempotency_key() -> N
         plans=StaticPlanResolver({PLAN_ID: original}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
         live_promotion=live_promotion(),
     )
     await first.prepare(PLAN_ID)
@@ -449,6 +472,7 @@ async def _assert_changed_command_cannot_reuse_a_prepared_idempotency_key() -> N
         plans=StaticPlanResolver({PLAN_ID: changed}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
         live_promotion=live_promotion(),
     )
 
@@ -472,6 +496,7 @@ async def _assert_changed_command_cannot_reuse_a_command_id_with_a_new_key() -> 
         plans=StaticPlanResolver({PLAN_ID: original}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
         live_promotion=live_promotion(),
     )
     await first.prepare(PLAN_ID)
@@ -484,6 +509,7 @@ async def _assert_changed_command_cannot_reuse_a_command_id_with_a_new_key() -> 
         plans=StaticPlanResolver({PLAN_ID: changed}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
         live_promotion=live_promotion(),
     )
 
@@ -511,6 +537,7 @@ async def _assert_signed_approval_is_durable_and_one_shot_across_restart(
         plans=StaticPlanResolver({PLAN_ID: command()}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.APPROVAL,
+        kill_switch=CLEAR,
         approval_verifier=HmacApprovalVerifier(APPROVAL_SECRET),
     )
     preview = await first.prepare(PLAN_ID)
@@ -530,6 +557,7 @@ async def _assert_signed_approval_is_durable_and_one_shot_across_restart(
         plans=StaticPlanResolver({PLAN_ID: command()}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.APPROVAL,
+        kill_switch=CLEAR,
         approval_verifier=HmacApprovalVerifier(APPROVAL_SECRET),
     )
     receipt = await restarted.execute(COMMAND_ID)
@@ -544,6 +572,7 @@ async def _assert_signed_approval_is_durable_and_one_shot_across_restart(
         plans=StaticPlanResolver({SECOND_PLAN_ID: second_value}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.APPROVAL,
+        kill_switch=CLEAR,
         approval_verifier=HmacApprovalVerifier(APPROVAL_SECRET),
     )
     second_preview = await second.prepare(SECOND_PLAN_ID)
@@ -576,6 +605,7 @@ async def _assert_live_promotion_requires_ten_cycles_and_completed_checklist() -
         plans=StaticPlanResolver({PLAN_ID: command(TradingMode.LIVE)}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
         live_promotion=evidence,
     )
     await service.prepare(PLAN_ID)
@@ -606,6 +636,7 @@ async def _assert_live_promotion_rechecks_blank_operator_confirmation() -> None:
         plans=StaticPlanResolver({PLAN_ID: command(TradingMode.LIVE)}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
         live_promotion=unsafe_evidence,
     )
     await service.prepare(PLAN_ID)
@@ -628,6 +659,7 @@ async def _assert_unknown_receipt_reconciles_without_resubmission() -> None:
         plans=StaticPlanResolver({PLAN_ID: command(TradingMode.LIVE)}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
         live_promotion=live_promotion(),
     )
     await service.prepare(PLAN_ID)
@@ -653,6 +685,7 @@ async def _assert_multi_transaction_receipt_fails_if_any_signature_failed() -> N
         plans=StaticPlanResolver({PLAN_ID: command(TradingMode.LIVE)}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
         live_promotion=live_promotion(),
     )
     await service.prepare(PLAN_ID)
@@ -678,13 +711,14 @@ async def _assert_uncertain_submit_is_terminal_until_operator_recovery() -> None
         plans=StaticPlanResolver({PLAN_ID: command(TradingMode.LIVE)}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
         live_promotion=live_promotion(),
     )
     await service.prepare(PLAN_ID)
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(ExecutionOutcomeUnknown):
         await service.execute(COMMAND_ID)
-    with pytest.raises(ExecutionBlocked, match="outcome is unknown"):
+    with pytest.raises(ExecutionOutcomeUnknown, match="outcome is unknown"):
         await service.execute(COMMAND_ID)
 
     record = await store.get(COMMAND_ID)
@@ -709,6 +743,7 @@ async def _assert_durable_receipt_reconciles_after_restart(tmp_path: Path) -> No
         plans=StaticPlanResolver({PLAN_ID: command(TradingMode.LIVE)}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
         live_promotion=live_promotion(),
     )
     await first.prepare(PLAN_ID)
@@ -722,6 +757,7 @@ async def _assert_durable_receipt_reconciles_after_restart(tmp_path: Path) -> No
         plans=StaticPlanResolver({PLAN_ID: command(TradingMode.LIVE)}),
         clock=FrozenClock(NOW),
         allowed_mode=TradingMode.LIVE,
+        kill_switch=CLEAR,
         live_promotion=live_promotion(),
     )
     reconciled = await restarted.execute(COMMAND_ID)
@@ -731,3 +767,114 @@ async def _assert_durable_receipt_reconciles_after_restart(tmp_path: Path) -> No
     assert reconciled.state is GatewayState.CONFIRMED
     assert gateway.submit_calls == 1
     assert gateway.status_calls == 1
+
+
+class KillSwitchOnSubmitting(InMemoryExecutionStore):
+    """The operator hits the kill switch while the SUBMITTING intent is being written."""
+
+    def __init__(self, kill_switch: KillSwitch) -> None:
+        super().__init__()
+        self._kill_switch = kill_switch
+
+    async def put(self, record: ExecutionRecord) -> None:
+        await super().put(record)
+        if record.phase is ExecutionPhase.SUBMITTING:
+            self._kill_switch.active = True
+
+
+def close_command() -> DlmmCommandV1:
+    return command(TradingMode.LIVE).model_copy(
+        update={
+            "operation": DlmmOperation.CLOSE,
+            "strategy": None,
+            "amount_x": None,
+            "amount_y": None,
+            "remove_bps": 10_000,
+        }
+    )
+
+
+def live_service(
+    value: DlmmCommandV1,
+    store: InMemoryExecutionStore,
+    gateway: RecordingGateway,
+    kill_switch: KillSwitch | None,
+    policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT,
+) -> ExecutionService:
+    return ExecutionService(
+        gateway=gateway,
+        store=store,
+        plans=StaticPlanResolver({PLAN_ID: value}),
+        clock=FrozenClock(NOW),
+        allowed_mode=TradingMode.LIVE,
+        live_promotion=live_promotion(),
+        kill_switch=kill_switch,
+        kill_switch_policy=policy,
+    )
+
+
+def test_kill_switch_raised_after_the_submitting_write_stops_the_gateway_submit() -> None:
+    async def scenario() -> tuple[int, ExecutionPhase]:
+        gateway = RecordingGateway()
+        kill_switch = KillSwitch()
+        store = KillSwitchOnSubmitting(kill_switch)
+        service = live_service(command(TradingMode.LIVE), store, gateway, kill_switch)
+        await service.prepare(PLAN_ID)
+        with pytest.raises(ExecutionBlocked, match="kill switch is active"):
+            await service.execute(COMMAND_ID)
+        record = await store.get(COMMAND_ID)
+        assert record is not None
+        return gateway.submit_calls, record.phase
+
+    submits, phase = asyncio.run(scenario())
+
+    assert submits == 0
+    assert phase is ExecutionPhase.FAILED
+
+
+@pytest.mark.parametrize("probe", [None, "failing"], ids=["not-wired", "unavailable"])
+def test_unknown_kill_switch_state_never_lets_a_command_out(probe: str | None) -> None:
+    class FailingKillSwitch(KillSwitch):
+        async def kill_switch_active(self) -> bool:
+            raise ConnectionError("mode store unreachable")
+
+    async def scenario() -> int:
+        gateway = RecordingGateway()
+        kill_switch = None if probe is None else FailingKillSwitch()
+        service = live_service(
+            command(TradingMode.LIVE), InMemoryExecutionStore(), gateway, kill_switch
+        )
+        await service.prepare(PLAN_ID)
+        with pytest.raises(ExecutionBlocked, match="kill switch"):
+            await service.execute(COMMAND_ID)
+        return gateway.submit_calls
+
+    assert asyncio.run(scenario()) == 0
+
+
+@pytest.mark.parametrize(
+    ("operation", "policy", "submitted"),
+    [
+        ("CLOSE", KillSwitchPolicy.ORDERLY_EXIT, True),
+        ("CLOSE", KillSwitchPolicy.HOLD_AND_ALERT, False),
+        ("OPEN", KillSwitchPolicy.ORDERLY_EXIT, False),
+    ],
+)
+def test_active_kill_switch_lets_only_an_orderly_exit_through(
+    operation: str, policy: KillSwitchPolicy, submitted: bool
+) -> None:
+    value = close_command() if operation == "CLOSE" else command(TradingMode.LIVE)
+
+    async def scenario() -> int:
+        gateway = RecordingGateway()
+        service = live_service(
+            value, InMemoryExecutionStore(), gateway, KillSwitch(active=True), policy
+        )
+        await service.prepare(PLAN_ID)
+        try:
+            await service.execute(COMMAND_ID)
+        except ExecutionBlocked:
+            pass
+        return gateway.submit_calls
+
+    assert asyncio.run(scenario()) == (1 if submitted else 0)

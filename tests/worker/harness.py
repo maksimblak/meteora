@@ -28,10 +28,13 @@ from src.market.universe import InMemoryUniverseStore
 from src.modes import InMemoryModeRepository
 from src.observability.alerts import CriticalAlertReporter
 from src.observability.metrics import WorkerMetrics
+from src.persistence.factory import PersistenceBackend, Repositories
 from src.persistence.memory import (
     InMemoryAuditLog,
     InMemoryDecisionStore,
+    InMemoryJobLeases,
     InMemoryPositionContexts,
+    InMemoryRecoverableExecutionStore,
     InMemorySnapshotHistory,
 )
 from src.providers.fixtures import FixtureFailure, FixtureOnChainProvider
@@ -127,6 +130,24 @@ def harness_policy() -> PipelinePolicy:
         maximum_history_points=20,
         entry_notional_quote=Decimal("10"),
         quote_base_units_per_unit=Decimal(1_000_000),
+    )
+
+
+def memory_repositories(clock: FrozenClock) -> Repositories:
+    """Every store of the worker in memory; a test models a restart by reusing it."""
+
+    universe = InMemoryUniverseStore()
+    return Repositories(
+        backend=PersistenceBackend.SQLITE,
+        mode=InMemoryModeRepository(),
+        accounting=InMemoryAccountingRepository(),
+        execution=InMemoryRecoverableExecutionStore(),
+        leases=InMemoryJobLeases(clock),
+        audit=InMemoryAuditLog(),
+        universe=universe,
+        history=InMemorySnapshotHistory(universe),
+        decisions=InMemoryDecisionStore(),
+        positions=InMemoryPositionContexts(),
     )
 
 

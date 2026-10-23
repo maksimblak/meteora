@@ -11,6 +11,10 @@ any new action) -> lease-guarded scheduler. Jobs, by priority:
 
 The default stack is SHADOW-only: without an execution gateway, APPROVAL/LIVE
 entries are cancelled as ``EXECUTION_GATEWAY_NOT_CONFIGURED`` and nothing is sent.
+A gateway is wired only for ``TRADING_MODE`` APPROVAL or LIVE with ``EXECUTOR_URL``,
+the internal token and PostgreSQL (the execution store must be durable). It then
+serves exactly that mode: approved entries continue inside the entry job and
+non-SHADOW exits inside the position job, both from durable execution records.
 """
 
 import asyncio
@@ -20,7 +24,8 @@ import signal
 import socket
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
+from typing import Protocol
 from uuid import uuid4
 
 import httpx
@@ -30,7 +35,16 @@ from src.core.config import AppConfig
 from src.core.logging import configure_logging
 from src.domain.models.primitives import PublicKey
 from src.domain.models.trading import TradingMode
-from src.execution.service import ExecutionService
+from src.execution.contracts import LivePromotionEvidence
+from src.execution.http_gateway import HttpExecutionGateway
+from src.execution.service import (
+    ApprovalVerifier,
+    ExecutionGateway,
+    ExecutionService,
+    HmacApprovalVerifier,
+    ReceiptLookup,
+)
+from src.execution.settings import ExecutorSettings
 from src.market.contracts import MarketDataProvider, OnChainProvider
 from src.market.models import (
     AuthorityStatus,
@@ -54,19 +68,25 @@ from src.observability.logging import error_fields, get_logger
 from src.observability.metrics import WorkerMetrics
 from src.observability.sinks import LoggingEventSink
 from src.persistence.contracts import EventSink
-from src.persistence.factory import Repositories, open_repositories
+from src.persistence.factory import PersistenceBackend, Repositories, open_repositories
 from src.providers.contracts import ProviderUnavailableError
 from src.recovery.service import ExecutorLease, RecoveryService
 from src.worker.execution import (
+    AnchorSource,
+    CommandResolver,
     CommandSubmitter,
     EntryExecutor,
+    GatewayEntrySettler,
+    GatewayFillBook,
+    GatewayPositionManager,
     GatewaySubmitter,
-    RegisteredPlanResolver,
+    ModeKillSwitch,
     ShadowSubmitter,
     shadow_address,
+    snapshot_anchor,
 )
 from src.worker.pipeline import CandidatePipeline
-from src.worker.policy import PipelinePolicy, hypothesis_policy
+from src.worker.policy import PipelinePolicy, load_pipeline_policy
 from src.worker.portfolio import RiskDayKeeper, ShadowPortfolio
 from src.worker.positions import PositionCycle
 from src.worker.scheduler import JobContext, JobSpec, Scheduler
@@ -75,6 +95,8 @@ from src.worker.scheduler import JobContext, JobSpec, Scheduler
 # may be running" and its TTL as the age after which a claim counts as abandoned.
 CANDIDATE_JOB = "candidate_pipeline"
 CANDIDATE_LEASE_TTL = timedelta(minutes=2)
+# The executor readiness probe runs on the health tick, but not more often than this.
+GATEWAY_READINESS_INTERVAL = timedelta(seconds=15)
 
 _UNKNOWN_SIGNALS = (
     "blacklisted",
@@ -132,6 +154,27 @@ class WorkerSettings:
         )
 
 
+class GatewayReadiness(Protocol):
+    async def ready(self, mode: TradingMode) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayWiring:
+    """The execution gateway for exactly one non-SHADOW mode (``TRADING_MODE``)."""
+
+    gateway: ExecutionGateway
+    allowed_mode: TradingMode
+    receipts: ReceiptLookup | None = None
+    readiness: GatewayReadiness | None = None
+    approval_verifier: ApprovalVerifier | None = None
+    live_promotion: LivePromotionEvidence | None = None
+    simulation_ttl: timedelta = timedelta(minutes=2)
+
+    def __post_init__(self) -> None:
+        if self.allowed_mode is TradingMode.SHADOW:
+            raise ValueError("SHADOW never uses the execution gateway")
+
+
 class UnavailableOnChainProvider:
     """Used when no Solana RPC is configured: every strict signal is ``UNKNOWN``."""
 
@@ -178,8 +221,8 @@ class WorkerRuntime:
         metrics: WorkerMetrics | None = None,
         health: HealthMonitor | None = None,
         sink: EventSink | None = None,
-        execution_service: ExecutionService | None = None,
-        plan_resolver: RegisteredPlanResolver | None = None,
+        gateway: GatewayWiring | None = None,
+        anchors: AnchorSource = snapshot_anchor,
         wallet_address: str | None = None,
     ) -> None:
         self.settings = settings
@@ -202,10 +245,52 @@ class WorkerRuntime:
         submitters: dict[TradingMode, CommandSubmitter] = {
             TradingMode.SHADOW: ShadowSubmitter(repos.accounting, clock, policy.shadow_costs)
         }
-        if execution_service is not None:
-            gateway = GatewaySubmitter(execution_service, plan_resolver or RegisteredPlanResolver())
-            submitters[TradingMode.APPROVAL] = gateway
-            submitters[TradingMode.LIVE] = gateway
+        self._gateway = gateway
+        self._gateway_checked_at: datetime | None = None
+        self.execution: ExecutionService | None = None
+        self.gateway_entries: GatewayEntrySettler | None = None
+        self.gateway_positions: GatewayPositionManager | None = None
+        if gateway is not None:
+            resolver = CommandResolver(repos.execution)
+            self.execution = ExecutionService(
+                gateway=gateway.gateway,
+                store=repos.execution,
+                plans=resolver,
+                clock=clock,
+                allowed_mode=gateway.allowed_mode,
+                simulation_ttl=gateway.simulation_ttl,
+                approval_verifier=gateway.approval_verifier,
+                live_promotion=gateway.live_promotion,
+                receipts=gateway.receipts,
+                kill_switch=ModeKillSwitch(repos.mode),
+                kill_switch_policy=policy.kill_switch_policy,
+            )
+            book = GatewayFillBook(repos.accounting, repos.execution, clock, policy.shadow_costs)
+            submitters[gateway.allowed_mode] = GatewaySubmitter(self.execution, resolver, book)
+            self.gateway_entries = GatewayEntrySettler(
+                modes=repos.mode,
+                executions=repos.execution,
+                service=self.execution,
+                book=book,
+                contexts=repos.positions,
+                alerts=self.alerts,
+                clock=clock,
+                metrics=self.metrics,
+            )
+            self.gateway_positions = GatewayPositionManager(
+                modes=repos.mode,
+                accounting=repos.accounting,
+                contexts=repos.positions,
+                history=repos.history,
+                executions=repos.execution,
+                service=self.execution,
+                resolver=resolver,
+                book=book,
+                alerts=self.alerts,
+                clock=clock,
+                metrics=self.metrics,
+                policy=policy,
+            )
         wallet = wallet_address or shadow_address("meteora-volume-bot:shadow-wallet")
         self.entries = EntryExecutor(
             modes=repos.mode,
@@ -217,6 +302,7 @@ class WorkerRuntime:
             metrics=self.metrics,
             policy=policy,
             wallet_address=wallet,
+            anchors=anchors,
         )
         self.pipeline = CandidatePipeline(
             history=repos.history,
@@ -253,7 +339,7 @@ class WorkerRuntime:
             clock=clock,
             metrics=self.metrics,
             executions=repos.execution,
-            execution_service=execution_service,
+            execution_service=self.execution,
             executor_lease=ExecutorLease(
                 repos.leases, CANDIDATE_JOB, f"{settings.owner}:recovery", CANDIDATE_LEASE_TTL
             ),
@@ -261,7 +347,7 @@ class WorkerRuntime:
         )
         self.relay = repos.outbox_relay(sink or LoggingEventSink(), clock, owner=settings.owner)
         self.retention = repos.retention()
-        self.health.set_execution_gateway(None if execution_service is None else True)
+        self.health.set_execution_gateway(None if gateway is None else False)
         if market is not None:
             self.health.register_provider("meteora", lambda: market.health)
         self.health.register_provider("solana", lambda: onchain.health)
@@ -294,7 +380,13 @@ class WorkerRuntime:
     # --- jobs ---------------------------------------------------------------------------
 
     async def position_job(self, context: JobContext) -> None:
-        await self.positions.run_all(correlation_id=context.correlation_id)
+        if self.gateway_positions is not None:
+            await self.gateway_positions.book_confirmed_entries()
+        report = await self.positions.run_all(correlation_id=context.correlation_id)
+        if self.gateway_positions is not None:
+            await self.gateway_positions.apply(
+                {item.position_id: item.action for item in report.reviews if not item.closed}
+            )
 
     async def recovery_job(self, context: JobContext) -> None:
         await self.recovery.reconcile()
@@ -302,6 +394,9 @@ class WorkerRuntime:
 
     async def candidate_job(self, context: JobContext) -> None:
         self.keeper.ensure_open()
+        if self.gateway_entries is not None:
+            # Approved and interrupted entries first, under this job's lease.
+            await self.gateway_entries.run()
         snapshots = await self.repositories.history.latest_universe()
         held = await self._open_position_pools()
         addresses = [
@@ -369,6 +464,7 @@ class WorkerRuntime:
 
     async def refresh_health(self) -> None:
         self.health.heartbeat()
+        await self._refresh_gateway_readiness()
         reachable = await self.repositories.ping()
         self.health.set_persistence(reachable)
         if not reachable:
@@ -406,6 +502,23 @@ class WorkerRuntime:
             if server is not None:
                 await server.close()
 
+    async def _refresh_gateway_readiness(self) -> None:
+        wiring = self._gateway
+        if wiring is None:
+            return
+        now = self.clock.now()
+        checked = self._gateway_checked_at
+        if checked is not None and now - checked < GATEWAY_READINESS_INTERVAL:
+            return
+        self._gateway_checked_at = now
+        ready = False
+        if wiring.readiness is not None:
+            try:
+                ready = await wiring.readiness.ready(wiring.allowed_mode)
+            except Exception as error:
+                self._log.warning("gateway_readiness_failed", **error_fields(error))
+        self.health.set_execution_gateway(ready)
+
     async def _open_position_pools(self) -> set[str]:
         open_ids = set(self.repositories.mode.open_positions())
         return {
@@ -418,12 +531,66 @@ class WorkerRuntime:
         self.repositories.close()
 
 
+def build_gateway(
+    config: AppConfig,
+    environ: Mapping[str, str],
+    repositories: Repositories,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[GatewayWiring | None, httpx.AsyncClient | None]:
+    """The HTTP gateway for ``TRADING_MODE``, or ``None``: SHADOW never gets one."""
+
+    mode = config.requested_mode
+    if mode is TradingMode.SHADOW:
+        return None, None
+    log = get_logger("worker.runtime")
+    settings = ExecutorSettings.from_environment(environ)
+    token = config.executor_internal_token
+    if settings.url is None or token is None:
+        missing = [
+            name
+            for name, value in (("EXECUTOR_URL", settings.url), ("EXECUTOR_INTERNAL_TOKEN", token))
+            if value is None
+        ]
+        log.warning("execution_gateway_not_configured", mode=mode.value, missing=missing)
+        return None, None
+    if repositories.backend is not PersistenceBackend.POSTGRESQL:
+        log.warning(
+            "execution_gateway_refused", mode=mode.value, reason="DURABLE_EXECUTION_STORE_REQUIRED"
+        )
+        return None, None
+    client = httpx.AsyncClient(
+        base_url=settings.url, timeout=settings.timeout.total_seconds(), transport=transport
+    )
+    gateway = HttpExecutionGateway(
+        client,
+        internal_token=token.get_secret_value(),
+        mode_token=None if settings.mode_token is None else settings.mode_token.get_secret_value(),
+    )
+    secret = settings.approval_secret
+    wiring = GatewayWiring(
+        gateway=gateway,
+        allowed_mode=mode,
+        receipts=gateway,
+        readiness=gateway,
+        approval_verifier=None
+        if secret is None
+        else HmacApprovalVerifier(secret.get_secret_value().encode("utf-8")),
+        live_promotion=settings.live_promotion() if mode is TradingMode.LIVE else None,
+    )
+    return wiring, client
+
+
 def build_runtime(
     config: AppConfig,
     environ: Mapping[str, str],
     *,
     clock: Clock | None = None,
+    executor_transport: httpx.AsyncBaseTransport | None = None,
 ) -> tuple[WorkerRuntime, list[httpx.AsyncClient]]:
+    # The rule bundle (RULESET_VERSION, RULESET_OVERRIDES_FILE) is resolved first: an
+    # unknown or invalid ruleset stops the start before any store or client is opened.
+    policy = load_pipeline_policy(environ)
     clock = clock or SystemClock()
     settings = WorkerSettings.from_environment(environ)
     metrics = WorkerMetrics()
@@ -451,14 +618,20 @@ def build_runtime(
         onchain = InstrumentedOnChainProvider(
             SolanaRpcProvider(ResilientHttpClient(client), clock=clock), metrics, name="solana"
         )
+    gateway, executor_client = build_gateway(
+        config, environ, repositories, transport=executor_transport
+    )
+    if executor_client is not None:
+        clients.append(executor_client)
     runtime = WorkerRuntime(
         settings=settings,
-        policy=hypothesis_policy(),
+        policy=policy,
         repositories=repositories,
         market=market,
         onchain=onchain,
         clock=clock,
         metrics=metrics,
+        gateway=gateway,
         wallet_address=config.wallet_public_key,
     )
     return runtime, clients
