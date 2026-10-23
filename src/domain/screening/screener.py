@@ -10,6 +10,8 @@ from src.domain.screening.models import (
     CandidateStatus,
     DecisionContext,
     DecisionFlag,
+    DepthEvidence,
+    DepthSource,
     EvidenceItem,
     GuideAssessment,
     IntegrityStatus,
@@ -17,6 +19,7 @@ from src.domain.screening.models import (
     ScoreComponent,
     ScreeningPolicy,
     VolumeIntegrityAssessment,
+    VolumeIntegrityMode,
     VolumeRegime,
 )
 from src.market.models import (
@@ -26,6 +29,7 @@ from src.market.models import (
     PoolSnapshot,
     RiskSignal,
     TokenRiskSnapshot,
+    WindowOrigin,
 )
 
 
@@ -34,21 +38,34 @@ def assess_volume_integrity(
     features: VolumeSpikeFeatures,
     policy: ScreeningPolicy,
 ) -> VolumeIntegrityAssessment:
-    """Require corroboration; a large spike alone is never labelled fake volume."""
+    """Require corroboration; a large spike alone is never labelled fake volume.
+
+    ``PARTICIPANTS``: transaction and participant counts and a wash-trading verdict are
+    mandatory. ``AVAILABLE_SIGNALS`` (D07, the Data API has no counts): turnover, fee
+    organicity and burst self-similarity are mandatory; counts are checked when present,
+    and their absence (with no wash-trading verdict either) is the
+    ``VOLUME_PARTICIPANTS_UNAVAILABLE`` flag instead of an unknown.
+    """
 
     reasons: list[str] = []
     missing: list[str] = []
+    flags: list[DecisionFlag] = []
     if token.wash_trading is RiskSignal.UNSAFE:
         reasons.append("provider_wash_trading")
 
     count = features.transaction_count
     participants = features.unique_participants
-    if count is None:
-        missing.append("transaction_count")
-    if participants is None:
-        missing.append("unique_participants")
-    if token.wash_trading is RiskSignal.UNKNOWN:
-        missing.append("wash_trading")
+    if policy.volume_integrity is VolumeIntegrityMode.AVAILABLE_SIGNALS:
+        reasons.extend(_available_signal_reasons(features, policy, missing))
+        if (count is None or participants is None) and token.wash_trading is RiskSignal.UNKNOWN:
+            flags.append(DecisionFlag.VOLUME_PARTICIPANTS_UNAVAILABLE)
+    else:
+        if count is None:
+            missing.append("transaction_count")
+        if participants is None:
+            missing.append("unique_participants")
+        if token.wash_trading is RiskSignal.UNKNOWN:
+            missing.append("wash_trading")
 
     volume = features.current_short_volume
     if volume is not None and volume > 0 and count == 0:
@@ -86,7 +103,113 @@ def assess_volume_integrity(
         status=status,
         reasons=tuple(sorted(set(reasons))),
         missing_signals=tuple(sorted(set(missing))),
+        flags=tuple(flags),
     )
+
+
+def _available_signal_reasons(
+    features: VolumeSpikeFeatures, policy: ScreeningPolicy, missing: list[str]
+) -> list[str]:
+    """Artificial volume on the signals a source without participant counts still has."""
+
+    reasons: list[str] = []
+    efficiency = features.fee_efficiency
+    turnover = features.turnover
+    spread = features.short_burst_spread
+    if efficiency is None:
+        missing.append("fee_efficiency")
+    elif efficiency < policy.minimum_fee_support:
+        reasons.append("fees_below_base_fee")
+    if turnover is None:
+        missing.append("turnover")
+    elif (
+        turnover > policy.maximum_turnover
+        and efficiency is not None
+        and efficiency < policy.minimum_fee_support
+    ):
+        reasons.append("turnover_without_fee_support")
+    if spread is None:
+        missing.append("short_burst_spread")
+    elif spread <= policy.maximum_burst_spread:
+        reasons.append("self_similar_bursts")
+    return reasons
+
+
+# Signals a policy may accept as missing: covered by a flag, never by UNKNOWN.
+def _flagged_token_signals(policy: ScreeningPolicy) -> frozenset[str]:
+    if policy.volume_integrity is VolumeIntegrityMode.AVAILABLE_SIGNALS:
+        return frozenset({"wash_trading"})
+    return frozenset()
+
+
+def merge_pool_token_signals(token: TokenRiskSnapshot, pool: PoolSnapshot) -> TokenRiskSnapshot:
+    """The token's risk with the Data API's own flags for the pool and its base token (D07).
+
+    ``is_blacklisted`` of the pool is the blacklist signal, ``is_verified`` the verification
+    and ``freeze_authority_disabled`` the freeze authority of the base mint. They fill what
+    the other sources left unknown; where both report, the more dangerous reading wins.
+    """
+
+    if token.mint != pool.pool.base_mint:
+        return token
+    blacklisted = _merge_signal(token.blacklisted, _danger(pool.pool_blacklisted))
+    verified = _merge_signal(token.verified, _danger(_negated(pool.base_token_verified)))
+    freeze = _merge_authority(token.freeze_authority, pool.base_freeze_authority_disabled)
+    if (blacklisted, verified, freeze) == (
+        token.blacklisted,
+        token.verified,
+        token.freeze_authority,
+    ):
+        return token
+    resolved = {
+        name
+        for name, value in (
+            ("blacklisted", blacklisted),
+            ("verified", verified),
+            ("freeze_authority", freeze),
+        )
+        if value not in (RiskSignal.UNKNOWN, AuthorityStatus.UNKNOWN)
+    }
+    missing = tuple(name for name in token.missing_signals if name not in resolved)
+    quality = token.data_quality
+    if quality is DataQuality.PARTIAL and not missing:
+        quality = DataQuality.COMPLETE
+    data = token.model_dump()
+    data.update(
+        blacklisted=blacklisted,
+        verified=verified,
+        freeze_authority=freeze,
+        missing_signals=missing,
+        data_quality=quality,
+        provider=f"{token.provider}+{pool.provider}",
+    )
+    return TokenRiskSnapshot.model_validate(data)
+
+
+def _negated(value: bool | None) -> bool | None:
+    return None if value is None else not value
+
+
+def _danger(value: bool | None) -> RiskSignal:
+    if value is None:
+        return RiskSignal.UNKNOWN
+    return RiskSignal.UNSAFE if value else RiskSignal.SAFE
+
+
+def _merge_signal(current: RiskSignal, reported: RiskSignal) -> RiskSignal:
+    if RiskSignal.UNSAFE in (current, reported):
+        return RiskSignal.UNSAFE
+    if RiskSignal.SAFE in (current, reported):
+        return RiskSignal.SAFE
+    return RiskSignal.UNKNOWN
+
+
+def _merge_authority(current: AuthorityStatus, disabled: bool | None) -> AuthorityStatus:
+    if current is AuthorityStatus.PRESENT or disabled is False:
+        return AuthorityStatus.PRESENT
+    if current is AuthorityStatus.REVOKED or disabled is True:
+        return AuthorityStatus.REVOKED
+    return AuthorityStatus.UNKNOWN
 
 
 def assess_guide_thresholds(
@@ -230,7 +353,10 @@ class PoolScreener:
         *,
         context: DecisionContext,
         estimated_price_impact: Decimal,
+        depth: DepthEvidence | None = None,
     ) -> CandidateDecision:
+        """``depth``: measured depth and impact (D07); ``None`` uses the snapshot's depth."""
+
         if isinstance(estimated_price_impact, (float, bool)):
             raise ValueError("estimated_price_impact must use Decimal")
         if estimated_price_impact < 0:
@@ -247,18 +373,33 @@ class PoolScreener:
             policy,
             integrity,
             estimated_price_impact,
+            depth,
         )
+        flagged = _flagged_token_signals(policy)
         missing = set(features.missing_signals)
-        missing.update(token.missing_signals)
+        missing.update(set(token.missing_signals) - flagged)
         missing.update(integrity.missing_signals)
-        evidence = _evidence(pool, token, features, integrity, estimated_price_impact, policy)
-        flags: tuple[DecisionFlag, ...] = ()
+        evidence = _evidence(
+            pool, token, features, integrity, estimated_price_impact, policy, depth
+        )
+        flags: list[DecisionFlag] = []
         if policy.guide is not None:
             guide = assess_guide_thresholds(pool, token, features, policy)
             reasons.extend(guide.reasons)
             missing.update(guide.missing_signals)
             evidence = (*evidence, *guide.evidence)
-            flags = guide.flags
+            flags.extend(guide.flags)
+        flags.extend(integrity.flags)
+        if depth is not None and depth.source is DepthSource.UNAVAILABLE:
+            flags.append(DecisionFlag.DEPTH_UNAVAILABLE)
+            if context.mode is not TradingMode.SHADOW:
+                reasons.append(RejectionCode.DEPTH_UNAVAILABLE)
+        if (
+            DecisionFlag.VOLUME_PARTICIPANTS_UNAVAILABLE in flags
+            and context.mode is TradingMode.LIVE
+        ):
+            reasons.append(RejectionCode.VOLUME_PARTICIPANTS_UNAVAILABLE)
+        reasons = list(dict.fromkeys(reasons))
 
         warming = features.readiness is SignalReadiness.WARMING_UP
         unknown_codes = {
@@ -278,13 +419,13 @@ class PoolScreener:
             components = ()
         elif reasons and context.mode is TradingMode.SHADOW:
             status = CandidateStatus.UNKNOWN
-            score, components = _score(features, token, policy)
+            score, components = _score(features, token, policy, flagged)
         elif reasons:
             status = CandidateStatus.REJECT
             score = None
             components = ()
         else:
-            score, components = _score(features, token, policy)
+            score, components = _score(features, token, policy, flagged)
             if score < policy.minimum_score:
                 reasons.append(RejectionCode.SCORE_BELOW_THRESHOLD)
                 status = CandidateStatus.REJECT
@@ -307,7 +448,8 @@ class PoolScreener:
             ruleset_version=context.ruleset_version,
             config_version=context.config_version,
             correlation_id=context.correlation_id,
-            flags=flags,
+            flags=tuple(dict.fromkeys(flags)),
+            depth=depth,
         )
 
     @staticmethod
@@ -318,6 +460,7 @@ class PoolScreener:
         policy: ScreeningPolicy,
         integrity: VolumeIntegrityAssessment,
         estimated_price_impact: Decimal,
+        depth: DepthEvidence | None,
     ) -> list[RejectionCode]:
         reasons: list[RejectionCode] = []
         feature_pool_identity = (
@@ -359,8 +502,24 @@ class PoolScreener:
             reasons.append(RejectionCode.FUTURE_FEATURE_DATA)
         if pool.tvl < policy.minimum_tvl:
             reasons.append(RejectionCode.LOW_TVL)
-        if pool.depth is None or pool.depth < policy.minimum_depth:
-            reasons.append(RejectionCode.LOW_DEPTH)
+        if depth is None:
+            if pool.depth is None or pool.depth < policy.minimum_depth:
+                reasons.append(RejectionCode.LOW_DEPTH)
+            if estimated_price_impact > policy.maximum_price_impact:
+                reasons.append(RejectionCode.PRICE_IMPACT_HIGH)
+        elif depth.source is not DepthSource.UNAVAILABLE:
+            # Measured (a quote that cannot fill the reference size has neither value).
+            if depth.depth is None or depth.depth < policy.minimum_depth:
+                reasons.append(RejectionCode.LOW_DEPTH)
+            if depth.price_impact is None or depth.price_impact > policy.maximum_price_impact:
+                reasons.append(RejectionCode.PRICE_IMPACT_HIGH)
+        # Data API flags of the pool and both tokens (G06, D07); ``None`` is no evidence.
+        if pool.pool_blacklisted is True:
+            reasons.append(RejectionCode.BLACKLISTED_POOL)
+        if pool.base_token_verified is False or pool.quote_token_verified is False:
+            reasons.append(RejectionCode.UNVERIFIED_TOKEN)
+        if pool.base_freeze_authority_disabled is False:
+            reasons.append(RejectionCode.FREEZE_AUTHORITY_PRESENT)
         if pool.pool_age < policy.minimum_pool_age:
             reasons.append(RejectionCode.POOL_TOO_YOUNG)
         if features.readiness is SignalReadiness.WARMING_UP:
@@ -387,14 +546,12 @@ class PoolScreener:
             reasons.append(RejectionCode.HOLDER_CONCENTRATION_HIGH)
         if token.freshness is Freshness.STALE:
             reasons.append(RejectionCode.TOKEN_RISK_STALE)
-        if token.data_quality is not DataQuality.COMPLETE or token.missing_signals:
+        if not _token_resolved(token, policy):
             reasons.append(RejectionCode.TOKEN_RISK_UNKNOWN)
         if integrity.status is IntegrityStatus.CONFIRMED:
             reasons.append(RejectionCode.ARTIFICIAL_VOLUME_CONFIRMED)
         elif integrity.status is IntegrityStatus.UNKNOWN:
             reasons.append(RejectionCode.VOLUME_INTEGRITY_UNKNOWN)
-        if estimated_price_impact > policy.maximum_price_impact:
-            reasons.append(RejectionCode.PRICE_IMPACT_HIGH)
         if features.readiness is SignalReadiness.READY and (
             features.short_ratio is None
             or features.long_ratio is None
@@ -409,10 +566,20 @@ class PoolScreener:
         return reasons
 
 
+def _token_resolved(token: TokenRiskSnapshot, policy: ScreeningPolicy) -> bool:
+    """Every mandatory token signal is known; a flagged one (wash trading) may be missing."""
+
+    unresolved = set(token.missing_signals) - _flagged_token_signals(policy)
+    if unresolved:
+        return False
+    return token.data_quality is DataQuality.COMPLETE or bool(token.missing_signals)
+
+
 def _score(
     features: VolumeSpikeFeatures,
     token: TokenRiskSnapshot,
     policy: ScreeningPolicy,
+    flagged: frozenset[str] = frozenset(),
 ) -> tuple[Decimal, tuple[ScoreComponent, ...]]:
     values = (
         (
@@ -445,7 +612,7 @@ def _score(
             _volatility_fit(features.price_volatility, policy.target_volatility),
             policy.weights.volatility_fit,
         ),
-        ("token_quality", _token_quality(token), policy.weights.token_quality),
+        ("token_quality", _token_quality(token, flagged), policy.weights.token_quality),
     )
     components = tuple(
         ScoreComponent(
@@ -484,8 +651,12 @@ def _volatility_fit(volatility: Decimal | None, target: Decimal) -> Decimal:
     return max(Decimal(0), Decimal(1) - min(distance, Decimal(1)))
 
 
-def _token_quality(token: TokenRiskSnapshot) -> Decimal:
-    return Decimal(1) if token.data_quality is DataQuality.COMPLETE else Decimal(0)
+def _token_quality(token: TokenRiskSnapshot, flagged: frozenset[str]) -> Decimal:
+    if token.data_quality is DataQuality.COMPLETE:
+        return Decimal(1)
+    if token.missing_signals and set(token.missing_signals) <= flagged:
+        return Decimal(1)
+    return Decimal(0)
 
 
 def _evidence(
@@ -495,10 +666,31 @@ def _evidence(
     integrity: VolumeIntegrityAssessment,
     price_impact: Decimal,
     policy: ScreeningPolicy,
+    depth: DepthEvidence | None,
 ) -> tuple[EvidenceItem, ...]:
+    measured = pool.depth if depth is None else depth.depth
+    windows = (
+        EvidenceItem(
+            name="short_window_source",
+            value=_origin_text(features.short_window_origin, pool),
+        ),
+        EvidenceItem(
+            name="baseline_source",
+            value="UNKNOWN" if features.baseline_origin is None else features.baseline_origin.value,
+        ),
+    )
+    sources = (
+        EvidenceItem(
+            name="depth_source",
+            value=DepthSource.SNAPSHOT.value if depth is None else depth.source.value,
+            threshold=None if depth is None else depth.detail,
+        ),
+    )
     return (
         EvidenceItem(name="tvl", value=str(pool.tvl), threshold=str(policy.minimum_tvl)),
-        EvidenceItem(name="depth", value=str(pool.depth), threshold=str(policy.minimum_depth)),
+        EvidenceItem(name="depth", value=str(measured), threshold=str(policy.minimum_depth)),
+        *sources,
+        *windows,
         EvidenceItem(
             name="short_ratio",
             value=str(features.short_ratio),
@@ -523,3 +715,20 @@ def _evidence(
         EvidenceItem(name="volume_integrity", value=integrity.status.value),
         EvidenceItem(name="token_data_quality", value=token.data_quality.value),
     )
+
+
+def _origin_text(origin: WindowOrigin | None, pool: PoolSnapshot) -> str:
+    """Where the current short window came from, with the derivation's interval or gap."""
+
+    derivation = pool.short_window
+    if origin is None:
+        if derivation is not None and derivation.reason is not None:
+            return f"UNKNOWN:{derivation.reason}"
+        return "UNKNOWN"
+    if (
+        origin is WindowOrigin.CUMULATIVE_DELTA
+        and derivation is not None
+        and derivation.interval_seconds is not None
+    ):
+        return f"{origin.value}:{derivation.interval_seconds}s"
+    return origin.value

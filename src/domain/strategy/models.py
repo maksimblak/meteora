@@ -60,6 +60,11 @@ class GuideStrategyRules(BaseModel):
     spot_holding_horizon: timedelta = timedelta(hours=1)
     overvolume_maximum_holding_period: timedelta = timedelta(minutes=30)
     overvolume_volume_decay_ratio: Decimal = Decimal("1")
+    # The bid-only range ends at the entry bin: a price above it leaves the position all in
+    # the quote token, earning nothing. It exits once the price has stayed above the entry
+    # bin's top for ``bid_only_upside_grace`` or runs ``bid_only_upside_exit`` beyond it.
+    bid_only_upside_grace: timedelta = timedelta(minutes=30)
+    bid_only_upside_exit: Decimal = Decimal("0.05")
 
     _reject_float = field_validator(
         "bid_ask_minimum_depth",
@@ -70,6 +75,7 @@ class GuideStrategyRules(BaseModel):
         "overvolume_volume_per_minute",
         "ath_breakout_margin",
         "overvolume_volume_decay_ratio",
+        "bid_only_upside_exit",
         mode="before",
     )(_exact_decimal)
 
@@ -101,6 +107,8 @@ class GuideStrategyRules(BaseModel):
             raise ValueError("spot holding periods must be positive")
         if not Decimal(0) < self.overvolume_volume_decay_ratio <= Decimal(1):
             raise ValueError("overvolume_volume_decay_ratio must be in (0, 1]")
+        if self.bid_only_upside_grace <= timedelta(0) or self.bid_only_upside_exit <= 0:
+            raise ValueError("the bid-only upside exit needs a positive grace and distance")
         return self
 
 
@@ -199,6 +207,19 @@ class ExitPolicy(BaseModel):
     exit_on_range_breach: bool = True
     exit_on_token_risk_deterioration: bool = True
     compare_rebalance_after_costs: bool = True
+    # A bid-only range (nothing above the entry bin): the price above it is a breach only
+    # after ``upside_breach_grace`` above the entry bin's top or ``upside_breach_fraction``
+    # beyond it. ``None``: any price above the range is a breach at once.
+    upside_breach_grace: timedelta | None = None
+    upside_breach_fraction: Decimal | None = None
+
+    _reject_float = field_validator("upside_breach_fraction", mode="before")(_exact_decimal)
+
+    @model_validator(mode="after")
+    def validate_exit(self) -> "ExitPolicy":
+        if (self.upside_breach_grace is None) != (self.upside_breach_fraction is None):
+            raise ValueError("the upside exit needs both its grace and its distance")
+        return self
 
 
 class StrategyPlan(BaseModel):
@@ -254,9 +275,21 @@ class PositionState(BaseModel):
     upper_price: Decimal
     entry_short_volume: Decimal
     maximum_holding_period: timedelta
+    # The plan's own exit on volume decay (``InvalidationPolicy.volume_decay_ratio``): an
+    # overvolume Spot exits at the first drop (1). ``None``: the monitor's general ratio.
+    volume_decay_ratio: Decimal | None = None
+    # The plan's upside exit of a bid-only range (``ExitPolicy``); ``None`` for other plans.
+    upside_breach_grace: timedelta | None = None
+    upside_breach_fraction: Decimal | None = None
 
     _reject_float = field_validator(
-        "entry_price", "lower_price", "upper_price", "entry_short_volume", mode="before"
+        "entry_price",
+        "lower_price",
+        "upper_price",
+        "entry_short_volume",
+        "volume_decay_ratio",
+        "upside_breach_fraction",
+        mode="before",
     )(_exact_decimal)
 
     @model_validator(mode="after")
@@ -271,6 +304,12 @@ class PositionState(BaseModel):
             raise ValueError("entry values are invalid")
         if self.maximum_holding_period <= timedelta(0):
             raise ValueError("maximum_holding_period must be positive")
+        if self.volume_decay_ratio is not None and not (
+            Decimal(0) < self.volume_decay_ratio <= Decimal(1)
+        ):
+            raise ValueError("volume_decay_ratio must be in (0, 1]")
+        if (self.upside_breach_grace is None) != (self.upside_breach_fraction is None):
+            raise ValueError("the upside exit needs both its grace and its distance")
         return self
 
 
@@ -309,6 +348,9 @@ class PositionSignals(BaseModel):
     estimated_rebalance_cost_base_units: int
     estimated_close_cost_base_units: int
     expected_remaining_fee_income_base_units: int
+    # Since when the price has stayed above a bid-only range (``PositionMonitor.above_range``)
+    # without a break; ``None`` when it is not above.
+    above_range_since: datetime | None = None
 
     _reject_float = field_validator(
         "current_fee_tvl",

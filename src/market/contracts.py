@@ -11,6 +11,7 @@ from src.market.models import (
     PoolSnapshot,
     ProviderHealth,
     TokenRiskSnapshot,
+    VolumeBucket,
     WalletState,
 )
 
@@ -22,6 +23,14 @@ class MarketDataProvider(Protocol):
     async def list_pools(self, cursor: str | None) -> PoolPage: ...
 
     async def get_pool_snapshot(self, pool: PoolRef, at: datetime) -> PoolSnapshot: ...
+
+
+class VolumeHistorySource(Protocol):
+    """Closed short-window buckets of one pool, to warm up a new candidate (D07)."""
+
+    async def volume_history(
+        self, pool: PoolRef, *, start: datetime, end: datetime
+    ) -> tuple[VolumeBucket, ...]: ...
 
 
 class OnChainProvider(Protocol):

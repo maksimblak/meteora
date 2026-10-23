@@ -17,7 +17,7 @@ and keeps what it had missed; if it is still short, it fails instead of publishi
 """
 
 import asyncio
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -37,6 +37,7 @@ from src.market.models import (
     PoolSnapshot,
     ProviderHealth,
     ProviderState,
+    VolumeBucket,
     WindowMetrics,
 )
 from src.providers.contracts import (
@@ -52,13 +53,21 @@ DATA_API_URL = "https://dlmm.datapi.meteora.ag"
 MAX_PAGE_SIZE = 1_000
 DEFAULT_REQUESTS_PER_SECOND = 2.0
 DEFAULT_PAGE_CONCURRENCY = 4
+# The default universe narrowing (D07): pools that traded in the last 24 hours, ~2.1k of
+# ~139k. ``filter_by=None`` sweeps everything.
+DEFAULT_UNIVERSE_FILTER = "volume_24h>0"
+HISTORY_TIMEFRAME = "5m"
+HISTORY_BUCKET = timedelta(minutes=5)
+# A bucket is final only this long after it closes: the open one is served as 0.0 (live,
+# 2026-10-23: a closed bucket kept its value from about a minute after closing on).
+DEFAULT_HISTORY_SETTLE = timedelta(minutes=2)
+MAX_CACHED_HISTORIES = 1_024
 # Oldest first: pools created during a sweep land on the last page and shift nothing.
 SORT_ORDER = "pool_created_at:asc"
 # Shortest first. The API's 2h and 12h windows have no domain window and are not kept.
 SOURCE_WINDOWS = ("30m", "1h", "4h", "24h")
 PROVIDER_NAME = "meteora_data_api"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
-_ALWAYS_MISSING = ("depth", "windows.5m")
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +100,12 @@ class _PoolQuote:
     base_decimals: int | None
     quote_decimals: int | None
     active_bin_id: int | None = None
+    cumulative_volume: Decimal | None = None
+    cumulative_fees: Decimal | None = None
+    blacklisted: bool | None = None
+    base_verified: bool | None = None
+    quote_verified: bool | None = None
+    base_freeze_disabled: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +141,15 @@ class _Sweep:
         return len(self.seen) + self.unidentified
 
 
+@dataclass(frozen=True, slots=True)
+class _History:
+    """Closed buckets of one pool, final up to ``settled_until``, from ``first`` on."""
+
+    first: datetime
+    settled_until: datetime
+    buckets: tuple[VolumeBucket, ...]
+
+
 class _Rejected(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -148,6 +172,8 @@ class MeteoraDataApiProvider:
         page_concurrency: int = DEFAULT_PAGE_CONCURRENCY,
         pool_states: PoolStateReader | None = None,
         maximum_rejected_share: Decimal = Decimal("0.5"),
+        history_settle: timedelta = DEFAULT_HISTORY_SETTLE,
+        cached_histories: int = MAX_CACHED_HISTORIES,
     ) -> None:
         if stale_after <= timedelta(0):
             raise ValueError("stale_after must be positive")
@@ -157,6 +183,11 @@ class MeteoraDataApiProvider:
             raise ValueError("page_concurrency must be at least one")
         if not Decimal(0) <= maximum_rejected_share < Decimal(1):
             raise ValueError("maximum_rejected_share must be in [0, 1)")
+        if history_settle < timedelta(0) or cached_histories < 1:
+            raise ValueError("history settle delay and cache size must be valid")
+        self._history_settle = history_settle
+        self._cached_histories = cached_histories
+        self._histories: OrderedDict[str, _History] = OrderedDict()
         self._client = client
         self._clock = clock or SystemClock()
         self._stale_after = stale_after
@@ -248,6 +279,58 @@ class MeteoraDataApiProvider:
             return self._snapshot(quote, observed_at)
         except ValidationError as error:
             raise ProviderPayloadError("Meteora returned an invalid snapshot") from error
+
+    async def volume_history(
+        self, pool: PoolRef, *, start: datetime, end: datetime
+    ) -> tuple[VolumeBucket, ...]:
+        """Final 5m buckets of ``pool`` that start at or after ``start`` and end by ``end``.
+
+        ``/pools/{address}/volume/history`` warms up a new candidate's baseline (D07). The
+        open bucket (served as 0.0) and buckets closed less than ``history_settle`` ago are
+        never returned. One request per pool per new bucket at most: a range already
+        covered is served from a bounded cache; requests share the sweep's rate limit.
+        """
+
+        start = _aware_datetime(start, field="start")
+        end = _aware_datetime(end, field="end")
+        horizon = min(_bucket_floor(end), _bucket_floor(self._clock.now() - self._history_settle))
+        if horizon <= start:
+            return ()
+        address = pool.address.root
+        cached = self._histories.get(address)
+        if cached is None or start < cached.first or horizon > cached.settled_until:
+            try:
+                buckets = await self._fetch_history(pool, start, end)
+            except ProviderPayloadError as error:
+                self._degrade("history_payload", error)
+                raise
+            cached = _History(first=start, settled_until=horizon, buckets=buckets)
+            self._histories[address] = cached
+            while len(self._histories) > self._cached_histories:
+                self._histories.popitem(last=False)
+        self._histories.move_to_end(address)
+        return tuple(
+            bucket for bucket in cached.buckets if bucket.start >= start and bucket.end <= horizon
+        )
+
+    async def _fetch_history(
+        self, pool: PoolRef, start: datetime, end: datetime
+    ) -> tuple[VolumeBucket, ...]:
+        payload = await self._get(
+            f"{self._pools_path}/{pool.address.root}/volume/history",
+            {
+                "timeframe": HISTORY_TIMEFRAME,
+                "start_time": str(int((start - _EPOCH).total_seconds())),
+                "end_time": str(int((end - _EPOCH).total_seconds())),
+            },
+        )
+        data = _mapping(payload, "volume history").get("data")
+        if not isinstance(data, list):
+            raise ProviderPayloadError("Meteora volume history must contain a data list")
+        buckets: list[VolumeBucket] = []
+        for item in data:
+            buckets.append(_bucket(pool, item))
+        return tuple(sorted(buckets, key=lambda bucket: bucket.start))
 
     # --- sweep ---------------------------------------------------------------------------
 
@@ -429,7 +512,9 @@ class MeteoraDataApiProvider:
             source_at=quote.source_at,
             ingested_at=self._clock.now(),
             freshness=Freshness.STALE if stale else Freshness.FRESH,
-            data_quality=DataQuality.PARTIAL,
+            # Complete when every field this API reports is there (D07): depth and the
+            # 5m window are not Data API fields, they come from quotes and counters.
+            data_quality=DataQuality.PARTIAL if quote.missing else DataQuality.COMPLETE,
             missing_fields=quote.missing,
             provider=PROVIDER_NAME,
             base_fee_rate=quote.base_fee_rate,
@@ -438,6 +523,12 @@ class MeteoraDataApiProvider:
             base_decimals=quote.base_decimals,
             quote_decimals=quote.quote_decimals,
             short_window_source=short_window,
+            cumulative_volume=quote.cumulative_volume,
+            cumulative_fees=quote.cumulative_fees,
+            pool_blacklisted=quote.blacklisted,
+            base_token_verified=quote.base_verified,
+            quote_token_verified=quote.quote_verified,
+            base_freeze_authority_disabled=quote.base_freeze_disabled,
         )
 
 
@@ -551,6 +642,9 @@ def _quote(value: Any, arrived_at: datetime) -> _PoolQuote:
     if bin_step == 0:
         raise _Rejected("invalid:pool_config.bin_step")
     windows, missing = _windows(value)
+    cumulative_volume, cumulative_fees = _cumulative(value.get("cumulative_metrics"))
+    if cumulative_volume is None or cumulative_fees is None:
+        missing.append("cumulative_metrics")
     tokens = (token_x, token_y)
     return _PoolQuote(
         pool=pool,
@@ -560,17 +654,29 @@ def _quote(value: Any, arrived_at: datetime) -> _PoolQuote:
         price=_amount(value.get("current_price"), "current_price"),
         bin_step=bin_step,
         windows=windows,
-        missing=tuple(sorted({*_ALWAYS_MISSING, *missing})),
+        missing=tuple(sorted(set(missing))),
         base_fee_rate=_base_fee_rate(config),
         market_cap=_token_value(tokens, pool.base_mint, "market_cap", _optional_amount),
         base_decimals=_token_value(tokens, pool.base_mint, "decimals", _optional_decimals),
         quote_decimals=_token_value(tokens, pool.quote_mint, "decimals", _optional_decimals),
+        cumulative_volume=cumulative_volume,
+        cumulative_fees=cumulative_fees,
+        blacklisted=_flag(value.get("is_blacklisted")),
+        base_verified=_token_value(tokens, pool.base_mint, "is_verified", _optional_flag),
+        quote_verified=_token_value(tokens, pool.quote_mint, "is_verified", _optional_flag),
+        base_freeze_disabled=_token_value(
+            tokens, pool.base_mint, "freeze_authority_disabled", _optional_flag
+        ),
     )
 
 
 def _windows(payload: Mapping[str, Any]) -> tuple[dict[str, WindowMetrics], list[str]]:
+    """Long windows with volume, LP fees and protocol fees; a gap is a missing field."""
+
     volume = _section(payload, "volume")
     fees = _section(payload, "fees")
+    protocol = payload.get("protocol_fees")
+    protocol_fees: Mapping[str, Any] = protocol if isinstance(protocol, Mapping) else {}
     windows: dict[str, WindowMetrics] = {}
     missing: list[str] = []
     for name in SOURCE_WINDOWS:
@@ -580,8 +686,39 @@ def _windows(payload: Mapping[str, Any]) -> tuple[dict[str, WindowMetrics], list
         fee = _optional_amount(fees.get(name), f"fees.{name}")
         if fee is None:
             missing.append(f"windows.{name}.fees")
-        windows[name] = WindowMetrics(volume=_amount(volume[name], f"volume.{name}"), fees=fee)
+        protocol_fee = _lenient_amount(protocol_fees.get(name))
+        if protocol_fee is None:
+            missing.append(f"windows.{name}.protocol_fees")
+        windows[name] = WindowMetrics(
+            volume=_amount(volume[name], f"volume.{name}"), fees=fee, protocol_fees=protocol_fee
+        )
     return windows, missing
+
+
+def _cumulative(value: Any) -> tuple[Decimal | None, Decimal | None]:
+    """Lifetime counters; an unusable counter is a missing field, not a rejected pool."""
+
+    if not isinstance(value, Mapping):
+        return None, None
+    return _lenient_amount(value.get("volume")), _lenient_amount(value.get("fees"))
+
+
+def _lenient_amount(value: Any) -> Decimal | None:
+    try:
+        return _optional_amount(value, "lenient")
+    except _Rejected:
+        return None
+
+
+def _flag(value: Any) -> bool | None:
+    """A JSON boolean; anything else is unknown, never ``True``."""
+
+    return value if isinstance(value, bool) else None
+
+
+def _optional_flag(value: Any, label: str) -> bool | None:
+    del label
+    return _flag(value)
 
 
 def _base_fee_rate(config: Mapping[str, Any]) -> Decimal | None:
@@ -663,6 +800,33 @@ def _non_negative_int(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise _Rejected(f"invalid:{label}")
     return int(value)
+
+
+def _bucket_floor(instant: datetime) -> datetime:
+    """The latest 5m bucket boundary at or before ``instant`` (buckets are epoch-aligned)."""
+
+    width = int(HISTORY_BUCKET.total_seconds())
+    seconds = int((instant - _EPOCH).total_seconds())
+    return _EPOCH + timedelta(seconds=seconds - seconds % width)
+
+
+def _bucket(pool: PoolRef, value: Any) -> VolumeBucket:
+    item = _mapping(value, "volume bucket")
+    timestamp = item.get("timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+        raise ProviderPayloadError("Meteora bucket timestamp must be epoch seconds")
+    try:
+        volume = _amount(item.get("volume"), "volume")
+        return VolumeBucket(
+            pool_address=pool.address,
+            start=_EPOCH + timedelta(seconds=timestamp),
+            duration=HISTORY_BUCKET,
+            volume=volume,
+            fees=_lenient_amount(item.get("fees")),
+            protocol_fees=_lenient_amount(item.get("protocol_fees")),
+        )
+    except (_Rejected, ValidationError, OverflowError) as error:
+        raise ProviderPayloadError("Meteora returned an invalid volume bucket") from error
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:

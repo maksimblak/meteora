@@ -62,14 +62,82 @@ class RejectionCode(StrEnum):
     ARTIFICIAL_VOLUME_SUSPECTED = "ARTIFICIAL_VOLUME_SUSPECTED"
     TOTAL_FEES_BELOW_THRESHOLD = "TOTAL_FEES_BELOW_THRESHOLD"
     GUIDE_SIGNAL_UNKNOWN = "GUIDE_SIGNAL_UNKNOWN"
+    # live data (D07)
+    BLACKLISTED_POOL = "BLACKLISTED_POOL"
+    DEPTH_UNAVAILABLE = "DEPTH_UNAVAILABLE"
+    VOLUME_PARTICIPANTS_UNAVAILABLE = "VOLUME_PARTICIPANTS_UNAVAILABLE"
 
 
 class DecisionFlag(StrEnum):
-    """Non-blocking facts the operator must see; unlike reasons they never change status."""
+    """Facts the operator must see. A flag never blocks SHADOW; where a stage cannot accept
+    it (see each flag), the screener adds the reason of the same name instead."""
 
     # D03: GMGN-style total fees have no Data API/RPC source; the conditional threshold is
     # skipped and the approval preview asks for a manual check instead.
     TOTAL_FEES_UNAVAILABLE = "TOTAL_FEES_UNAVAILABLE"
+    # D07: no quote measured depth and price impact. SHADOW goes on with a conservative
+    # slippage model; APPROVAL and LIVE are closed (reason ``DEPTH_UNAVAILABLE``).
+    DEPTH_UNAVAILABLE = "DEPTH_UNAVAILABLE"
+    # D07: no transaction or participant counts (none from the Data API). Artificial volume
+    # is judged on turnover, fee organicity and burst self-similarity; SHADOW and APPROVAL go
+    # on, LIVE is closed (reason ``VOLUME_PARTICIPANTS_UNAVAILABLE``) until a provider has them.
+    VOLUME_PARTICIPANTS_UNAVAILABLE = "VOLUME_PARTICIPANTS_UNAVAILABLE"
+
+
+class VolumeIntegrityMode(StrEnum):
+    """Which signals decide artificial volume (G07)."""
+
+    # shadow-hypothesis-v1: transaction and participant counts are mandatory.
+    PARTICIPANTS = "PARTICIPANTS"
+    # Live data (D07): turnover, fee organicity and self-similar bursts are mandatory;
+    # participant counts are used when present, otherwise flagged.
+    AVAILABLE_SIGNALS = "AVAILABLE_SIGNALS"
+
+
+class DepthSource(StrEnum):
+    SNAPSHOT = "SNAPSHOT"
+    QUOTE = "QUOTE"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class DepthEvidence(BaseModel):
+    """Depth and price impact at the reference size, as measured for the decision (D07).
+
+    ``QUOTE``: the executor's read-only quote; no ``depth`` means the pool could not fill
+    the reference size. ``UNAVAILABLE``: nothing was measured, ``detail`` says why.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    source: DepthSource
+    depth: Decimal | None = None
+    price_impact: Decimal | None = None
+    reference_notional: Decimal | None = None
+    detail: str | None = None
+    measured_at: datetime | None = None
+
+    _reject_float = field_validator(
+        "depth", "price_impact", "reference_notional", mode="before"
+    )(_exact_decimal)
+
+    @model_validator(mode="after")
+    def validate_depth(self) -> "DepthEvidence":
+        if any(
+            value is not None and value < 0
+            for value in (self.depth, self.price_impact, self.reference_notional)
+        ):
+            raise ValueError("depth evidence cannot be negative")
+        if self.price_impact is not None and self.price_impact > 1:
+            raise ValueError("price impact is a fraction in [0, 1]")
+        if self.source is DepthSource.UNAVAILABLE and (
+            self.depth is not None or self.price_impact is not None
+        ):
+            raise ValueError("unavailable depth carries no measured value")
+        if self.measured_at is not None and (
+            self.measured_at.tzinfo is None or self.measured_at.utcoffset() is None
+        ):
+            raise ValueError("measured_at must be timezone-aware")
+        return self
 
 
 class VolumeRegime(StrEnum):
@@ -215,6 +283,11 @@ class ScreeningPolicy(BaseModel):
     maximum_transactions_per_participant: Decimal = Decimal("20")
     weights: ScoreWeights = ScoreWeights()
     guide: GuideScreeningRules | None = None
+    volume_integrity: VolumeIntegrityMode = VolumeIntegrityMode.PARTICIPANTS
+    # AVAILABLE_SIGNALS: bursts closer than this spread are one repeated trade (G07); the
+    # fee organicity below ``minimum_fee_support`` does not pay for the volume it reports.
+    maximum_burst_spread: Decimal = Decimal("0.02")
+    minimum_fee_support: Decimal = Decimal("0.5")
 
     _reject_float = field_validator(
         "minimum_tvl",
@@ -234,11 +307,15 @@ class ScreeningPolicy(BaseModel):
         "assumed_cost_rate",
         "maximum_turnover",
         "maximum_transactions_per_participant",
+        "maximum_burst_spread",
+        "minimum_fee_support",
         mode="before",
     )(_exact_decimal)
 
     @model_validator(mode="after")
     def validate_policy(self) -> "ScreeningPolicy":
+        if not Decimal(0) <= self.maximum_burst_spread < Decimal(1) or self.minimum_fee_support < 0:
+            raise ValueError("artificial-volume thresholds are out of range")
         non_negative = (
             self.minimum_tvl,
             self.minimum_depth,
@@ -296,6 +373,7 @@ class VolumeIntegrityAssessment(BaseModel):
     status: IntegrityStatus
     reasons: tuple[str, ...]
     missing_signals: tuple[str, ...]
+    flags: tuple[DecisionFlag, ...] = ()
 
 
 class CandidateDecision(BaseModel):
@@ -317,6 +395,8 @@ class CandidateDecision(BaseModel):
     config_version: str
     correlation_id: str
     flags: tuple[DecisionFlag, ...] = ()
+    # How depth and price impact were measured (D07); ``None``: the snapshot's own depth.
+    depth: DepthEvidence | None = None
 
     _reject_float = field_validator("score", "estimated_price_impact", mode="before")(
         _exact_decimal

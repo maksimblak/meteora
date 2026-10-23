@@ -88,33 +88,36 @@ def test_default_is_bid_ask_from_the_local_high_reaching_seventy_to_eighty_perce
     result = plan(guide_history(bin_step=250))
 
     # ceil(ln(1 / 0.25) / ln(1.025)) = 57 bins below; 1.025^-57 leaves 24.5% of the price.
+    # One-sided bid (D08): the range ends at the active bin, nothing above the price.
     assert result.strategy is StrategyKind.BID_ASK
     assert result.direction is Direction.BEARISH
     assert result.selection_reason is StrategySelectionReason.BID_ASK_FROM_LOCAL_HIGH
-    assert (result.lower_bin_offset, result.upper_bin_offset) == (-57, 1)
+    assert (result.lower_bin_offset, result.upper_bin_offset) == (-57, 0)
     assert Decimal("0.70") <= lower_edge_depth(result, 250) <= Decimal("0.80")
     assert recorded(result)["range_limited_by_bins"] == "false"
+    assert recorded(result)["range_side"] == "BID_ONLY"
     assert result.loss_fraction_at_invalidation == lower_edge_depth(result, 250)
     assert result.exit_policy.maximum_holding_period == GUIDE_STRATEGY.holding_horizon
 
 
-def test_bid_ask_below_a_recent_high_extends_up_to_that_high() -> None:
+def test_bid_ask_below_a_recent_high_stays_below_the_price_and_records_the_high() -> None:
     history = guide_history(prices=("1", "1", "1", "1", "1", "1.1", "0.99"), bin_step=250)
 
     result = plan(history)
 
-    # ln(1.1 / 0.99) / ln(1.025) = 4.27 -> the upper edge sits 5 bins up, at the local high.
+    # ln(1.1 / 0.99) / ln(1.025) = 4.27 -> the high is 5 bins up; no liquidity goes there.
     assert result.strategy is StrategyKind.BID_ASK
-    assert result.upper_bin_offset == 5
+    assert result.upper_bin_offset == 0
     assert result.lower_bin_offset == -57
     assert recorded(result)["local_high_price"] == "1.1"
+    assert recorded(result)["bins_to_local_high"] == "5"
 
 
 def test_bin_cap_bounds_the_range_and_says_so() -> None:
     result = plan(guide_history(bin_step=100))
 
     assert result.upper_bin_offset - result.lower_bin_offset + 1 == 70  # DLMM position width
-    assert result.lower_bin_offset == -68
+    assert (result.lower_bin_offset, result.upper_bin_offset) == (-69, 0)
     assert recorded(result)["range_limited_by_bins"] == "true"
     assert lower_edge_depth(result, 100) < Decimal("0.70")
 
@@ -189,15 +192,31 @@ def test_same_candidate_is_spot_under_shadow_hypothesis_and_bid_ask_under_guide(
     assert guided.selection_reason is StrategySelectionReason.BID_ASK_FROM_LOCAL_HIGH
 
 
+def test_the_bid_only_plan_carries_its_upside_exit_and_spot_keeps_the_plain_breach() -> None:
+    bid_ask = plan(guide_history(bin_step=250))
+    spot = plan(guide_history(short="600000", tvl="1000000"))
+
+    rules = GuideStrategyRules()
+    assert bid_ask.exit_policy.upside_breach_grace == rules.bid_only_upside_grace
+    assert bid_ask.exit_policy.upside_breach_grace == timedelta(minutes=30)
+    assert bid_ask.exit_policy.upside_breach_fraction == rules.bid_only_upside_exit
+    assert spot.exit_policy.upside_breach_grace is None
+    assert spot.exit_policy.upside_breach_fraction is None
+
+
 def test_bid_ask_born_at_its_upper_edge_is_held_until_price_nears_the_lower_edge() -> None:
+    result = plan(guide_history(bin_step=250))
+    step = Decimal("1.025")
     position = PositionState(
         position_id="position-1",
         opened_at=NOW - timedelta(hours=1),
         entry_price=Decimal("1"),
-        lower_price=Decimal("0.25"),
-        upper_price=Decimal("1.025"),
+        lower_price=step**result.lower_bin_offset,
+        upper_price=step**result.upper_bin_offset,  # the entry price: no bin above it
         entry_short_volume=Decimal("400"),
         maximum_holding_period=timedelta(hours=4),
+        upside_breach_grace=result.exit_policy.upside_breach_grace,
+        upside_breach_fraction=result.exit_policy.upside_breach_fraction,
     )
     signals = {
         "current_fee_tvl": Decimal("0.02"),
@@ -214,7 +233,7 @@ def test_bid_ask_born_at_its_upper_edge_is_held_until_price_nears_the_lower_edge
         position,
         history[-1],
         risk_state(),
-        PositionSignals(normalized_range_position=Decimal("0.97"), **signals),  # type: ignore[arg-type]
+        PositionSignals(normalized_range_position=Decimal("1"), **signals),  # type: ignore[arg-type]
     )
     falling = PositionMonitor(price_shock_fraction=Decimal("0.80")).evaluate(
         position,

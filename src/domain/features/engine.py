@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from src.domain.features.models import (
@@ -12,7 +12,14 @@ from src.domain.features.models import (
     VolumeFeatureRules,
     VolumeSpikeFeatures,
 )
-from src.market.models import DataQuality, Freshness, PoolSnapshot, WindowMetrics
+from src.market.models import (
+    DataQuality,
+    Freshness,
+    PoolSnapshot,
+    VolumeBucket,
+    WindowMetrics,
+    WindowOrigin,
+)
 
 _TURNOVER_MINUTES = 5
 MAD_SCALE = Decimal("1.4826")
@@ -28,7 +35,16 @@ class VolumeFeatureEngine:
         rules: VolumeFeatureRules,
         *,
         decision_at: datetime,
+        warmup: Sequence[VolumeBucket] = (),
     ) -> VolumeSpikeFeatures:
+        """``warmup``: closed short buckets of the pool's volume history (D07).
+
+        They stand in for the baseline only while the pool's own snapshots carry fewer
+        than ``minimum_baseline_points`` short windows, and for the current short window
+        only when the latest snapshot has none. A bucket is used only if it ended by
+        ``decision_at`` and before the current window began.
+        """
+
         if decision_at.tzinfo is None or decision_at.utcoffset() is None:
             raise ValueError("decision_at must be timezone-aware")
         eligible = [
@@ -45,13 +61,30 @@ class VolumeFeatureEngine:
         latest = ordered[-1]
         if any(item.pool != latest.pool for item in ordered):
             raise ValueError("feature history must belong to one pool")
+        if any(bucket.pool_address != latest.pool.address for bucket in warmup):
+            raise ValueError("volume history must belong to one pool")
         _reject_conflicting_observations(ordered)
+        buckets = _closed_buckets(warmup, rules, decision_at)
 
         prior = ordered[:-1][-rules.baseline_points :]
+        short = _current_short(latest, buckets, rules, decision_at)
+        current_short = short.metrics if short is not None else None
+        current_long = latest.windows.get(rules.long_window)
         short_values = _window_values(prior, rules.short_window)
         long_values = _window_values(prior, rules.long_window)
-        current_short = latest.windows.get(rules.short_window)
-        current_long = latest.windows.get(rules.long_window)
+        baseline_origin = _snapshot_origin(prior, rules.short_window) if short_values else None
+        if len(short_values) < rules.minimum_baseline_points and buckets:
+            short_end = short.end if short is not None else latest.source_at
+            history_short = _bucket_values(buckets, short_end - _window(rules.short_window))
+            if len(history_short) > len(short_values):
+                short_values = history_short[-rules.baseline_points :]
+                baseline_origin = WindowOrigin.VOLUME_HISTORY
+        if len(long_values) < rules.minimum_baseline_points and buckets:
+            history_long = _rolling_sums(
+                buckets, rules, latest.source_at - _window(rules.short_window)
+            )
+            if len(history_long) > len(long_values):
+                long_values = history_long[-rules.baseline_points :]
         missing: set[str] = set()
 
         short_median = _median(short_values)
@@ -89,7 +122,13 @@ class VolumeFeatureEngine:
             and all(item.data_quality is DataQuality.COMPLETE for item in ordered)
             else DataQuality.PARTIAL
         )
-        guide = _guide_features(ordered, rules.guide, decision_at)
+        guide = _guide_features(
+            ordered,
+            rules.guide,
+            decision_at,
+            current_short if rules.short_window == _guide_window(rules) else None,
+            rules.short_window,
+        )
         return VolumeSpikeFeatures(
             decision_at=decision_at,
             observed_at=latest.observed_at,
@@ -125,7 +164,110 @@ class VolumeFeatureEngine:
             local_high_price=guide.local_high_price,
             all_time_high_price=guide.all_time_high_price,
             volume_window_source=guide.volume_window_source,
+            short_window_origin=short.origin if short is not None else None,
+            baseline_origin=baseline_origin,
+            short_burst_spread=_burst_spread(
+                [*short_values, current_short.volume] if current_short is not None else [],
+                rules.burst_points,
+            ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _ShortWindow:
+    """The current short window, where it came from and when it ended."""
+
+    metrics: WindowMetrics
+    origin: WindowOrigin
+    end: datetime
+
+
+def _window(name: str) -> timedelta:
+    return timedelta(minutes=WINDOW_MINUTES[name])
+
+
+def _closed_buckets(
+    warmup: Sequence[VolumeBucket], rules: VolumeFeatureRules, decision_at: datetime
+) -> list[VolumeBucket]:
+    """Short-length buckets that ended by the decision, oldest first, one per start."""
+
+    width = _window(rules.short_window)
+    by_start = {
+        bucket.start: bucket
+        for bucket in warmup
+        if bucket.duration == width and bucket.end <= decision_at
+    }
+    return [by_start[start] for start in sorted(by_start)]
+
+
+def _current_short(
+    latest: PoolSnapshot,
+    buckets: Sequence[VolumeBucket],
+    rules: VolumeFeatureRules,
+    decision_at: datetime,
+) -> _ShortWindow | None:
+    reported = latest.windows.get(rules.short_window)
+    if reported is not None:
+        derivation = latest.short_window
+        origin = (
+            derivation.origin
+            if derivation is not None and derivation.window == rules.short_window
+            else WindowOrigin.REPORTED
+        )
+        return _ShortWindow(reported, origin, latest.source_at)
+    if not buckets:
+        return None
+    last = buckets[-1]
+    if decision_at - last.end > rules.maximum_source_age:
+        return None
+    metrics = WindowMetrics(volume=last.volume, fees=last.fees, protocol_fees=last.protocol_fees)
+    return _ShortWindow(metrics, WindowOrigin.VOLUME_HISTORY, last.end)
+
+
+def _snapshot_origin(prior: Sequence[PoolSnapshot], window: str) -> WindowOrigin:
+    derived = any(
+        item.short_window is not None
+        and item.short_window.window == window
+        and window in item.windows
+        for item in prior
+    )
+    return WindowOrigin.CUMULATIVE_DELTA if derived else WindowOrigin.REPORTED
+
+
+def _bucket_values(buckets: Sequence[VolumeBucket], until: datetime) -> list[Decimal]:
+    return [bucket.volume for bucket in buckets if bucket.end <= until]
+
+
+def _rolling_sums(
+    buckets: Sequence[VolumeBucket], rules: VolumeFeatureRules, until: datetime
+) -> list[Decimal]:
+    """Long-window volumes as sums of consecutive short buckets ending by ``until``."""
+
+    span = WINDOW_MINUTES[rules.long_window] // WINDOW_MINUTES[rules.short_window]
+    usable = [bucket for bucket in buckets if bucket.end <= until]
+    sums: list[Decimal] = []
+    for index in range(span - 1, len(usable)):
+        run = usable[index - span + 1 : index + 1]
+        contiguous = all(
+            later.start == earlier.end for earlier, later in zip(run, run[1:], strict=False)
+        )
+        if contiguous:
+            sums.append(sum((bucket.volume for bucket in run), Decimal(0)))
+    return sums
+
+
+def _burst_spread(series: Sequence[Decimal], points: int) -> Decimal | None:
+    recent = list(series[-points:])
+    if len(recent) < points:
+        return None
+    high = max(recent)
+    if high <= 0:
+        return None
+    return (high - min(recent)) / high
+
+
+def _guide_window(rules: VolumeFeatureRules) -> str | None:
+    return None if rules.guide is None else rules.guide.volume_window
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,14 +284,25 @@ def _guide_features(
     ordered: Sequence[PoolSnapshot],
     rules: GuideFeatureRules | None,
     decision_at: datetime,
+    current_short: WindowMetrics | None,
+    short_window: str,
 ) -> _GuideValues:
-    """guide-v1 inputs from point-in-time windows; every quantity stays ``None`` if unknown."""
+    """guide-v1 inputs from point-in-time windows; every quantity stays ``None`` if unknown.
+
+    ``current_short`` is the resolved current short window (reported, derived or the last
+    history bucket); it is the volume window whenever the guide reads that window.
+    """
 
     if rules is None:
         return _GuideValues()
     latest = ordered[-1]
-    window = _volume_window(latest, rules)
-    volume = latest.windows.get(window) if window is not None else None
+    window: str | None
+    volume: WindowMetrics | None
+    if current_short is not None:
+        window, volume = short_window, current_short
+    else:
+        window = _volume_window(latest, rules)
+        volume = latest.windows.get(window) if window is not None else None
     per_minute = (
         volume.volume / Decimal(WINDOW_MINUTES[window])
         if volume is not None and window is not None
@@ -164,14 +317,17 @@ def _guide_features(
     )
     organic = latest.windows.get(rules.organicity_window)
     fee_efficiency = None
+    # Organicity compares every fee paid (LP fees plus the protocol share, D07) with what
+    # the volume would have paid at the pool's base fee.
+    paid = organic.total_fees if organic is not None else None
     if (
         organic is not None
-        and organic.fees is not None
+        and paid is not None
         and organic.volume > 0
         and latest.base_fee_rate is not None
         and latest.base_fee_rate > 0
     ):
-        fee_efficiency = organic.fees / (organic.volume * latest.base_fee_rate)
+        fee_efficiency = paid / (organic.volume * latest.base_fee_rate)
     window_start = decision_at - rules.local_high_lookback
     local_high = max(item.price for item in ordered if item.observed_at >= window_start)
     prior = ordered[:-1]

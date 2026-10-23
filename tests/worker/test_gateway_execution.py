@@ -20,6 +20,7 @@ from prometheus_client import CollectorRegistry
 
 from src.core.clock import FrozenClock
 from src.domain.models.events import EventType
+from src.domain.models.primitives import BaseUnits, PublicKey
 from src.domain.models.trading import TradingMode
 from src.domain.strategy import PositionActionKind
 from src.execution.contracts import (
@@ -45,6 +46,7 @@ from src.execution.service import (
     HmacApprovalVerifier,
     sign_operator_approval,
 )
+from src.market.models import DataQuality, PoolRef, WalletState
 from src.modes import KillSwitchPolicy, ModeService, PendingPlanStatus
 from src.modes.models import ModeTransition
 from src.observability.metrics import WorkerMetrics
@@ -52,10 +54,10 @@ from src.persistence.contracts import JobLease
 from src.persistence.factory import Repositories
 from src.persistence.memory import InMemoryEventSink
 from src.portfolio.models import PositionStatus
+from src.providers.contracts import LbPairState
 from src.providers.fixtures import FixtureOnChainProvider
 from src.recovery.service import RecoveryAction
 from src.worker.execution import (
-    ACTIVE_BIN_TOLERANCE,
     AnchorSource,
     BinAnchor,
     EntryCommandUnavailable,
@@ -67,6 +69,7 @@ from src.worker.execution import (
     shadow_address,
     snapshot_anchor,
 )
+from src.worker.policy import DEFAULT_ACTIVE_BIN_TOLERANCE as ACTIVE_BIN_TOLERANCE
 from src.worker.policy import PipelinePolicy
 from src.worker.runtime import GatewayWiring, WorkerRuntime, WorkerSettings
 from src.worker.scheduler import JobContext
@@ -82,6 +85,48 @@ from tests.worker.harness import (
 
 SECRET = b"0123456789abcdef0123456789abcdef"
 ANCHOR = BinAnchor(active_bin_id=8_000, base_decimals=6, quote_decimals=6)
+WALLET_ADDRESS = "SysvarC1ock11111111111111111111111111111111"
+
+
+class StaticPoolStates:
+    """The LB pair account as a fresh RPC read reports it right before an entry."""
+
+    def __init__(self, active_bin_id: int | None = ANCHOR.active_bin_id, *, bin_step: int = 25):
+        self.active_bin_id = active_bin_id
+        self.bin_step = bin_step
+        self.reads = 0
+
+    async def get_pool_states(self, pools: Any) -> dict[str, LbPairState]:
+        self.reads += 1
+        if self.active_bin_id is None:
+            return {}
+        return {
+            pool.address.root: LbPairState(
+                self.active_bin_id, self.bin_step, pool.base_mint.root, pool.quote_mint.root
+            )
+            for pool in pools
+            if isinstance(pool, PoolRef)
+        }
+
+    async def get_mint_decimals(self, mints: Any) -> dict[str, int]:
+        return {}
+
+
+def funded_wallet() -> WalletState:
+    """Both legs available: the base token and native SOL for the wSOL quote leg."""
+
+    return WalletState(
+        wallet=PublicKey(WALLET_ADDRESS),
+        native_balance=BaseUnits(10**15),
+        token_balances={POOL.base_mint.root: BaseUnits(10**15)},
+        observed_at=NOW,
+        source_at=NOW,
+        ingested_at=NOW,
+        data_quality=DataQuality.COMPLETE,
+    )
+
+
+FUNDED_WALLET = funded_wallet()
 
 
 class FakeExecutor:
@@ -232,6 +277,8 @@ def worker(
     *,
     anchors: AnchorSource = lambda market: ANCHOR,
     policy: PipelinePolicy | None = None,
+    pool_states: StaticPoolStates | None = None,
+    wallet: WalletState | None = FUNDED_WALLET,
 ) -> WorkerRuntime:
     return WorkerRuntime(
         settings=WorkerSettings(
@@ -241,8 +288,12 @@ def worker(
         repositories=repos,
         market=None,
         onchain=FixtureOnChainProvider(
-            token_risks={POOL.base_mint.root: safe_token()}, clock=clock
+            token_risks={POOL.base_mint.root: safe_token()},
+            wallet_states={} if wallet is None else {WALLET_ADDRESS: wallet},
+            clock=clock,
         ),
+        pool_states=pool_states or StaticPoolStates(),
+        wallet_address=WALLET_ADDRESS,
         clock=clock,
         metrics=WorkerMetrics(CollectorRegistry()),
         sink=InMemoryEventSink(),

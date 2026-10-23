@@ -110,6 +110,13 @@ class PositionMonitor:
         self._near_edge_fraction = near_edge_fraction
         self._price_shock_fraction = price_shock_fraction
 
+    @staticmethod
+    def above_range(position: PositionState, market: PoolSnapshot) -> bool:
+        """The price is above the range: for a bid-only range, above its top bin's upper
+        border (the entry bin spans one bin step above the entry price)."""
+
+        return market.price > _upper_border(position, market)
+
     def evaluate(
         self,
         position: PositionState,
@@ -127,15 +134,21 @@ class PositionMonitor:
             alert_reasons.append(PositionReason.TOKEN_RISK_UNKNOWN)
         if signals.token_risk is RiskSignal.UNSAFE:
             exit_reasons.append(PositionReason.TOKEN_RISK_DETERIORATED)
-        if market.price < position.lower_price or market.price > position.upper_price:
+        if market.price < position.lower_price or _above_breached(
+            position, market, risk, signals
+        ):
             exit_reasons.append(PositionReason.RANGE_BREACH)
         if risk.as_of - position.opened_at >= position.maximum_holding_period:
             exit_reasons.append(PositionReason.MAX_HOLDING_PERIOD)
+        # The short window is reported or derived from the counters (D07); the decay ratio
+        # is the position plan's own when it carries one (an overvolume Spot: 1).
         short = market.windows.get("5m")
-        if (
-            short is not None
-            and short.volume < position.entry_short_volume * self._volume_decay_ratio
-        ):
+        ratio = (
+            position.volume_decay_ratio
+            if position.volume_decay_ratio is not None
+            else self._volume_decay_ratio
+        )
+        if short is not None and short.volume < position.entry_short_volume * ratio:
             exit_reasons.append(PositionReason.VOLUME_DECAY)
         if signals.current_fee_tvl is None:
             alert_reasons.append(PositionReason.FEE_SIGNAL_UNKNOWN)
@@ -198,6 +211,34 @@ class PositionMonitor:
             reasons=(),
             position_id=position.position_id,
         )
+
+
+def _upper_border(position: PositionState, market: PoolSnapshot) -> Decimal:
+    if position.upside_breach_grace is None:
+        return position.upper_price
+    return position.upper_price * (Decimal(1) + Decimal(market.bin_step) / Decimal(10_000))
+
+
+def _above_breached(
+    position: PositionState, market: PoolSnapshot, risk: RiskState, signals: PositionSignals
+) -> bool:
+    """An upward range breach; a bid-only range tolerates a stay above it (D08).
+
+    The guide rides a few pullbacks and leaves once the price has gone: above the entry
+    bin's top for ``upside_breach_grace``, or ``upside_breach_fraction`` beyond it at once.
+    """
+
+    if not PositionMonitor.above_range(position, market):
+        return False
+    grace = position.upside_breach_grace
+    fraction = position.upside_breach_fraction
+    if grace is None or fraction is None:
+        return True
+    border = _upper_border(position, market)
+    if market.price >= border * (Decimal(1) + fraction):
+        return True
+    since = signals.above_range_since
+    return since is not None and risk.as_of - since >= grace
 
 
 def _direction(candidate: CandidateDecision, policy: StrategyPolicy) -> Direction:
@@ -316,10 +357,12 @@ def _guide_plan(
             evidence=tuple(evidence),
         )
 
+    # One-sided bid from the price down (D08): the range ends at the active bin, so the entry
+    # is the quote token only - the executor never swaps and the wallet holds no base token.
+    # Bins up to a higher local high would need base liquidity: only their distance is kept.
     target = _bins_for_depth(step, rules.bid_ask_target_depth, rules.bid_ask_maximum_depth)
-    below = min(target, rules.maximum_position_bins - 2)
+    below = min(target, rules.maximum_position_bins - 1)
     to_high = 0 if high is None or high <= market.price else _bins_between(step, market.price, high)
-    above = max(1, min(to_high, rules.maximum_position_bins - 1 - below))
     depth = Decimal(1) - step ** (-below)
     evidence.extend(
         (
@@ -334,7 +377,7 @@ def _guide_plan(
                 threshold=str(rules.maximum_position_bins),
             ),
             EvidenceItem(name="bins_to_local_high", value=str(to_high)),
-            EvidenceItem(name="upper_reaches_local_high", value=str(above >= to_high).lower()),
+            EvidenceItem(name="range_side", value="BID_ONLY"),
         )
     )
     return _assemble(
@@ -343,13 +386,14 @@ def _guide_plan(
         policy,
         strategy=StrategyKind.BID_ASK,
         direction=Direction.BEARISH,
-        bounds=(-below, above),
+        bounds=(-below, 0),
         horizon=policy.holding_horizon,
         # Conservative: all capital converted at the entry price, marked at the lower edge.
         loss_fraction=min(max(volatility_loss, depth), Decimal(1)),
         volume_decay_ratio=policy.volume_decay_ratio,
         reason=StrategySelectionReason.BID_ASK_FROM_LOCAL_HIGH,
         evidence=tuple(evidence),
+        upside_exit=(rules.bid_only_upside_grace, rules.bid_only_upside_exit),
     )
 
 
@@ -387,8 +431,10 @@ def _assemble(
     volume_decay_ratio: Decimal,
     reason: StrategySelectionReason,
     evidence: tuple[EvidenceItem, ...],
+    upside_exit: tuple[timedelta, Decimal] | None = None,
 ) -> StrategyPlan:
     expires_at = market.observed_at + policy.plan_ttl
+    grace, fraction = upside_exit if upside_exit is not None else (None, None)
     return StrategyPlan(
         strategy=strategy,
         direction=direction,
@@ -401,7 +447,11 @@ def _assemble(
             volume_decay_ratio=volume_decay_ratio,
             expires_at=expires_at,
         ),
-        exit_policy=ExitPolicy(maximum_holding_period=horizon),
+        exit_policy=ExitPolicy(
+            maximum_holding_period=horizon,
+            upside_breach_grace=grace,
+            upside_breach_fraction=fraction,
+        ),
         created_at=market.observed_at,
         expires_at=expires_at,
         loss_fraction_at_invalidation=loss_fraction,

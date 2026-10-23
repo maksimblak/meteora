@@ -38,12 +38,14 @@ from src.observability.logging import cycle_context, error_fields, get_logger
 from src.observability.metrics import WorkerMetrics
 from src.persistence.contracts import (
     AuditLog,
+    DecisionStore,
     PositionContext,
     PositionContextStore,
     SnapshotHistory,
 )
 from src.portfolio.models import PositionStatus, PositionValuation, ShadowPosition
 from src.providers.contracts import ProviderError
+from src.worker.evidence import DailyEvidence
 from src.worker.execution import audit_event
 from src.worker.policy import PipelinePolicy
 from src.worker.portfolio import RiskDayKeeper, ShadowPortfolio
@@ -85,7 +87,12 @@ class PositionCycle:
         policy: PipelinePolicy,
         clock: Clock,
         metrics: WorkerMetrics,
+        decisions: DecisionStore | None = None,
+        evidence: DailyEvidence | None = None,
     ) -> None:
+        """``decisions``: the plan records whose own exit rules (the volume-decay ratio of
+        an overvolume Spot) the monitor applies; ``evidence`` counts invariant breaches."""
+
         self._modes = modes
         self._accounting = accounting
         self._contexts = contexts
@@ -98,6 +105,9 @@ class PositionCycle:
         self._clock = clock
         self._metrics = metrics
         self._portfolio = portfolio
+        self._decisions = decisions
+        self._evidence = evidence
+        self._plan_exits: dict[str, _PlanExit] = {}
         self._monitor = PositionMonitor(
             volume_decay_ratio=policy.strategy.volume_decay_ratio,
             price_shock_fraction=policy.strategy.price_shock_fraction,
@@ -137,6 +147,8 @@ class PositionCycle:
         if open_count <= limit or self._modes.mode_state().kill_switch_active:
             return
         self._log.critical("risk_invariant_breach", open_positions=open_count, limit=limit)
+        if self._evidence is not None:
+            self._evidence.breach(now)
         self._modes.activate_kill_switch(
             reason=(
                 f"RISK_INVARIANT_BREACH: {open_count} open positions exceed the cap of {limit}"
@@ -191,6 +203,7 @@ class PositionCycle:
             return PositionReview(
                 position_id, PositionActionKind.ALERT, ("RISK_DAY_NOT_OPENED",), None
             ), valuation
+        state = _state(context, await self._plan_exit(context))
         signals = PositionSignals(
             current_fee_tvl=_fee_tvl(market),
             baseline_fee_tvl=context.baseline_fee_tvl,
@@ -200,8 +213,9 @@ class PositionCycle:
             estimated_rebalance_cost_base_units=self._cost(valuation) * 2,
             estimated_close_cost_base_units=self._cost(valuation),
             expected_remaining_fee_income_base_units=0,
+            above_range_since=await self._above_since(state, context, market, now),
         )
-        action = self._monitor.evaluate(_state(context), market, risk, signals)
+        action = self._monitor.evaluate(state, market, risk, signals)
         reasons = tuple(reason.value for reason in action.reasons)
         proposed = audit_event(
             EventType.POSITION_ACTION_PROPOSED,
@@ -284,6 +298,53 @@ class PositionCycle:
             return True
         return False
 
+    async def _plan_exit(self, context: PositionContext) -> "_PlanExit":
+        """The exit rules of the position's own plan (volume decay, bid-only upside), read
+        once per position; without the record the monitor's general rules apply."""
+
+        cached = self._plan_exits.get(context.position_id)
+        if cached is not None:
+            return cached
+        found = _PlanExit()
+        if self._decisions is not None:
+            try:
+                record = await self._decisions.plan(context.plan_id)
+            except Exception as error:
+                self._log.warning("plan_record_unavailable", **error_fields(error))
+                return found  # the general rules this time; read again next cycle
+            if record is not None:
+                plan = record.sized_plan.plan
+                found = _PlanExit(
+                    volume_decay_ratio=plan.invalidation.volume_decay_ratio,
+                    upside_breach_grace=plan.exit_policy.upside_breach_grace,
+                    upside_breach_fraction=plan.exit_policy.upside_breach_fraction,
+                )
+        self._plan_exits[context.position_id] = found
+        return found
+
+    async def _above_since(
+        self,
+        state: PositionState,
+        context: PositionContext,
+        market: PoolSnapshot,
+        now: datetime,
+    ) -> datetime | None:
+        """Start of the unbroken run of snapshots above a bid-only range, from history."""
+
+        if state.upside_breach_grace is None or not PositionMonitor.above_range(state, market):
+            return None
+        history = await self._history.history(
+            context.pool_address, until=now, limit=self._policy.features.maximum_history_points
+        )
+        since = market.observed_at
+        for snapshot in reversed(history):
+            if snapshot.observed_at < context.opened_at:
+                break
+            if not PositionMonitor.above_range(state, snapshot):
+                break
+            since = min(since, snapshot.observed_at)
+        return since
+
     async def _token(self, context: PositionContext, now: datetime) -> TokenRiskSnapshot | None:
         try:
             return await self._onchain.get_token_risk(PublicKey(context.base_mint))
@@ -333,7 +394,15 @@ class PositionCycle:
         )
 
 
-def _state(context: PositionContext) -> PositionState:
+@dataclass(frozen=True, slots=True)
+class _PlanExit:
+    volume_decay_ratio: Decimal | None = None
+    upside_breach_grace: timedelta | None = None
+    upside_breach_fraction: Decimal | None = None
+
+
+def _state(context: PositionContext, plan: _PlanExit | None = None) -> PositionState:
+    rules = plan or _PlanExit()
     return PositionState(
         position_id=context.position_id,
         opened_at=context.opened_at,
@@ -342,6 +411,9 @@ def _state(context: PositionContext) -> PositionState:
         upper_price=context.upper_price,
         entry_short_volume=context.entry_short_volume,
         maximum_holding_period=context.maximum_holding_period,
+        volume_decay_ratio=rules.volume_decay_ratio,
+        upside_breach_grace=rules.upside_breach_grace,
+        upside_breach_fraction=rules.upside_breach_fraction,
     )
 
 

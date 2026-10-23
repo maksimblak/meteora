@@ -25,7 +25,7 @@ simulation and the gateway, one bounded sequence of attempts per position.
 
 import hashlib
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
@@ -37,6 +37,7 @@ from src.accounting.repository import AccountingRepository
 from src.accounting.service import AccountingService, ShadowBroker, position_aggregate_id
 from src.core.clock import Clock
 from src.domain.models.events import AuditEvent, EventType
+from src.domain.models.primitives import PublicKey
 from src.domain.models.trading import TradingMode
 from src.domain.risk.models import SizedPlan
 from src.domain.strategy import PositionActionKind
@@ -62,7 +63,7 @@ from src.execution.service import (
     ExecutionStore,
     GatewayRejected,
 )
-from src.market.models import PoolSnapshot
+from src.market.models import PoolSnapshot, WalletState
 from src.modes.models import KillSwitchPolicy, PendingPlan, PendingPlanStatus
 from src.modes.repository import ModeRepository
 from src.observability.alerts import CriticalAlertReporter
@@ -75,7 +76,8 @@ from src.persistence.contracts import (
     SnapshotHistory,
 )
 from src.portfolio.models import PositionStatus, ShadowPosition
-from src.worker.policy import PipelinePolicy
+from src.providers.contracts import PoolStateReader
+from src.worker.policy import DEFAULT_ACTIVE_BIN_TOLERANCE, PipelinePolicy
 
 _BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _BPS = Decimal(10_000)
@@ -87,10 +89,9 @@ _SPENT_PHASES = frozenset({ExecutionPhase.FAILED, ExecutionPhase.EXPIRED})
 POSITION_ACTION_ATTEMPTS = 5
 POSITION_ACTION_TTL = timedelta(minutes=2)
 REDUCE_BPS = 5_000
-# Bins the pool may move between the snapshot an entry was planned on and the executor's
-# simulation before the planned range is stale and the executor refuses the entry.
-ACTIVE_BIN_TOLERANCE = 3
 _LIQUIDITY_OPERATIONS = frozenset({DlmmOperation.OPEN, DlmmOperation.ADD})
+WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112"
+_MAXIMUM_DECIMALS = 18
 
 
 def shadow_address(seed: str) -> str:
@@ -154,10 +155,20 @@ type AnchorSource = Callable[[PoolSnapshot], BinAnchor | None]
 
 
 def snapshot_anchor(market: PoolSnapshot) -> BinAnchor | None:
-    """Default source: the market snapshot has neither an active bin id nor decimals."""
+    """The active bin and both decimals the snapshot carries (D06/D07), or ``None``.
 
-    del market
-    return None
+    The sweep's active bin ages within minutes; a non-SHADOW entry re-reads it from the LB
+    pair account right before the command is built and never sends this one unchecked.
+    """
+
+    values = (market.active_bin_id, market.base_decimals, market.quote_decimals)
+    if any(value is None for value in values):
+        return None
+    active, base, quote = values
+    assert active is not None and base is not None and quote is not None
+    if base > _MAXIMUM_DECIMALS or quote > _MAXIMUM_DECIMALS:
+        return None
+    return BinAnchor(active_bin_id=active, base_decimals=base, quote_decimals=quote)
 
 
 class EntryCommandUnavailable(ValueError):
@@ -181,9 +192,16 @@ def build_entry_command(
     wallet_address: str,
     max_slippage_bps: int,
     anchor: BinAnchor | None = None,
-    active_bin_tolerance: int = ACTIVE_BIN_TOLERANCE,
+    active_bin_tolerance: int = DEFAULT_ACTIVE_BIN_TOLERANCE,
 ) -> DlmmCommand:
-    """Split the sized capital evenly between Y and X at the observed price.
+    """Split the sized capital between Y and X by where the range lies (D08).
+
+    Bins below the active bin hold only Y, bins above only X, the active bin both: a range
+    with no bin above the active one (the guide's Bid-Ask from the high, active bin funded
+    with Y) is all quote token, one with no bin below is all base token, and a range on
+    both sides splits by its bins on each side, the active bin shared (an even split for
+    a symmetric Spot). The executor never swaps, so a leg the wallet does not hold refuses
+    the entry.
 
     SHADOW: a V1 lifecycle command on the synthetic shadow position with the strategy's
     relative bins (the shadow broker models them).
@@ -197,7 +215,7 @@ def build_entry_command(
     never sent as an absolute bin id.
     """
 
-    amount_y = size_base_units // 2
+    amount_y = quote_leg(size_base_units, lower_bin_offset, upper_bin_offset)
     quote_value_x = Decimal(size_base_units - amount_y)
     try:
         correlation = UUID(correlation_id)
@@ -247,6 +265,22 @@ def build_entry_command(
         token_x_decimals=anchor.base_decimals,
         token_y_decimals=anchor.quote_decimals,
     )
+
+
+def quote_leg(size_base_units: int, lower_bin_offset: int, upper_bin_offset: int) -> int:
+    """The quote-token (Y) part of ``size_base_units`` for a range of relative bins.
+
+    No bin above the active one: all Y, the active bin included (a one-sided bid). No bin
+    below it: all X. Otherwise both sides by their bins, the active bin shared.
+    """
+
+    if upper_bin_offset <= 0:
+        return size_base_units
+    if lower_bin_offset >= 0:
+        return 0
+    below = Decimal(-lower_bin_offset) + Decimal("0.5")
+    width = Decimal(upper_bin_offset - lower_bin_offset + 1)
+    return _floor(Decimal(size_base_units) * below / width)
 
 
 def _floor(value: Decimal) -> int:
@@ -729,6 +763,10 @@ class EntryBlocked(RuntimeError):
         self.reason = reason
 
 
+class WalletReader(Protocol):
+    async def get_wallet_state(self, wallet: PublicKey) -> WalletState: ...
+
+
 def entry_guard(modes: EntryStore, clock: Clock, mode: TradingMode, plan_id: UUID) -> SubmitGuard:
     """Re-read the durable state: the plan is still EXECUTING, no stop, same mode."""
 
@@ -765,7 +803,14 @@ class EntryExecutor:
         policy: PipelinePolicy,
         wallet_address: str,
         anchors: AnchorSource = snapshot_anchor,
+        pool_states: PoolStateReader | None = None,
+        wallets: WalletReader | None = None,
+        conservative_shadow: CommandSubmitter | None = None,
     ) -> None:
+        """``pool_states``: the fresh active-bin read before a non-SHADOW entry (D07);
+        ``wallets``: the wallet balances a non-SHADOW entry's token legs need (D08);
+        ``conservative_shadow``: the SHADOW fill for an entry without measured depth."""
+
         self._modes = modes
         self._audit = audit
         self._submitters = dict(submitters)
@@ -776,6 +821,9 @@ class EntryExecutor:
         self._policy = policy
         self._wallet = wallet_address
         self._anchors = anchors
+        self._pool_states = pool_states
+        self._wallets = wallets
+        self._conservative_shadow = conservative_shadow
         self._log = get_logger("worker.entries")
 
     async def execute(
@@ -787,9 +835,17 @@ class EntryExecutor:
         market: PoolSnapshot,
         correlation_id: UUID,
         causation_id: UUID | None,
+        entry_short_volume: Decimal | None = None,
+        conservative: bool = False,
     ) -> EntryResult:
+        """``entry_short_volume``: the decision's current short window (it may come from
+        the pool's volume history); ``conservative``: SHADOW fills with the conservative
+        slippage model because no quote measured the depth (``DEPTH_UNAVAILABLE``)."""
+
         mode = self._modes.mode_state().mode
         submitter = self._submitters.get(mode)
+        if mode is TradingMode.SHADOW and conservative and self._conservative_shadow is not None:
+            submitter = self._conservative_shadow
         if submitter is None:
             self._cancel(plan_id)
             return self._finish(
@@ -801,11 +857,12 @@ class EntryExecutor:
         anchor: BinAnchor | None = None
         if mode is not TradingMode.SHADOW:
             anchor = self._anchors(market)
+            reason = "ENTRY_ANCHOR_UNAVAILABLE"
+            if anchor is not None:
+                anchor, reason = await self._fresh_anchor(market, anchor)
             if anchor is None:
                 self._cancel(plan_id)
-                return self._finish(
-                    mode, EntryResult(EntryStatus.BLOCKED, plan_id, "ENTRY_ANCHOR_UNAVAILABLE")
-                )
+                return self._finish(mode, EntryResult(EntryStatus.BLOCKED, plan_id, reason))
         try:
             self._modes.claim_entry(plan_id, self._clock.now())
         except ValueError as error:
@@ -830,12 +887,17 @@ class EntryExecutor:
                 wallet_address=self._wallet,
                 max_slippage_bps=self._policy.max_slippage_bps,
                 anchor=anchor,
+                active_bin_tolerance=self._policy.active_bin_tolerance,
             )
         except EntryCommandUnavailable as unavailable:
             self._fail(plan_id)
             return self._finish(
                 mode, EntryResult(EntryStatus.BLOCKED, plan_id, unavailable.reason)
             )
+        if mode is not TradingMode.SHADOW:
+            shortfall = await self._wallet_shortfall(command, market)
+            if shortfall is not None:
+                return await self._blocked(mode, plan_id, command, shortfall, correlation_id)
         guard = entry_guard(self._modes, self._clock, mode, plan_id)
         try:
             guard()
@@ -848,6 +910,7 @@ class EntryExecutor:
                     _position_context(
                         plan_id, decision_id, sized, market, mode, command,
                         position_id=entry_position_address(plan_id),
+                        entry_short_volume=entry_short_volume,
                     )
                 )
             await self._audit.append(
@@ -882,7 +945,9 @@ class EntryExecutor:
             if mode is TradingMode.SHADOW:
                 result = await submitter.submit(command, market, guard)
             else:
-                recorder = self._position_recorder(plan_id, decision_id, sized, market, command)
+                recorder = self._position_recorder(
+                    plan_id, decision_id, sized, market, command, entry_short_volume
+                )
                 result = await submitter.submit(command, market, guard, recorder)
         except Exception as error:
             # The outcome is unknown: keep the plan EXECUTING (capacity stays reserved)
@@ -920,6 +985,7 @@ class EntryExecutor:
         sized: SizedPlan,
         market: PoolSnapshot,
         command: DlmmCommand,
+        entry_short_volume: Decimal | None,
     ) -> PositionRecorder:
         """The context of a gateway entry, under the position the executor created."""
 
@@ -927,6 +993,7 @@ class EntryExecutor:
             context = _position_context(
                 plan_id, decision_id, sized, market, command.mode, command,
                 position_id=position_id,
+                entry_short_volume=entry_short_volume,
             )
             try:
                 await self._contexts.put(context)
@@ -939,6 +1006,72 @@ class EntryExecutor:
                 raise EntryBlocked("AUDIT_PERSISTENCE_FAILED") from error
 
         return record
+
+    async def _fresh_anchor(
+        self, market: PoolSnapshot, anchor: BinAnchor
+    ) -> tuple[BinAnchor | None, str]:
+        """Re-read the LB pair: the sweep's active bin is minutes old by now (D07).
+
+        The fresh bin becomes the anchor when it is within ``active_bin_tolerance`` of the
+        planned one; a larger move, another pair or no read at all cancels the entry.
+        """
+
+        reader = self._pool_states
+        if reader is None:
+            return None, "ACTIVE_BIN_UNAVAILABLE"
+        try:
+            states = await reader.get_pool_states([market.pool])
+        except Exception as error:
+            self._log.warning("active_bin_read_failed", **error_fields(error))
+            return None, "ACTIVE_BIN_UNAVAILABLE"
+        state = states.get(market.pool.address.root)
+        if state is None:
+            return None, "ACTIVE_BIN_UNAVAILABLE"
+        if (
+            state.token_x_mint != market.pool.base_mint.root
+            or state.token_y_mint != market.pool.quote_mint.root
+            or state.bin_step != market.bin_step
+        ):
+            return None, "POOL_STATE_MISMATCH"
+        if abs(state.active_bin_id - anchor.active_bin_id) > self._policy.active_bin_tolerance:
+            self._log.info(
+                "active_bin_drift",
+                planned=anchor.active_bin_id,
+                current=state.active_bin_id,
+                tolerance=self._policy.active_bin_tolerance,
+            )
+            return None, "ACTIVE_BIN_DRIFT"
+        return replace(anchor, active_bin_id=state.active_bin_id), ""
+
+    async def _wallet_shortfall(self, command: DlmmCommand, market: PoolSnapshot) -> str | None:
+        """The leg the wallet cannot fund; the executor does not swap (D08)."""
+
+        reader = self._wallets
+        if reader is None:
+            return "WALLET_STATE_UNAVAILABLE"
+        try:
+            state = await reader.get_wallet_state(PublicKey(self._wallet))
+        except Exception as error:
+            self._log.warning("wallet_state_unavailable", **error_fields(error))
+            return "WALLET_STATE_UNAVAILABLE"
+        legs = (
+            (market.pool.base_mint.root, command.amount_x, "WALLET_INSUFFICIENT_BASE_TOKEN"),
+            (market.pool.quote_mint.root, command.amount_y, "WALLET_INSUFFICIENT_QUOTE_TOKEN"),
+        )
+        for mint, amount, reason in legs:
+            needed = int(amount or "0")
+            if needed > 0 and needed > self._holding(state, mint):
+                return reason
+        return None
+
+    def _holding(self, state: WalletState, mint: str) -> int:
+        balance = state.token_balances.get(mint)
+        held = 0 if balance is None else balance.root
+        if mint == WRAPPED_SOL_MINT:
+            # The SDK wraps native SOL; keep a reserve for fees and rent.
+            native = state.native_balance.root
+            held += max(native - self._policy.wallet_native_reserve_lamports, 0)
+        return held
 
     async def _blocked(
         self,
@@ -1049,12 +1182,15 @@ def _position_context(
     command: DlmmCommand,
     *,
     position_id: str,
+    entry_short_volume: Decimal | None = None,
 ) -> PositionContext:
     plan = sized.plan
     step = Decimal(1) + Decimal(market.bin_step) / _BPS
     short = market.windows.get("5m")
     long = market.windows.get("30m")
     fees = long.fees if long is not None and long.fees is not None else Decimal(0)
+    if entry_short_volume is None:
+        entry_short_volume = short.volume if short is not None else Decimal(0)
     return PositionContext(
         position_id=position_id,
         plan_id=plan_id,
@@ -1064,7 +1200,7 @@ def _position_context(
         entry_price=market.price,
         lower_price=market.price * step**plan.lower_bin_offset,
         upper_price=market.price * step**plan.upper_bin_offset,
-        entry_short_volume=short.volume if short is not None else Decimal(0),
+        entry_short_volume=entry_short_volume,
         baseline_fee_tvl=fees / market.tvl if market.tvl > 0 else Decimal(0),
         entry_tvl=market.tvl,
         maximum_holding_period=plan.exit_policy.maximum_holding_period,

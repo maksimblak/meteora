@@ -9,7 +9,7 @@ is kept byte-for-byte so its decisions stay reproducible.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -21,8 +21,9 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from src.accounting.models import CostModel
 from src.domain.features import GuideFeatureRules, VolumeFeatureRules
 from src.domain.risk.models import RiskPolicy
-from src.domain.screening import GuideScreeningRules, ScreeningPolicy
+from src.domain.screening import GuideScreeningRules, ScreeningPolicy, VolumeIntegrityMode
 from src.domain.strategy import GuideStrategyRules, StrategyPolicy
+from src.market.windows import ShortWindowRules
 from src.modes.models import KillSwitchPolicy
 
 LEGACY_RULESET_VERSION = "shadow-hypothesis-v1"
@@ -31,6 +32,48 @@ DEFAULT_RULESET_VERSION = GUIDE_RULESET_VERSION
 DEFAULT_CONFIG_VERSION = "worker-config-v1"
 RULESET_VERSION_ENV = "RULESET_VERSION"
 RULESET_OVERRIDES_ENV = "RULESET_OVERRIDES_FILE"
+UNIVERSE_INTERVAL_ENV = "WORKER_UNIVERSE_INTERVAL_SECONDS"
+DEFAULT_UNIVERSE_INTERVAL = timedelta(minutes=5)
+# Bins the pool may move between the snapshot an entry was planned on and the fresh read
+# (and the executor's simulation) before the planned range counts as stale.
+DEFAULT_ACTIVE_BIN_TOLERANCE = 3
+
+
+def universe_interval(environ: Mapping[str, str]) -> timedelta:
+    """The universe cadence: snapshots of one pool are this far apart (plus slack)."""
+
+    raw = environ.get(UNIVERSE_INTERVAL_ENV)
+    seconds = int(raw) if raw else int(DEFAULT_UNIVERSE_INTERVAL.total_seconds())
+    if seconds <= 0:
+        raise ValueError(f"{UNIVERSE_INTERVAL_ENV} must be a positive number of seconds")
+    return timedelta(seconds=seconds)
+
+
+def observation_gap(interval: timedelta) -> timedelta:
+    """Largest gap between adjacent snapshots that is still one cadence step.
+
+    One source for both the ATH coverage proof and the short-window derivation, so neither
+    is configured apart from the universe interval: the interval plus max(30 s, 10%).
+    """
+
+    return interval + max(timedelta(seconds=30), interval / 10)
+
+
+def _short_window_rules(
+    interval: timedelta,
+    *,
+    negative_noise_absolute: Decimal = Decimal("10"),
+    negative_noise_relative: Decimal = Decimal("0.0000001"),
+    counter_reset_after: timedelta = timedelta(minutes=30),
+) -> ShortWindowRules:
+    gap = observation_gap(interval)
+    return ShortWindowRules(
+        minimum_interval=min(timedelta(minutes=1), gap),
+        maximum_interval=gap,
+        negative_noise_absolute=negative_noise_absolute,
+        negative_noise_relative=negative_noise_relative,
+        counter_reset_after=counter_reset_after,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +87,17 @@ class PipelinePolicy:
     quote_base_units_per_unit: Decimal
     max_slippage_bps: int = 100
     kill_switch_policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT
+    short_window: ShortWindowRules = field(
+        default_factory=lambda: _short_window_rules(DEFAULT_UNIVERSE_INTERVAL)
+    )
+    active_bin_tolerance: int = DEFAULT_ACTIVE_BIN_TOLERANCE
+    # SHADOW without a quote (DEPTH_UNAVAILABLE, D07): the fill pays the worst slippage the
+    # command tolerates and the pool is assumed to absorb only this share of its TVL at the
+    # maximum price impact.
+    conservative_costs: CostModel = field(default_factory=lambda: _shadow_costs(100))
+    conservative_depth_fraction: Decimal = Decimal("0.05")
+    # Native SOL kept for fees and rent when the wallet's SOL funds a wSOL leg.
+    wallet_native_reserve_lamports: int = 20_000_000
 
     def __post_init__(self) -> None:
         versions = {
@@ -57,6 +111,20 @@ class PipelinePolicy:
             raise ValueError("entry notional and quote unit scale must be positive")
         if not 0 <= self.max_slippage_bps <= 10_000:
             raise ValueError("max_slippage_bps must be in [0, 10000]")
+        if self.active_bin_tolerance < 0:
+            raise ValueError("active_bin_tolerance must not be negative")
+        if not Decimal(0) < self.conservative_depth_fraction <= Decimal(1):
+            raise ValueError("conservative_depth_fraction must be in (0, 1]")
+        if not (
+            self.shadow_costs.slippage_bps
+            <= self.conservative_costs.slippage_bps
+            <= self.max_slippage_bps
+        ):
+            raise ValueError(
+                "conservative slippage must lie between the shadow model and the tolerance"
+            )
+        if self.wallet_native_reserve_lamports < 0:
+            raise ValueError("wallet_native_reserve_lamports must not be negative")
 
     @property
     def ruleset_version(self) -> str:
@@ -88,10 +156,13 @@ def hypothesis_policy(
     quote_base_units_per_unit: Decimal = Decimal(1_000_000),
     max_slippage_bps: int = 100,
     kill_switch_policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT,
+    universe_interval: timedelta = DEFAULT_UNIVERSE_INTERVAL,
 ) -> PipelinePolicy:
     """``shadow-hypothesis-v1``: volume-spike rules of spec 6.2-6.4 without guide signals."""
 
     return PipelinePolicy(
+        short_window=_short_window_rules(universe_interval),
+        conservative_costs=_shadow_costs(max_slippage_bps),
         features=VolumeFeatureRules(
             ruleset_version=ruleset_version,
             config_version=config_version,
@@ -158,7 +229,19 @@ class GuidePolicySettings(BaseModel):
     organicity_window: str = "1h"
     local_high_lookback: timedelta = timedelta(hours=1)
     ath_coverage_tolerance: timedelta = timedelta(minutes=15)
-    maximum_observation_gap: timedelta = timedelta(minutes=5, seconds=30)
+    # The ATH observation gap and the short-window interval follow the universe interval
+    # (``WORKER_UNIVERSE_INTERVAL_SECONDS``); they are not thresholds of their own.
+    short_window_negative_noise: Decimal = Decimal("10")
+    short_window_negative_noise_relative: Decimal = Decimal("0.0000001")
+    short_window_counter_reset_after: timedelta = timedelta(minutes=30)
+    bid_only_upside_grace: timedelta = timedelta(minutes=30)
+    bid_only_upside_exit: Decimal = Decimal("0.05")
+    maximum_burst_spread: Decimal = Decimal("0.02")
+    minimum_fee_support: Decimal = Decimal("0.5")
+    active_bin_tolerance: int = DEFAULT_ACTIVE_BIN_TOLERANCE
+    # Without a quote, SHADOW fills pay the full slippage tolerance (``max_slippage_bps``).
+    conservative_slippage_bps: int = 100
+    conservative_depth_fraction: Decimal = Decimal("0.05")
     holding_horizon: timedelta = timedelta(hours=4)
     bid_ask_minimum_depth: Decimal = Decimal("0.70")
     bid_ask_target_depth: Decimal = Decimal("0.75")
@@ -188,11 +271,25 @@ def guide_policy(
     ruleset_version: str = GUIDE_RULESET_VERSION,
     config_version: str = DEFAULT_CONFIG_VERSION,
     kill_switch_policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT,
+    universe_interval: timedelta = DEFAULT_UNIVERSE_INTERVAL,
 ) -> PipelinePolicy:
-    """``guide-v1``: spec 6.2-6.4 plus the LexDollar thresholds and strategy choice (6.6)."""
+    """``guide-v1``: spec 6.2-6.4 plus the LexDollar thresholds and strategy choice (6.6).
+
+    On live data (D07) artificial volume is judged on the signals the Data API has, and the
+    observation gap of the ATH proof follows ``universe_interval``.
+    """
 
     values = settings or GuidePolicySettings()
     return PipelinePolicy(
+        short_window=_short_window_rules(
+            universe_interval,
+            negative_noise_absolute=values.short_window_negative_noise,
+            negative_noise_relative=values.short_window_negative_noise_relative,
+            counter_reset_after=values.short_window_counter_reset_after,
+        ),
+        active_bin_tolerance=values.active_bin_tolerance,
+        conservative_costs=_shadow_costs(values.conservative_slippage_bps),
+        conservative_depth_fraction=values.conservative_depth_fraction,
         features=VolumeFeatureRules(
             ruleset_version=ruleset_version,
             config_version=config_version,
@@ -204,7 +301,7 @@ def guide_policy(
                 organicity_window=values.organicity_window,
                 local_high_lookback=values.local_high_lookback,
                 ath_coverage_tolerance=values.ath_coverage_tolerance,
-                maximum_observation_gap=values.maximum_observation_gap,
+                maximum_observation_gap=observation_gap(universe_interval),
             ),
         ),
         screening=ScreeningPolicy(
@@ -228,6 +325,9 @@ def guide_policy(
                 minimum_fee_efficiency=values.minimum_fee_efficiency,
                 minimum_total_fees_sol=values.minimum_total_fees_sol,
             ),
+            volume_integrity=VolumeIntegrityMode.AVAILABLE_SIGNALS,
+            maximum_burst_spread=values.maximum_burst_spread,
+            minimum_fee_support=values.minimum_fee_support,
         ),
         strategy=StrategyPolicy(
             ruleset_version=ruleset_version,
@@ -247,6 +347,8 @@ def guide_policy(
                 spot_holding_horizon=values.spot_holding_horizon,
                 overvolume_maximum_holding_period=values.overvolume_maximum_holding_period,
                 overvolume_volume_decay_ratio=values.overvolume_volume_decay_ratio,
+                bid_only_upside_grace=values.bid_only_upside_grace,
+                bid_only_upside_exit=values.bid_only_upside_exit,
             ),
         ),
         risk=RiskPolicy(ruleset_version=ruleset_version, config_version=config_version),
@@ -272,14 +374,15 @@ def load_pipeline_policy(environ: Mapping[str, str]) -> PipelinePolicy:
 
     version = environ.get(RULESET_VERSION_ENV) or DEFAULT_RULESET_VERSION
     overrides_path = environ.get(RULESET_OVERRIDES_ENV)
+    interval = universe_interval(environ)
     if version == LEGACY_RULESET_VERSION:
         if overrides_path:
             raise ValueError("threshold overrides apply to guide-v1 only")
-        return hypothesis_policy()
+        return hypothesis_policy(universe_interval=interval)
     if version != GUIDE_RULESET_VERSION:
         raise ValueError(f"unknown ruleset version {version!r}")
     if not overrides_path:
-        return guide_policy()
+        return guide_policy(universe_interval=interval)
     document = yaml.safe_load(Path(overrides_path).read_text(encoding="utf-8")) or {}
     if not isinstance(document, dict):
         raise ValueError("ruleset overrides must be a mapping")
@@ -298,12 +401,12 @@ def load_pipeline_policy(environ: Mapping[str, str]) -> PipelinePolicy:
         settings = GuidePolicySettings.model_validate(thresholds)
     except ValidationError as error:
         raise ValueError(f"invalid guide-v1 thresholds: {error}") from error
-    return guide_policy(settings, config_version=config_version)
+    return guide_policy(settings, config_version=config_version, universe_interval=interval)
 
 
-def _shadow_costs() -> CostModel:
+def _shadow_costs(slippage_bps: int = 50) -> CostModel:
     return CostModel(
-        slippage_bps=50,
+        slippage_bps=slippage_bps,
         network_fee_base_units=Decimal(0),
         jito_tip_base_units=Decimal(0),
     )

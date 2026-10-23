@@ -164,6 +164,9 @@ class Harness:
     token_failure: FixtureFailure | None = None
     policy: PipelinePolicy = field(default_factory=harness_policy)
     wrap_shadow_submitter: Callable[[ShadowSubmitter], Any] | None = None
+    token_risks: dict[str, TokenRiskSnapshot] | None = None
+    quotes: Any = None
+    warmup: Any = None
 
     def __post_init__(self) -> None:
         shadow = ShadowSubmitter(self.accounting, self.clock, self.policy.shadow_costs)
@@ -173,7 +176,7 @@ class Harness:
         self.metrics = WorkerMetrics(self.registry)
         self.history = InMemorySnapshotHistory(self.universe)
         self.onchain = FixtureOnChainProvider(
-            token_risks={POOL.base_mint.root: safe_token()},
+            token_risks=self.token_risks or {POOL.base_mint.root: safe_token()},
             failure=self.token_failure,
             clock=self.clock,
         )
@@ -190,6 +193,9 @@ class Harness:
             metrics=self.metrics,
             policy=self.policy,
             wallet_address=WALLET,
+            conservative_shadow=ShadowSubmitter(
+                self.accounting, self.clock, self.policy.conservative_costs
+            ),
         )
         self.pipeline = CandidatePipeline(
             history=self.history,
@@ -203,6 +209,8 @@ class Harness:
             policy=self.policy,
             clock=self.clock,
             metrics=self.metrics,
+            quotes=self.quotes,
+            warmup=self.warmup,
         )
         self.positions = PositionCycle(
             modes=self.modes,
@@ -217,6 +225,7 @@ class Harness:
             policy=self.policy,
             clock=self.clock,
             metrics=self.metrics,
+            decisions=self.decisions,
         )
 
     def ingest(self, snapshots: list[PoolSnapshot]) -> None:

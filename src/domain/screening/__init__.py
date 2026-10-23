@@ -5,6 +5,8 @@ from src.domain.screening.models import (
     CandidateStatus,
     DecisionContext,
     DecisionFlag,
+    DepthEvidence,
+    DepthSource,
     EvidenceItem,
     GuideAssessment,
     GuideScreeningRules,
@@ -14,12 +16,14 @@ from src.domain.screening.models import (
     ScoreWeights,
     ScreeningPolicy,
     VolumeIntegrityAssessment,
+    VolumeIntegrityMode,
     VolumeRegime,
 )
 from src.domain.screening.screener import (
     PoolScreener,
     assess_guide_thresholds,
     assess_volume_integrity,
+    merge_pool_token_signals,
 )
 
 __all__ = [
@@ -27,6 +31,8 @@ __all__ = [
     "CandidateStatus",
     "DecisionContext",
     "DecisionFlag",
+    "DepthEvidence",
+    "DepthSource",
     "EvidenceItem",
     "GuideAssessment",
     "GuideScreeningRules",
@@ -37,7 +43,9 @@ __all__ = [
     "ScoreWeights",
     "ScreeningPolicy",
     "VolumeIntegrityAssessment",
+    "VolumeIntegrityMode",
     "VolumeRegime",
     "assess_guide_thresholds",
     "assess_volume_integrity",
+    "merge_pool_token_signals",
 ]

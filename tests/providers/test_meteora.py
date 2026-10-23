@@ -189,9 +189,57 @@ def test_live_floats_become_exact_decimals_and_epoch_milliseconds_utc() -> None:
         assert trump.freshness is Freshness.FRESH
         assert trump.depth is None and trump.active_bin_id is None
         assert trump.short_window_source == "30m"
-        assert trump.data_quality is DataQuality.PARTIAL
-        assert trump.missing_fields == ("depth", "windows.5m")
         assert trump.provider == "meteora_data_api"
+
+    asyncio.run(exercise())
+
+
+def test_completeness_is_judged_by_the_fields_the_live_api_reports() -> None:
+    """D07: depth and a 5m window are not Data API fields, so they never make it partial."""
+
+    async def exercise() -> None:
+        provider, client = _provider(_sweep_api(), FrozenClock(NOW))
+        async with client:
+            snapshots = await _snapshots(provider, NOW)
+
+        trump = snapshots[TRUMP_POOL]
+        assert trump.data_quality is DataQuality.COMPLETE
+        assert trump.missing_fields == ()
+        assert trump.cumulative_volume == Decimal("33432123174.116455")
+        assert trump.cumulative_fees == Decimal("36483907.5384265")
+        assert trump.windows["30m"].protocol_fees == Decimal("2.821107684999987")
+        assert trump.windows["30m"].total_fees == Decimal("25.390220060333228") + Decimal(
+            "2.821107684999987"
+        )
+        assert trump.pool_blacklisted is False
+        assert (trump.base_token_verified, trump.quote_token_verified) == (True, True)
+        assert trump.base_freeze_authority_disabled is True
+        # BP keeps its freeze authority (recorded ``freeze_authority_disabled: false``).
+        assert snapshots[BP_POOL].base_freeze_authority_disabled is False
+        assert all(item.data_quality is DataQuality.COMPLETE for item in snapshots.values())
+
+    asyncio.run(exercise())
+
+
+def test_a_pool_missing_live_fields_is_partial_and_names_them() -> None:
+    async def exercise() -> None:
+        page = _parsed("pools_page1.json")
+        trump = next(item for item in page["data"] if item["address"] == TRUMP_POOL)
+        del trump["cumulative_metrics"]
+        del trump["protocol_fees"]["1h"]
+        del trump["is_blacklisted"]
+        trump["token_x"]["is_verified"] = "yes"  # not a boolean: unknown, never true
+        provider, client = _provider(_sweep_api(page1=_encoded(page)), FrozenClock(NOW))
+        async with client:
+            snapshots = await _snapshots(provider, NOW)
+
+        partial = snapshots[TRUMP_POOL]
+        assert partial.data_quality is DataQuality.PARTIAL
+        assert partial.missing_fields == ("cumulative_metrics", "windows.1h.protocol_fees")
+        assert partial.cumulative_volume is None and partial.cumulative_fees is None
+        assert partial.windows["1h"].protocol_fees is None
+        assert partial.pool_blacklisted is None
+        assert partial.base_token_verified is None
 
     asyncio.run(exercise())
 
@@ -568,3 +616,97 @@ def test_a_shift_that_cannot_be_repaired_is_not_published_as_a_universe() -> Non
         assert "missed" in provider.health.last_error
 
     asyncio.run(exercise())
+
+
+HISTORY = FIXTURES / "series" / "history_5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6.json"
+SOL_REF = PoolRef(
+    address=PublicKey(SOL_POOL), base_mint=PublicKey(SOL_MINT), quote_mint=PublicKey(USDC_MINT)
+)
+
+
+class HistoryApi:
+    """``/pools/{address}/volume/history`` as recorded at 15:51:19 UTC on 2026-10-23."""
+
+    def __init__(self, body: bytes | None = None) -> None:
+        self.body = body or HISTORY.read_bytes()
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return httpx.Response(200, content=self.body, headers={"content-type": "application/json"})
+
+
+def test_volume_history_returns_only_closed_settled_buckets_as_exact_decimals() -> None:
+    recorded = json.loads(HISTORY.read_bytes(), parse_float=Decimal)["data"]
+    clock = FrozenClock(datetime(2026, 10, 23, 15, 51, 4, tzinfo=UTC))
+    api = HistoryApi()
+    provider, client = _provider(api, clock)  # type: ignore[arg-type]
+    start = clock.now() - timedelta(hours=2)
+
+    async def exercise() -> Any:
+        async with client:
+            return await provider.volume_history(SOL_REF, start=start, end=clock.now())
+
+    buckets = asyncio.run(exercise())
+
+    (request,) = api.requests
+    assert request.url.path == f"/pools/{SOL_POOL}/volume/history"
+    assert dict(request.url.params) == {
+        "timeframe": "5m",
+        "start_time": str(int(start.timestamp())),
+        "end_time": str(int(clock.now().timestamp())),
+    }
+    # From 13:55 (first start after 13:51:04) to the 15:40 bucket: 15:45 closed only
+    # 64 s ago, the open 15:50 bucket (served as 0.0) never leaves the adapter.
+    assert buckets[0].start == datetime(2026, 10, 23, 13, 55, tzinfo=UTC)
+    assert buckets[-1].end == datetime(2026, 10, 23, 15, 45, tzinfo=UTC)
+    assert len(buckets) == 22
+    first = recorded[13]
+    assert (buckets[0].volume, buckets[0].fees, buckets[0].protocol_fees) == (
+        first["volume"], first["fees"], first["protocol_fees"]
+    )
+    assert all(bucket.pool_address.root == SOL_POOL for bucket in buckets)
+
+
+def test_volume_history_is_cached_until_a_new_bucket_settles_and_rate_limited() -> None:
+    clock = FrozenClock(datetime(2026, 10, 23, 15, 51, 4, tzinfo=UTC))
+    api = HistoryApi()
+    sleep = RecordedSleep()
+    provider, client = _provider(api, clock, rate_limiter=_limiter(sleep))  # type: ignore[arg-type]
+
+    async def exercise() -> list[Any]:
+        results = []
+        async with client:
+            for advance in (timedelta(0), timedelta(seconds=30), timedelta(minutes=5)):
+                clock.advance(advance)
+                results.append(
+                    await provider.volume_history(
+                        SOL_REF, start=clock.now() - timedelta(hours=1), end=clock.now()
+                    )
+                )
+        return results
+
+    first, again, later = asyncio.run(exercise())
+
+    assert len(api.requests) == 2  # the second read came from the cache
+    assert again == first
+    assert later[-1].end == datetime(2026, 10, 23, 15, 50, tzinfo=UTC)
+    assert sleep.delays == [0.5]
+
+
+def test_a_broken_volume_history_degrades_the_provider() -> None:
+    api = HistoryApi(json.dumps({"data": [{"timestamp": "soon", "volume": 1.0}]}).encode())
+    provider, client = _provider(api, FrozenClock(datetime(2026, 10, 23, 16, tzinfo=UTC)))  # type: ignore[arg-type]
+
+    async def exercise() -> None:
+        async with client:
+            with pytest.raises(ProviderPayloadError, match="bucket"):
+                await provider.volume_history(
+                    SOL_REF,
+                    start=datetime(2026, 10, 23, 15, tzinfo=UTC),
+                    end=datetime(2026, 10, 23, 16, tzinfo=UTC),
+                )
+
+    asyncio.run(exercise())
+
+    assert provider.health.state is ProviderState.DEGRADED

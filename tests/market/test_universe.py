@@ -16,6 +16,8 @@ from src.market.models import (
     WindowMetrics,
 )
 from src.market.universe import InMemoryUniverseStore, SyncStatus, UniverseSync
+from src.market.windows import ShortWindowRules
+from src.persistence.memory import InMemorySnapshotHistory
 from src.providers.contracts import ProviderUnavailableError
 
 NOW = datetime(2026, 10, 18, 10, 0, tzinfo=UTC)
@@ -256,5 +258,53 @@ def test_listing_failure_fails_the_sync_without_opening_a_version() -> None:
         assert result.status is SyncStatus.FAILED
         assert result.error_code == "PROVIDER_UNAVAILABLE"
         assert store.begin_calls == 0 and provider.snapshot_calls == []
+
+    asyncio.run(exercise())
+
+
+class CountingProvider(RecordingProvider):
+    """Live-like source: no 5m window, lifetime counters that grow 100 volume a minute."""
+
+    async def get_pool_snapshot(self, pool: PoolRef, at: datetime) -> PoolSnapshot:
+        snapshot = await super().get_pool_snapshot(pool, at)
+        minutes = Decimal(int((at - NOW).total_seconds())) / Decimal(60)
+        data = snapshot.model_dump()
+        data["windows"] = {
+            name: metric for name, metric in snapshot.windows.items() if name != "5m"
+        }
+        data.update(
+            cumulative_volume=Decimal("50000") + Decimal(100) * minutes,
+            cumulative_fees=Decimal("50") + minutes / Decimal(10),
+        )
+        return PoolSnapshot.model_validate(data)
+
+
+def test_each_synced_snapshot_derives_its_short_window_from_the_last_universe() -> None:
+    async def exercise() -> None:
+        clock = FrozenClock(NOW)
+        provider = CountingProvider()
+        store = InMemoryUniverseStore()
+        sync = UniverseSync(
+            provider,
+            store,
+            clock=clock,
+            previous=InMemorySnapshotHistory(store),
+            short_window=ShortWindowRules(),
+        )
+
+        await sync.run(UUID(int=7))
+        clock.advance(timedelta(minutes=5))
+        await sync.run(UUID(int=8))
+
+        for pool in provider.pools:
+            first, second = store.history_for(pool.address)
+            assert "5m" not in first.windows
+            assert first.short_window is not None
+            assert first.short_window.reason == "NO_PREVIOUS"
+            # 5 minutes at 100 a minute; fees 0.1 a minute.
+            assert second.windows["5m"].volume == Decimal("500")
+            assert second.windows["5m"].fees == Decimal("0.5")
+            assert second.short_window is not None
+            assert second.short_window.previous_source_at == first.source_at
 
     asyncio.run(exercise())

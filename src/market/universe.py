@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from typing import Protocol
 from uuid import UUID
 
 from src.core.clock import Clock, SystemClock
@@ -14,6 +15,7 @@ from src.market.contracts import (
     UniverseSnapshotStore,
 )
 from src.market.models import PoolRef, PoolSnapshot
+from src.market.windows import ShortWindowRules, derive_short_window
 from src.providers.contracts import (
     ProviderError,
     ProviderPayloadError,
@@ -21,6 +23,12 @@ from src.providers.contracts import (
     ProviderTimeoutError,
     ProviderUnavailableError,
 )
+
+
+class PreviousUniverse(Protocol):
+    """The last published universe: the predecessor of each pool's next snapshot."""
+
+    async def latest_universe(self) -> tuple[PoolSnapshot, ...]: ...
 
 
 class SyncStatus(StrEnum):
@@ -140,6 +148,8 @@ class UniverseSync:
         max_concurrency: int = 8,
         batch_size: int | None = None,
         priority_addresses: set[str] | None = None,
+        previous: PreviousUniverse | None = None,
+        short_window: ShortWindowRules | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be at least one")
@@ -151,6 +161,8 @@ class UniverseSync:
         self._max_concurrency = max_concurrency
         self._batch_size = batch_size or max_concurrency
         self._priority_addresses = frozenset(priority_addresses or ())
+        self._previous = previous
+        self._short_window = short_window
 
     async def run(self, sync_id: UUID) -> SyncResult:
         """List every page, then observe the version and stage it in bounded batches.
@@ -164,10 +176,11 @@ class UniverseSync:
             pools = await self._list_universe()
         except ProviderError as error:
             return _failed(sync_id, error)
+        previous = await self._previous_snapshots()
         observed_at = self._clock.now()
         stage = await self._store.begin(sync_id, observed_at)
         try:
-            pool_count = await self._stage_snapshots(stage, pools, observed_at)
+            pool_count = await self._stage_snapshots(stage, pools, observed_at, previous)
             duplicates = await stage.commit()
         except ProviderError as error:
             await stage.abort()
@@ -203,16 +216,38 @@ class UniverseSync:
             seen_cursors.add(page.next_cursor)
             cursor = page.next_cursor
 
+    async def _previous_snapshots(self) -> dict[str, PoolSnapshot]:
+        """Each pool's snapshot in the last published universe, its short-window base."""
+
+        if self._previous is None or self._short_window is None:
+            return {}
+        return {
+            snapshot.pool.address.root: snapshot
+            for snapshot in await self._previous.latest_universe()
+        }
+
+    def _derive(
+        self, snapshots: tuple[PoolSnapshot, ...], previous: dict[str, PoolSnapshot]
+    ) -> tuple[PoolSnapshot, ...]:
+        rules = self._short_window
+        if rules is None:
+            return snapshots
+        return tuple(
+            derive_short_window(snapshot, previous.get(snapshot.pool.address.root), rules)
+            for snapshot in snapshots
+        )
+
     async def _stage_snapshots(
         self,
         stage: UniverseSnapshotStage,
         pools: tuple[PoolRef, ...],
         observed_at: datetime,
+        previous: dict[str, PoolSnapshot],
     ) -> int:
         pool_count = 0
         for offset in range(0, len(pools), self._batch_size):
             batch = pools[offset : offset + self._batch_size]
-            snapshots = await self._snapshot_batch(batch, observed_at)
+            snapshots = self._derive(await self._snapshot_batch(batch, observed_at), previous)
             try:
                 await stage.stage(snapshots)
             except ValueError as error:

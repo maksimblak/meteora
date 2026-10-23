@@ -7,7 +7,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from src.domain.models.primitives import PublicKey
-from src.market.models import DataQuality, Freshness
+from src.market.models import DataQuality, Freshness, WindowOrigin
 
 
 def _exact_decimal(value: object) -> object:
@@ -78,6 +78,7 @@ class VolumeFeatureRules(BaseModel):
     maximum_history_points: int = 288
     maximum_source_age: timedelta = timedelta(minutes=10)
     zero_dispersion_score: Decimal = Decimal("10")
+    burst_points: int = 3
     guide: GuideFeatureRules | None = None
 
     _reject_float = field_validator("zero_dispersion_score", mode="before")(_exact_decimal)
@@ -100,6 +101,10 @@ class VolumeFeatureRules(BaseModel):
             raise ValueError("maximum_source_age must be positive")
         if self.zero_dispersion_score <= 0:
             raise ValueError("zero_dispersion_score must be positive")
+        if self.burst_points < 2:
+            raise ValueError("burst_points must be at least two")
+        if WINDOW_MINUTES[self.long_window] % WINDOW_MINUTES[self.short_window]:
+            raise ValueError("long_window must be a whole number of short windows")
         return self
 
 
@@ -146,6 +151,13 @@ class VolumeSpikeFeatures(BaseModel):
     # The window volume per minute was averaged over: the rules' ``volume_window`` or the
     # snapshot's marked substitute (D04); ``None`` when volume per minute is unknown.
     volume_window_source: str | None = None
+    # Where the current short window and its baseline came from (D07): reported by the
+    # source, derived from cumulative counters, or the pool's volume history (warm-up).
+    short_window_origin: WindowOrigin | None = None
+    baseline_origin: WindowOrigin | None = None
+    # (max - min) / max of the last ``burst_points`` short windows: near zero means the
+    # same burst repeats (self-similar volume, G07); ``None`` with too few windows.
+    short_burst_spread: Decimal | None = None
 
     _reject_float = field_validator(
         "volume_per_minute",

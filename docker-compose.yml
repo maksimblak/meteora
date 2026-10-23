@@ -84,11 +84,54 @@ services:
       <<: *python-environment
       # Health/metrics for the api on the internal compose network only (not published).
       WORKER_METRICS_HOST: 0.0.0.0
+      # Live data (D07): the public Data API, narrowed by METEORA_UNIVERSE_FILTER
+      # (empty = pools that traded in 24 h, "all" = the full sweep). SOLANA_RPC_URL adds
+      # token risk and LB pair reads; without it token risk stays UNKNOWN.
+      METEORA_DATA_API_BASE_URL: ${METEORA_DATA_API_BASE_URL:-https://dlmm.datapi.meteora.ag}
+      METEORA_UNIVERSE_FILTER: ${METEORA_UNIVERSE_FILTER:-}
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL:-}
+      TRADING_MODE: ${TRADING_MODE:-}
+      RULESET_VERSION: ${RULESET_VERSION:-}
+      WORKER_UNIVERSE_INTERVAL_SECONDS: ${WORKER_UNIVERSE_INTERVAL_SECONDS:-}
+      # Read-only quotes for candidates' depth (D07) from executor-quotes below, in every
+      # mode. Set the internal token (or its *_FILE inside the container) for both; without
+      # it there are no quotes and candidates carry DEPTH_UNAVAILABLE.
+      EXECUTOR_QUOTES_URL: ${EXECUTOR_QUOTES_URL:-http://executor-quotes:3000}
+      EXECUTOR_URL: ${EXECUTOR_URL:-}
+      EXECUTOR_INTERNAL_TOKEN: ${EXECUTOR_INTERNAL_TOKEN:-}
+      EXECUTOR_INTERNAL_TOKEN_FILE: ${EXECUTOR_INTERNAL_TOKEN_FILE:-}
     expose:
       - "9100"
     depends_on:
       migrate:
         condition: service_completed_successfully
+
+  # The executor image pinned to SHADOW: it starts with the shadow stack, holds no wallet
+  # by construction and serves only the read-only POST /v1/quotes (SOLANA_RPC_URL and the
+  # internal token required). The money executor stays in the ``live`` profile.
+  executor-quotes:
+    build:
+      context: .
+      dockerfile: Dockerfile.executor
+    environment:
+      TRADING_MODE: SHADOW
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL:-}
+      EXECUTOR_INTERNAL_TOKEN: ${EXECUTOR_INTERNAL_TOKEN:-}
+      EXECUTOR_INTERNAL_TOKEN_FILE: ${EXECUTOR_INTERNAL_TOKEN_FILE:-}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3000/health/live')
+          .then((response) => process.exit(response.ok ? 0 : 1))
+          .catch(() => process.exit(1))
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    expose:
+      - "3000"
 
   executor:
     profiles: ["live"]
