@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, field_serializer, field_validator, m
 from src.domain.models.primitives import BaseUnits, PublicKey
 
 WINDOW_NAMES = frozenset({"5m", "30m", "1h", "4h", "24h"})
+_I32_MIN, _I32_MAX = -(2**31), 2**31 - 1
+_U8_MAX = 255
 
 
 class FrozenMapping[ValueT](Mapping[str, ValueT]):
@@ -153,6 +155,14 @@ class PoolSnapshot(BaseModel):
     # they are not part of ``missing_fields`` so rulesets that do not use them are unaffected.
     base_fee_rate: Decimal | None = None
     base_token_market_cap: Decimal | None = None
+    # Execution anchor (spec 8.5, D06): the pool's active bin and both token decimals.
+    # ``None`` when no source reported them; a non-SHADOW entry needs all three.
+    active_bin_id: int | None = None
+    base_decimals: int | None = None
+    quote_decimals: int | None = None
+    # The window standing in for the short 5m window when the source has none (D04),
+    # e.g. ``"30m"`` from the live Data API; ``None`` when the source made no substitution.
+    short_window_source: str | None = None
 
     _reject_binary_float = field_validator(
         "tvl", "depth", "price", "base_fee_rate", "base_token_market_cap", mode="before"
@@ -169,6 +179,13 @@ class PoolSnapshot(BaseModel):
             raise ValueError("base_token_market_cap must not be negative")
         if self.bin_step <= 0:
             raise ValueError("bin_step must be positive")
+        if self.active_bin_id is not None and not _I32_MIN <= self.active_bin_id <= _I32_MAX:
+            raise ValueError("active_bin_id must fit the on-chain i32")
+        for decimals in (self.base_decimals, self.quote_decimals):
+            if decimals is not None and not 0 <= decimals <= _U8_MAX:
+                raise ValueError("token decimals must fit the on-chain u8")
+        if self.short_window_source is not None and self.short_window_source not in self.windows:
+            raise ValueError("short_window_source must name a window the snapshot carries")
         unknown_windows = set(self.windows).difference(WINDOW_NAMES)
         if unknown_windows:
             raise ValueError(f"unknown metric windows: {sorted(unknown_windows)}")

@@ -1,9 +1,29 @@
 """Small transport boundary shared by provider adapters."""
 
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from src.domain.models.primitives import PublicKey
-from src.market.models import EnhancedTokenSignals, ProviderHealth
+from src.market.models import EnhancedTokenSignals, PoolRef, ProviderHealth
+
+
+@dataclass(frozen=True, slots=True)
+class LbPairState:
+    """On-chain facts read from a DLMM pair's LB pair account (spec 8.5, D06)."""
+
+    active_bin_id: int
+    bin_step: int
+    token_x_mint: str
+    token_y_mint: str
+
+
+class PoolStateReader(Protocol):
+    """Fills what the Data API does not report: the active bin and, if missing, decimals."""
+
+    async def get_pool_states(self, pools: Sequence[PoolRef]) -> Mapping[str, LbPairState]: ...
+
+    async def get_mint_decimals(self, mints: Sequence[PublicKey]) -> Mapping[str, int]: ...
 
 
 class JsonClient(Protocol):

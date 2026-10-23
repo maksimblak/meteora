@@ -124,6 +124,7 @@ class VolumeFeatureEngine:
             fee_efficiency=guide.fee_efficiency,
             local_high_price=guide.local_high_price,
             all_time_high_price=guide.all_time_high_price,
+            volume_window_source=guide.volume_window_source,
         )
 
 
@@ -134,6 +135,7 @@ class _GuideValues:
     fee_efficiency: Decimal | None = None
     local_high_price: Decimal | None = None
     all_time_high_price: Decimal | None = None
+    volume_window_source: str | None = None
 
 
 def _guide_features(
@@ -146,8 +148,13 @@ def _guide_features(
     if rules is None:
         return _GuideValues()
     latest = ordered[-1]
-    volume = latest.windows.get(rules.volume_window)
-    per_minute = volume.volume / Decimal(WINDOW_MINUTES[rules.volume_window]) if volume else None
+    window = _volume_window(latest, rules)
+    volume = latest.windows.get(window) if window is not None else None
+    per_minute = (
+        volume.volume / Decimal(WINDOW_MINUTES[window])
+        if volume is not None and window is not None
+        else None
+    )
     # The guide threshold is 5-minute volume to liquidity; rescale so a longer window
     # (a 30m average) cannot make the 0.5 bar several times easier to clear.
     to_liquidity = (
@@ -185,7 +192,23 @@ def _guide_features(
         fee_efficiency=fee_efficiency,
         local_high_price=local_high,
         all_time_high_price=all_time_high,
+        volume_window_source=window if per_minute is not None else None,
     )
+
+
+def _volume_window(latest: PoolSnapshot, rules: GuideFeatureRules) -> str | None:
+    """The configured window, else the source's marked substitute within the limit (D04)."""
+
+    if rules.volume_window in latest.windows:
+        return rules.volume_window
+    substitute = latest.short_window_source
+    if (
+        substitute is None
+        or substitute not in WINDOW_MINUTES
+        or WINDOW_MINUTES[substitute] > WINDOW_MINUTES[rules.maximum_volume_window]
+    ):
+        return None
+    return substitute
 
 
 def _reject_conflicting_observations(history: Sequence[PoolSnapshot]) -> None:

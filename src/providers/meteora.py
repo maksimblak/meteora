@@ -1,8 +1,28 @@
-"""Meteora Data API adapter with strict payload normalization."""
+"""Meteora DLMM Data API adapter (``dlmm.datapi.meteora.ag``) with strict normalization.
 
-from collections.abc import Mapping
+The live API (format recorded 2026-10-23, spec 6.1 D04) reports every number as a JSON
+float, ``created_at`` as epoch milliseconds, volume and fees for 30m/1h/2h/4h/12h/24h (no
+5m) and paginates by page number. It states no as-of time and serves only the present, so
+the arrival of a page is the ``source_at`` of every pool on it. Floats become ``Decimal``
+through their shortest round-trip string: no binary float reaches the domain.
+
+A sweep (``list_pools(None)`` and the cursors it returns) keeps each listed pool until
+``get_pool_snapshot`` turns it into a snapshot, so the universe costs one request per page,
+not per pool. One sweep at a time per provider instance.
+
+Pages are a moving window over a live index: a tie reorder or a pool indexed mid-sweep
+shifts later pages, so one pool arrives twice and another never. A sweep that saw a repeat,
+or fewer distinct pools than the reported ``total``, re-reads the pages around each repeat
+and keeps what it had missed; if it is still short, it fails instead of publishing.
+"""
+
+import asyncio
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
 from typing import Any
 
 from pydantic import ValidationError
@@ -10,20 +30,110 @@ from pydantic import ValidationError
 from src.core.clock import Clock, SystemClock
 from src.domain.models.primitives import PublicKey
 from src.market.models import (
-    WINDOW_NAMES,
     DataQuality,
     Freshness,
     PoolPage,
     PoolRef,
     PoolSnapshot,
     ProviderHealth,
+    ProviderState,
     WindowMetrics,
 )
-from src.providers.contracts import JsonClient, ProviderPayloadError
+from src.providers.contracts import (
+    JsonClient,
+    LbPairState,
+    PoolStateReader,
+    ProviderError,
+    ProviderPayloadError,
+)
+from src.providers.resilience import IntervalRateLimiter
+
+DATA_API_URL = "https://dlmm.datapi.meteora.ag"
+MAX_PAGE_SIZE = 1_000
+DEFAULT_REQUESTS_PER_SECOND = 2.0
+DEFAULT_PAGE_CONCURRENCY = 4
+# Oldest first: pools created during a sweep land on the last page and shift nothing.
+SORT_ORDER = "pool_created_at:asc"
+# Shortest first. The API's 2h and 12h windows have no domain window and are not kept.
+SOURCE_WINDOWS = ("30m", "1h", "4h", "24h")
+PROVIDER_NAME = "meteora_data_api"
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_ALWAYS_MISSING = ("depth", "windows.5m")
+
+
+@dataclass(frozen=True, slots=True)
+class SweepReport:
+    """What the current (or last) universe sweep saw; rejected pools never become snapshots."""
+
+    pages: int
+    reported_total: int | None
+    listed: int
+    accepted: int
+    rejected: Mapping[str, int]
+    anchored: int
+    complete: bool
+    duplicates: int = 0
+    recovered: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _PoolQuote:
+    pool: PoolRef
+    source_at: datetime
+    created_at: datetime
+    tvl: Decimal
+    price: Decimal
+    bin_step: int
+    windows: Mapping[str, WindowMetrics]
+    missing: tuple[str, ...]
+    base_fee_rate: Decimal | None
+    market_cap: Decimal | None
+    base_decimals: int | None
+    quote_decimals: int | None
+    active_bin_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RawPage:
+    payload: Any
+    arrived_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _PageMeta:
+    items: Sequence[Any]
+    pages: int
+    total: int
+
+
+@dataclass(slots=True)
+class _Sweep:
+    pages: int = 0
+    reported_total: int | None = None
+    listed: int = 0
+    accepted: int = 0
+    anchored: int = 0
+    complete: bool = False
+    duplicates: int = 0
+    recovered: int = 0
+    unidentified: int = 0
+    rejected: Counter[str] = field(default_factory=Counter)
+    seen: set[str] = field(default_factory=set)
+    shifted_pages: set[int] = field(default_factory=set)
+
+    @property
+    def distinct(self) -> int:
+        return len(self.seen) + self.unidentified
+
+
+class _Rejected(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class MeteoraDataApiProvider:
-    """Expose provider JSON through the stable market-data contract."""
+    """Expose the live Data API through the stable market-data contract."""
 
     def __init__(
         self,
@@ -32,222 +142,533 @@ class MeteoraDataApiProvider:
         clock: Clock | None = None,
         stale_after: timedelta = timedelta(minutes=2),
         pools_path: str = "/pools",
+        page_size: int = MAX_PAGE_SIZE,
+        filter_by: str | None = None,
+        rate_limiter: IntervalRateLimiter | None = None,
+        page_concurrency: int = DEFAULT_PAGE_CONCURRENCY,
+        pool_states: PoolStateReader | None = None,
+        maximum_rejected_share: Decimal = Decimal("0.5"),
     ) -> None:
         if stale_after <= timedelta(0):
             raise ValueError("stale_after must be positive")
+        if not 1 <= page_size <= MAX_PAGE_SIZE:
+            raise ValueError(f"page_size must be between 1 and {MAX_PAGE_SIZE}")
+        if page_concurrency < 1:
+            raise ValueError("page_concurrency must be at least one")
+        if not Decimal(0) <= maximum_rejected_share < Decimal(1):
+            raise ValueError("maximum_rejected_share must be in [0, 1)")
         self._client = client
         self._clock = clock or SystemClock()
         self._stale_after = stale_after
         self._pools_path = pools_path.rstrip("/")
+        self._page_size = page_size
+        self._filter_by = filter_by
+        self._limiter = rate_limiter or IntervalRateLimiter(DEFAULT_REQUESTS_PER_SECOND)
+        self._page_concurrency = page_concurrency
+        self._pool_states = pool_states
+        self._maximum_rejected_share = maximum_rejected_share
+        self._sweep = _Sweep()
+        self._quotes: dict[str, _PoolQuote] = {}
+        self._prefetch: dict[int, asyncio.Task[_RawPage]] = {}
+        self._known_pages: int | None = None
+        self._payload_failures = 0
+        self._last_payload_error: str | None = None
 
     @property
     def health(self) -> ProviderHealth:
-        return self._client.health
+        """Transport health, degraded further by pages that could not be normalized."""
+
+        transport = self._client.health
+        if transport.state is not ProviderState.HEALTHY or not self._payload_failures:
+            return transport
+        return ProviderHealth(
+            ProviderState.DEGRADED, self._payload_failures, self._last_payload_error, None
+        )
+
+    @property
+    def sweep(self) -> SweepReport:
+        state = self._sweep
+        return SweepReport(
+            pages=state.pages,
+            reported_total=state.reported_total,
+            listed=state.listed,
+            accepted=state.accepted,
+            rejected=MappingProxyType(dict(state.rejected)),
+            anchored=state.anchored,
+            complete=state.complete,
+            duplicates=state.duplicates,
+            recovered=state.recovered,
+        )
 
     async def list_pools(self, cursor: str | None) -> PoolPage:
-        params = {"cursor": cursor} if cursor is not None else None
-        payload = _mapping(await self._client.get_json(self._pools_path, params=params))
-        raw_items = payload.get("items", payload.get("pairs", payload.get("data")))
-        if not isinstance(raw_items, list):
-            raise ProviderPayloadError("Meteora pool page must contain an items list")
-        items = tuple(_pool_ref(item) for item in raw_items)
-        next_cursor = payload.get("next_cursor", payload.get("nextCursor"))
-        if next_cursor is not None and not isinstance(next_cursor, str):
-            raise ProviderPayloadError("Meteora next cursor must be a string or null")
-        return PoolPage(items=items, next_cursor=next_cursor)
+        page = 1 if cursor is None else _page_number(cursor)
+        if cursor is None:
+            self._start_sweep()
+        try:
+            raw = await self._page(page)
+            meta = _page_meta(raw.payload, page)
+        except ProviderPayloadError as error:
+            self._cancel_prefetch()
+            self._degrade("broken_page", error)
+            raise
+        except BaseException:
+            self._cancel_prefetch()
+            raise
+        self._known_pages = meta.pages
+        self._schedule_ahead(page)
+        state = self._sweep
+        state.pages += 1
+        state.reported_total = meta.total
+        quotes = await self._anchor(self._accept(meta.items, raw.arrived_at, page))
+        next_cursor = str(page + 1) if page < meta.pages else None
+        if next_cursor is None:
+            quotes.extend(await self._repair())
+        for quote in quotes:
+            self._quotes[quote.pool.address.root] = quote
+        state.accepted += len(quotes)
+        state.anchored += sum(1 for quote in quotes if quote.active_bin_id is not None)
+        if next_cursor is None:
+            self._finish_sweep()
+        return PoolPage(items=tuple(quote.pool for quote in quotes), next_cursor=next_cursor)
 
     async def get_pool_snapshot(self, pool: PoolRef, at: datetime) -> PoolSnapshot:
         observed_at = _aware_datetime(at, field="observed_at")
-        payload = _mapping(await self._client.get_json(f"{self._pools_path}/{pool.address.root}"))
-        source_at = _timestamp(
-            _required(payload, "source_at", "updated_at", "updatedAt"),
-            field="source_at",
-        )
-        created_at = _timestamp(
-            _required(payload, "created_at", "createdAt", "pool_created_at"),
-            field="created_at",
-        )
+        quote = self._quotes.pop(pool.address.root, None)
+        if quote is None or quote.pool != pool:
+            try:
+                quote = await self._fetch_quote(pool)
+            except ProviderPayloadError as error:
+                self._degrade("pool_payload", error)
+                raise
+            # The API serves only the present: an observation never predates its source.
+            observed_at = max(observed_at, quote.source_at)
+        elif quote.source_at > observed_at:
+            raise ProviderPayloadError("listed page arrived after the observation instant")
         try:
-            windows, missing_fields = _windows(payload)
-            tvl = _decimal(_required(payload, "tvl", "liquidity"), field="tvl")
-            depth_raw = payload.get("depth", payload.get("active_liquidity"))
-            depth = _decimal(depth_raw, field="depth") if depth_raw is not None else None
-            if depth is None:
-                missing_fields.append("depth")
-            price = _decimal(
-                _required(payload, "price", "current_price", "currentPrice"),
-                field="price",
-            )
-            bin_step = _integer(_required(payload, "bin_step", "binStep"), field="bin_step")
-            base_fee_rate = _base_fee_rate(payload)
-            market_cap = _base_market_cap(payload, pool)
-            freshness = (
-                Freshness.STALE if observed_at - source_at > self._stale_after else Freshness.FRESH
-            )
-            quality = DataQuality.PARTIAL if missing_fields else DataQuality.COMPLETE
-            return PoolSnapshot(
-                pool=pool,
-                windows=windows,
-                tvl=tvl,
-                depth=depth,
-                price=price,
-                bin_step=bin_step,
-                created_at=created_at,
-                observed_at=observed_at,
-                source_at=source_at,
-                ingested_at=self._clock.now(),
-                freshness=freshness,
-                data_quality=quality,
-                missing_fields=tuple(sorted(missing_fields)),
-                provider="meteora_data_api",
-                base_fee_rate=base_fee_rate,
-                base_token_market_cap=market_cap,
-            )
+            return self._snapshot(quote, observed_at)
         except ValidationError as error:
             raise ProviderPayloadError("Meteora returned an invalid snapshot") from error
 
+    # --- sweep ---------------------------------------------------------------------------
 
-def _base_fee_rate(payload: Mapping[str, Any]) -> Decimal | None:
-    """Base fee as a fraction; the API reports it in percent (``0.04`` means 0.04%)."""
+    def _start_sweep(self) -> None:
+        self._cancel_prefetch()
+        self._sweep = _Sweep()
+        self._quotes.clear()
+        self._known_pages = None
 
-    config = payload.get("pool_config")
-    raw = _mapping(config).get("base_fee_pct") if config is not None else None
-    if raw is None:
-        raw = payload.get("base_fee_pct", payload.get("base_fee_percentage"))
-    if raw is None:
+    async def _repair(self) -> list[_PoolQuote]:
+        """Re-read the pages around each repeat and keep the pools the shift had hidden."""
+
+        state = self._sweep
+        if not state.shifted_pages:
+            return []
+        last = self._known_pages or 0
+        pages = sorted(
+            {near for page in state.shifted_pages for near in (page - 1, page) if 1 <= near <= last}
+        )
+        recovered: list[_PoolQuote] = []
+        for page in pages:
+            try:
+                raw = await self._fetch_page(page)
+                meta = _page_meta(raw.payload, page)
+            except ProviderPayloadError as error:
+                self._degrade("broken_page", error)
+                raise
+            state.reported_total = meta.total
+            accepted = self._accept(meta.items, raw.arrived_at, page, rereading=True)
+            recovered.extend(await self._anchor(accepted))
+        return recovered
+
+    def _finish_sweep(self) -> None:
+        state = self._sweep
+        total = state.reported_total or 0
+        if state.distinct < total:
+            error = ProviderPayloadError(
+                f"Meteora sweep missed {total - state.distinct} of {total} pools after "
+                f"re-reading the shifted pages {sorted(state.shifted_pages)}"
+            )
+            self._degrade("page_shift", error)
+            raise error
+        rejected = sum(state.rejected.values())
+        if state.listed and Decimal(rejected) / Decimal(state.listed) > (
+            self._maximum_rejected_share
+        ):
+            error = ProviderPayloadError(
+                f"Meteora sweep rejected {rejected} of {state.listed} pools"
+            )
+            self._degrade("rejected_share", error)
+            raise error
+        state.complete = True
+        self._cancel_prefetch()
+        self._payload_failures = 0
+        self._last_payload_error = None
+
+    def _accept(
+        self, items: Sequence[Any], arrived_at: datetime, page: int, *, rereading: bool = False
+    ) -> list[_PoolQuote]:
+        """New distinct pools of a page; a repeat marks the page as shifted, not rejected."""
+
+        state = self._sweep
+        accepted: list[_PoolQuote] = []
+        for item in items:
+            address = _address_of(item)
+            if address is not None and address in state.seen:
+                if not rereading:
+                    state.duplicates += 1
+                    state.shifted_pages.add(page)
+                continue
+            if address is None:
+                if rereading:
+                    continue  # cannot tell whether the first read counted it
+                state.unidentified += 1
+            else:
+                state.seen.add(address)
+            state.listed += 1
+            if rereading:
+                state.recovered += 1
+            try:
+                accepted.append(_quote(item, arrived_at))
+            except _Rejected as rejection:
+                state.rejected[rejection.reason] += 1
+        return accepted
+
+    async def _anchor(self, quotes: list[_PoolQuote]) -> list[_PoolQuote]:
+        """Active bin from the LB pair account; decimals from mints when the API lacks them."""
+
+        reader = self._pool_states
+        if reader is None or not quotes:
+            return quotes
+        try:
+            states = await reader.get_pool_states([quote.pool for quote in quotes])
+        except ProviderError:
+            states = {}
+        missing = sorted(
+            {
+                mint.root
+                for quote in quotes
+                for mint, decimals in (
+                    (quote.pool.base_mint, quote.base_decimals),
+                    (quote.pool.quote_mint, quote.quote_decimals),
+                )
+                if decimals is None
+            }
+        )
+        decimals: Mapping[str, int] = {}
+        if missing:
+            try:
+                decimals = await reader.get_mint_decimals([PublicKey(mint) for mint in missing])
+            except ProviderError:
+                decimals = {}
+        return [_anchored(quote, states.get(quote.pool.address.root), decimals) for quote in quotes]
+
+    # --- requests ------------------------------------------------------------------------
+
+    async def _page(self, page: int) -> _RawPage:
+        task = self._prefetch.pop(page, None)
+        if task is not None:
+            return await task
+        return await self._fetch_page(page)
+
+    def _schedule_ahead(self, page: int) -> None:
+        if self._known_pages is None:
+            return
+        last = min(self._known_pages, page + self._page_concurrency - 1)
+        for ahead in range(page + 1, last + 1):
+            if ahead not in self._prefetch:
+                task = asyncio.create_task(self._fetch_page(ahead))
+                task.add_done_callback(_retrieve)
+                self._prefetch[ahead] = task
+
+    def _cancel_prefetch(self) -> None:
+        for task in self._prefetch.values():
+            task.cancel()
+        self._prefetch.clear()
+
+    async def _fetch_page(self, page: int) -> _RawPage:
+        params = {"page": str(page), "page_size": str(self._page_size), "sort_by": SORT_ORDER}
+        if self._filter_by is not None:
+            params["filter_by"] = self._filter_by
+        payload = await self._get(self._pools_path, params)
+        return _RawPage(payload, self._clock.now())
+
+    async def _fetch_quote(self, pool: PoolRef) -> _PoolQuote:
+        payload = await self._get(f"{self._pools_path}/{pool.address.root}", None)
+        arrived_at = self._clock.now()
+        try:
+            quote = _quote(payload, arrived_at)
+        except _Rejected as rejection:
+            raise ProviderPayloadError(f"Meteora pool rejected: {rejection.reason}") from None
+        if quote.pool != pool:
+            raise ProviderPayloadError("Meteora pool identity differs from the requested pool")
+        (anchored,) = await self._anchor([quote])
+        return anchored
+
+    async def _get(self, path: str, params: dict[str, str] | None) -> Any:
+        await self._limiter.acquire()
+        return await self._client.get_json(path, params=params)
+
+    def _degrade(self, category: str, error: Exception) -> None:
+        self._payload_failures += 1
+        self._last_payload_error = f"{category}: {error}"
+
+    # --- snapshot ------------------------------------------------------------------------
+
+    def _snapshot(self, quote: _PoolQuote, observed_at: datetime) -> PoolSnapshot:
+        stale = observed_at - quote.source_at > self._stale_after
+        short_window = next((name for name in SOURCE_WINDOWS if name in quote.windows), None)
+        return PoolSnapshot(
+            pool=quote.pool,
+            windows=quote.windows,
+            tvl=quote.tvl,
+            depth=None,
+            price=quote.price,
+            bin_step=quote.bin_step,
+            created_at=quote.created_at,
+            observed_at=observed_at,
+            source_at=quote.source_at,
+            ingested_at=self._clock.now(),
+            freshness=Freshness.STALE if stale else Freshness.FRESH,
+            data_quality=DataQuality.PARTIAL,
+            missing_fields=quote.missing,
+            provider=PROVIDER_NAME,
+            base_fee_rate=quote.base_fee_rate,
+            base_token_market_cap=quote.market_cap,
+            active_bin_id=quote.active_bin_id,
+            base_decimals=quote.base_decimals,
+            quote_decimals=quote.quote_decimals,
+            short_window_source=short_window,
+        )
+
+
+def _retrieve(task: "asyncio.Task[_RawPage]") -> None:
+    """Mark a prefetch failure as seen; the consumer re-raises it when it awaits the page."""
+
+    if not task.cancelled():
+        task.exception()
+
+
+def _anchored(
+    quote: _PoolQuote, state: LbPairState | None, decimals: Mapping[str, int]
+) -> _PoolQuote:
+    pool = quote.pool
+    active_bin_id = None
+    if (
+        state is not None
+        and state.token_x_mint == pool.base_mint.root
+        and state.token_y_mint == pool.quote_mint.root
+        and state.bin_step == quote.bin_step
+    ):
+        active_bin_id = state.active_bin_id
+    base = quote.base_decimals
+    quote_decimals = quote.quote_decimals
+    return replace(
+        quote,
+        active_bin_id=active_bin_id,
+        base_decimals=base if base is not None else _u8(decimals.get(pool.base_mint.root)),
+        quote_decimals=(
+            quote_decimals
+            if quote_decimals is not None
+            else _u8(decimals.get(pool.quote_mint.root))
+        ),
+    )
+
+
+def _u8(value: int | None) -> int | None:
+    return value if value is not None and 0 <= value <= 255 else None
+
+
+# --- page and pool normalization ---------------------------------------------------------
+
+
+def _address_of(item: Any) -> str | None:
+    value = item.get("address") if isinstance(item, Mapping) else None
+    if not isinstance(value, str):
         return None
-    percent = _decimal(raw, field="base_fee_pct")
-    if not Decimal(0) <= percent <= Decimal(100):
-        raise ProviderPayloadError("base_fee_pct must be a percentage in [0, 100]")
-    return percent / Decimal(100)
+    try:
+        return PublicKey(value).root
+    except ValueError:
+        return None
 
 
-def _base_market_cap(payload: Mapping[str, Any], pool: PoolRef) -> Decimal | None:
-    """Market cap of the pool's base token, matched by mint and never guessed by side."""
-
-    for side in ("token_x", "token_y"):
-        token = payload.get(side)
-        if token is None:
-            continue
-        details = _mapping(token)
-        if details.get("address") == pool.base_mint.root and details.get("market_cap") is not None:
-            return _decimal(details["market_cap"], field=f"{side}.market_cap")
-    raw = payload.get("base_market_cap", payload.get("market_cap"))
-    return None if raw is None else _decimal(raw, field="market_cap")
+def _page_number(cursor: str) -> int:
+    if not cursor.isdigit() or int(cursor) < 2:
+        raise ProviderPayloadError("Meteora cursor must be a page number above one")
+    return int(cursor)
 
 
-def _mapping(value: Any) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ProviderPayloadError("provider payload must be an object")
+def _page_meta(payload: Any, page: int) -> _PageMeta:
+    data = _mapping(payload, "page")
+    items = data.get("data")
+    if not isinstance(items, list):
+        raise ProviderPayloadError("Meteora page must contain a data list")
+    current = _page_count(data, "current_page")
+    pages = _page_count(data, "pages")
+    total = _page_count(data, "total")
+    size = _page_count(data, "page_size")
+    if current != page:
+        raise ProviderPayloadError(f"Meteora served page {current} for page {page}")
+    if size < 1 or pages != -(-total // size):
+        raise ProviderPayloadError("Meteora page count disagrees with the total")
+    expected = size if page < pages else max(0, total - (pages - 1) * size)
+    if page > pages:
+        expected = 0
+    if len(items) != expected:
+        raise ProviderPayloadError(
+            f"Meteora page {page} is partial: {len(items)} of {expected} pools"
+        )
+    return _PageMeta(items=items, pages=pages, total=total)
+
+
+def _page_count(payload: Mapping[str, Any], name: str) -> int:
+    value = payload.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ProviderPayloadError(f"Meteora page {name} must be a non-negative integer")
     return value
 
 
-def _required(payload: Mapping[str, Any], *names: str) -> Any:
-    for name in names:
-        if name in payload:
-            return payload[name]
-    raise ProviderPayloadError(f"provider payload is missing required field {names[0]}")
+def _quote(value: Any, arrived_at: datetime) -> _PoolQuote:
+    """One pool of the live format, or ``_Rejected`` with the reason it cannot be used."""
 
-
-def _pool_ref(value: Any) -> PoolRef:
-    payload = _mapping(value)
+    if not isinstance(value, Mapping):
+        raise _Rejected("malformed")
+    token_x = _section(value, "token_x")
+    token_y = _section(value, "token_y")
+    pool = PoolRef(
+        address=_key(value, "address", "address"),
+        base_mint=_key(token_x, "address", "token_x.address"),
+        quote_mint=_key(token_y, "address", "token_y.address"),
+    )
+    created_ms = _non_negative_int(value.get("created_at"), "created_at")
+    if created_ms == 0:
+        raise _Rejected("created_at_unknown")
     try:
-        return PoolRef(
-            address=PublicKey(_required(payload, "address", "pair_address", "pairAddress")),
-            base_mint=PublicKey(_required(payload, "base_mint", "mint_x", "mintX", "token_x_mint")),
-            quote_mint=PublicKey(
-                _required(payload, "quote_mint", "mint_y", "mintY", "token_y_mint")
-            ),
-        )
-    except (TypeError, ValueError) as error:
-        raise ProviderPayloadError("Meteora pool identity is invalid") from error
+        created_at = _EPOCH + timedelta(milliseconds=created_ms)
+    except OverflowError:
+        raise _Rejected("invalid:created_at") from None
+    config = _section(value, "pool_config")
+    bin_step = _non_negative_int(config.get("bin_step"), "pool_config.bin_step")
+    if bin_step == 0:
+        raise _Rejected("invalid:pool_config.bin_step")
+    windows, missing = _windows(value)
+    tokens = (token_x, token_y)
+    return _PoolQuote(
+        pool=pool,
+        source_at=arrived_at,
+        created_at=created_at,
+        tvl=_amount(value.get("tvl"), "tvl"),
+        price=_amount(value.get("current_price"), "current_price"),
+        bin_step=bin_step,
+        windows=windows,
+        missing=tuple(sorted({*_ALWAYS_MISSING, *missing})),
+        base_fee_rate=_base_fee_rate(config),
+        market_cap=_token_value(tokens, pool.base_mint, "market_cap", _optional_amount),
+        base_decimals=_token_value(tokens, pool.base_mint, "decimals", _optional_decimals),
+        quote_decimals=_token_value(tokens, pool.quote_mint, "decimals", _optional_decimals),
+    )
 
 
 def _windows(payload: Mapping[str, Any]) -> tuple[dict[str, WindowMetrics], list[str]]:
-    raw_windows = payload.get("windows")
+    volume = _section(payload, "volume")
+    fees = _section(payload, "fees")
     windows: dict[str, WindowMetrics] = {}
     missing: list[str] = []
-    if raw_windows is not None:
-        raw_mapping = _mapping(raw_windows)
-        for name in sorted(WINDOW_NAMES):
-            raw_window = raw_mapping.get(name)
-            if raw_window is None:
-                missing.append(f"windows.{name}")
-                continue
-            metric = _mapping(raw_window)
-            fee_raw = metric.get("fees")
-            if fee_raw is None:
-                missing.append(f"windows.{name}.fees")
-            windows[name] = WindowMetrics(
-                volume=_decimal(_required(metric, "volume"), field=f"windows.{name}.volume"),
-                fees=(
-                    _decimal(fee_raw, field=f"windows.{name}.fees") if fee_raw is not None else None
-                ),
-                transaction_count=_optional_integer(
-                    metric.get("transaction_count"), field=f"windows.{name}.transaction_count"
-                ),
-                unique_participants=_optional_integer(
-                    metric.get("unique_participants"),
-                    field=f"windows.{name}.unique_participants",
-                ),
-            )
-        return windows, missing
-
-    for name in sorted(WINDOW_NAMES):
-        volume_raw = payload.get(f"volume_{name}")
-        if volume_raw is None:
+    for name in SOURCE_WINDOWS:
+        if volume.get(name) is None:
             missing.append(f"windows.{name}")
             continue
-        fee_raw = payload.get(f"fees_{name}")
-        if fee_raw is None:
+        fee = _optional_amount(fees.get(name), f"fees.{name}")
+        if fee is None:
             missing.append(f"windows.{name}.fees")
-        windows[name] = WindowMetrics(
-            volume=_decimal(volume_raw, field=f"volume_{name}"),
-            fees=_decimal(fee_raw, field=f"fees_{name}") if fee_raw is not None else None,
-        )
+        windows[name] = WindowMetrics(volume=_amount(volume[name], f"volume.{name}"), fees=fee)
     return windows, missing
 
 
-def _decimal(value: Any, *, field: str) -> Decimal:
-    if isinstance(value, (float, bool)):
-        raise ProviderPayloadError(f"{field} must be an exact decimal, not binary float")
-    if not isinstance(value, (str, int, Decimal)):
-        raise ProviderPayloadError(f"{field} must be a decimal string or integer")
-    try:
-        parsed = Decimal(value)
-    except InvalidOperation as error:
-        raise ProviderPayloadError(f"{field} must be a finite decimal") from error
-    if not parsed.is_finite():
-        raise ProviderPayloadError(f"{field} must be a finite decimal")
-    return parsed
+def _base_fee_rate(config: Mapping[str, Any]) -> Decimal | None:
+    """Base fee as a fraction; the API reports it in percent (``0.04`` means 0.04%)."""
+
+    percent = _optional_amount(config.get("base_fee_pct"), "pool_config.base_fee_pct")
+    if percent is None:
+        return None
+    if percent > Decimal(100):
+        raise _Rejected("invalid:pool_config.base_fee_pct")
+    return percent / Decimal(100)
 
 
-def _integer(value: Any, *, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise ProviderPayloadError(f"{field} must be an integer")
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise ProviderPayloadError(f"{field} must be an integer") from error
-    if isinstance(value, str) and str(parsed) != value:
-        raise ProviderPayloadError(f"{field} must be an integer")
-    return parsed
+def _token_value[ValueT](
+    tokens: tuple[Mapping[str, Any], Mapping[str, Any]],
+    mint: PublicKey,
+    name: str,
+    parse: Callable[[Any, str], ValueT | None],
+) -> ValueT | None:
+    """A token figure taken only from the side whose address is ``mint``, never by position."""
+
+    for side, token in zip(("token_x", "token_y"), tokens, strict=True):
+        if token.get("address") == mint.root:
+            return parse(token.get(name), f"{side}.{name}")
+    return None
 
 
-def _optional_integer(value: Any, *, field: str) -> int | None:
-    return None if value is None else _integer(value, field=field)
+def _section(payload: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    value = payload.get(name)
+    if not isinstance(value, Mapping):
+        raise _Rejected(f"missing:{name}")
+    return value
 
 
-def _timestamp(value: Any, *, field: str) -> datetime:
-    if isinstance(value, datetime):
-        return _aware_datetime(value, field=field)
+def _key(payload: Mapping[str, Any], name: str, label: str) -> PublicKey:
+    value = payload.get(name)
     if not isinstance(value, str):
-        raise ProviderPayloadError(f"{field} must be an ISO-8601 timestamp")
+        raise _Rejected(f"missing:{label}")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise ProviderPayloadError(f"{field} must be an ISO-8601 timestamp") from error
-    return _aware_datetime(parsed, field=field)
+        return PublicKey(value)
+    except ValueError:
+        raise _Rejected(f"invalid:{label}") from None
+
+
+def _amount(value: Any, label: str) -> Decimal:
+    parsed = _optional_amount(value, label)
+    if parsed is None:
+        raise _Rejected(f"missing:{label}")
+    return parsed
+
+
+def _optional_amount(value: Any, label: str) -> Decimal | None:
+    """A non-negative finite number; a float goes through its shortest round-trip string."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise _Rejected(f"invalid:{label}")
+    try:
+        parsed = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
+    except InvalidOperation:
+        raise _Rejected(f"invalid:{label}") from None
+    if not parsed.is_finite() or parsed < 0:
+        raise _Rejected(f"invalid:{label}")
+    return parsed
+
+
+def _optional_decimals(value: Any, label: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255:
+        raise _Rejected(f"invalid:{label}")
+    return int(value)
+
+
+def _non_negative_int(value: Any, label: str) -> int:
+    if value is None:
+        raise _Rejected(f"missing:{label}")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _Rejected(f"invalid:{label}")
+    return int(value)
+
+
+def _mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ProviderPayloadError(f"Meteora {label} must be an object")
+    return value
 
 
 def _aware_datetime(value: datetime, *, field: str) -> datetime:

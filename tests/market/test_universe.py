@@ -192,9 +192,69 @@ def test_universe_sync_limits_each_snapshot_batch() -> None:
         assert store.commit_calls == 1
         assert store.abort_calls == 0
         assert store.legacy_publish_called is False
-        assert provider.events.index(f"snapshot:{provider.pools[0].address.root}") < (
-            provider.events.index("list:last")
+        # Every page is listed before the version is observed; the open position goes first.
+        assert provider.events[:3] == ["list:None", "list:last", "begin"]
+        assert provider.events[3] == f"snapshot:{provider.pools[1].address.root}"
+
+    asyncio.run(exercise())
+
+
+class PagedSourceProvider(RecordingProvider):
+    """A Data API-like source: a pool's data is as old as the page that listed it."""
+
+    def __init__(self, clock: FrozenClock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.listed_at: dict[str, datetime] = {}
+
+    async def list_pools(self, cursor: str | None) -> PoolPage:
+        self.clock.advance(timedelta(seconds=40))
+        page = await super().list_pools(cursor)
+        for pool in page.items:
+            self.listed_at[pool.address.root] = self.clock.now()
+        return page
+
+    async def get_pool_snapshot(self, pool: PoolRef, at: datetime) -> PoolSnapshot:
+        snapshot = await super().get_pool_snapshot(pool, at)
+        source_at = self.listed_at[pool.address.root]
+        return PoolSnapshot.model_validate(
+            {**snapshot.model_dump(), "source_at": source_at, "observed_at": at}
         )
-        assert provider.events.index("stage") < provider.events.index("list:last")
+
+
+def test_universe_is_observed_after_its_last_page_so_no_source_is_newer() -> None:
+    async def exercise() -> None:
+        clock = FrozenClock(NOW)
+        provider = PagedSourceProvider(clock)
+        store = InMemoryUniverseStore()
+
+        result = await UniverseSync(provider, store, clock=clock).run(UUID(int=5))
+
+        assert result.status is SyncStatus.COMPLETED
+        assert store.current is not None
+        assert store.current.observed_at == NOW + timedelta(seconds=80)
+        assert max(item.source_at for item in store.current.snapshots) == (
+            store.current.observed_at
+        )
+
+    asyncio.run(exercise())
+
+
+def test_listing_failure_fails_the_sync_without_opening_a_version() -> None:
+    class BrokenListing(RecordingProvider):
+        async def list_pools(self, cursor: str | None) -> PoolPage:
+            if cursor is not None:
+                raise ProviderUnavailableError("second page lost")
+            return await super().list_pools(cursor)
+
+    async def exercise() -> None:
+        provider = BrokenListing()
+        store = RecordingStagingStore(provider.events)
+
+        result = await UniverseSync(provider, store, clock=FrozenClock(NOW)).run(UUID(int=6))
+
+        assert result.status is SyncStatus.FAILED
+        assert result.error_code == "PROVIDER_UNAVAILABLE"
+        assert store.begin_calls == 0 and provider.snapshot_calls == []
 
     asyncio.run(exercise())

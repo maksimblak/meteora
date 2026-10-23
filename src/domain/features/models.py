@@ -28,7 +28,10 @@ class GuideFeatureRules(BaseModel):
     """Inputs of the LexDollar guide rules (spec 6.6); all are point-in-time.
 
     ``volume_window`` feeds volume per minute; volume-to-liquidity is that rate over five
-    minutes, as the guide reads it, whatever the window. ``organicity_window`` compares
+    minutes, as the guide reads it, whatever the window. A source without that window (the
+    live Data API has no 5m, D04) may mark a substitute in ``PoolSnapshot.short_window_source``;
+    it is used only up to ``maximum_volume_window`` and is named in
+    ``VolumeSpikeFeatures.volume_window_source``. ``organicity_window`` compares
     collected fees with the pool's base fee. A local high looks back
     ``local_high_lookback``. The pool ATH is known only when the stored history starts
     within ``ath_coverage_tolerance`` of pool creation and no two consecutive snapshots are
@@ -39,6 +42,7 @@ class GuideFeatureRules(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
     volume_window: str = "5m"
+    maximum_volume_window: str = "30m"
     organicity_window: str = "1h"
     local_high_lookback: timedelta = timedelta(hours=1)
     ath_coverage_tolerance: timedelta = timedelta(minutes=15)
@@ -46,7 +50,10 @@ class GuideFeatureRules(BaseModel):
 
     @model_validator(mode="after")
     def validate_guide(self) -> "GuideFeatureRules":
-        if self.volume_window not in WINDOW_MINUTES or self.organicity_window not in WINDOW_MINUTES:
+        if any(
+            window not in WINDOW_MINUTES
+            for window in (self.volume_window, self.maximum_volume_window, self.organicity_window)
+        ):
             raise ValueError("unsupported guide window")
         if self.local_high_lookback <= timedelta(0):
             raise ValueError("local_high_lookback must be positive")
@@ -136,6 +143,9 @@ class VolumeSpikeFeatures(BaseModel):
     fee_efficiency: Decimal | None = None
     local_high_price: Decimal | None = None
     all_time_high_price: Decimal | None = None
+    # The window volume per minute was averaged over: the rules' ``volume_window`` or the
+    # snapshot's marked substitute (D04); ``None`` when volume per minute is unknown.
+    volume_window_source: str | None = None
 
     _reject_float = field_validator(
         "volume_per_minute",

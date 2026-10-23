@@ -98,3 +98,53 @@ def test_market_models_preserve_exact_values_and_unknown_risk() -> None:
             ingested_at=NOW,
             data_quality=DataQuality.COMPLETE,
         )
+
+
+def _live_snapshot(**extra: Any) -> PoolSnapshot:
+    """A Data API snapshot: no 5m window and no depth, so it is honestly partial."""
+
+    windows = {name: metric for name, metric in _windows().items() if name != "5m"}
+    payload: dict[str, Any] = {
+        "pool": PoolRef(address=POOL_ADDRESS, base_mint=MINT_A, quote_mint=MINT_B),
+        "windows": windows,
+        "tvl": Decimal("100"),
+        "depth": None,
+        "price": Decimal("1"),
+        "bin_step": 20,
+        "created_at": datetime(2026, 10, 1, tzinfo=UTC),
+        "observed_at": NOW,
+        "source_at": NOW,
+        "ingested_at": NOW,
+        "freshness": Freshness.FRESH,
+        "data_quality": DataQuality.PARTIAL,
+        "missing_fields": ("depth", "windows.5m"),
+        **extra,
+    }
+    return PoolSnapshot(**payload)
+
+
+def test_snapshot_carries_execution_anchor_and_short_window_source() -> None:
+    """D06 anchor (active bin, both decimals) and the D04 short-window mark are optional."""
+
+    anchored = _live_snapshot(
+        active_bin_id=-1387, base_decimals=9, quote_decimals=6, short_window_source="30m"
+    )
+    bare = _live_snapshot()
+
+    assert (anchored.active_bin_id, anchored.base_decimals, anchored.quote_decimals) == (
+        -1387,
+        9,
+        6,
+    )
+    assert anchored.short_window_source == "30m"
+    assert (bare.active_bin_id, bare.base_decimals, bare.quote_decimals) == (None, None, None)
+    assert bare.short_window_source is None
+    for invalid in (
+        {"base_decimals": -1},
+        {"quote_decimals": 256},
+        {"active_bin_id": 2**31},
+        {"short_window_source": "5m"},  # the mark must name a window the snapshot has
+        {"short_window_source": "2h"},
+    ):
+        with pytest.raises(ValidationError):
+            _live_snapshot(**invalid)

@@ -153,19 +153,25 @@ class UniverseSync:
         self._priority_addresses = frozenset(priority_addresses or ())
 
     async def run(self, sync_id: UUID) -> SyncResult:
+        """List every page, then observe the version and stage it in bounded batches.
+
+        The instant is taken after the last page: a source that serves only the present
+        (the Data API) stamps each pool with its page's arrival, and no snapshot may hold
+        data newer than its ``observed_at``. A listing failure opens no version at all.
+        """
+
+        try:
+            pools = await self._list_universe()
+        except ProviderError as error:
+            return _failed(sync_id, error)
         observed_at = self._clock.now()
         stage = await self._store.begin(sync_id, observed_at)
         try:
-            pool_count = await self._stage_pages(stage, observed_at)
+            pool_count = await self._stage_snapshots(stage, pools, observed_at)
             duplicates = await stage.commit()
         except ProviderError as error:
             await stage.abort()
-            return SyncResult(
-                sync_id=sync_id,
-                status=SyncStatus.FAILED,
-                pool_count=0,
-                error_code=_provider_error_code(error),
-            )
+            return _failed(sync_id, error)
         except BaseException:
             await stage.abort()
             raise
@@ -176,43 +182,43 @@ class UniverseSync:
             duplicate_count=duplicates,
         )
 
-    async def _stage_pages(
-        self,
-        stage: UniverseSnapshotStage,
-        observed_at: datetime,
-    ) -> int:
+    async def _list_universe(self) -> tuple[PoolRef, ...]:
         cursor: str | None = None
         seen_cursors: set[str] = set()
-        pool_count = 0
+        seen_pools: set[str] = set()
+        priority: list[PoolRef] = []
+        regular: list[PoolRef] = []
         while True:
             page = await self._provider.list_pools(cursor)
-            priority = [
-                pool
-                for pool in page.items
-                if pool.address.root in self._priority_addresses
-            ]
-            regular = [
-                pool
-                for pool in page.items
-                if pool.address.root not in self._priority_addresses
-            ]
-            ordered = (*priority, *regular)
-            for offset in range(0, len(ordered), self._batch_size):
-                batch = ordered[offset : offset + self._batch_size]
-                snapshots = await self._snapshot_batch(batch, observed_at)
-                try:
-                    await stage.stage(snapshots)
-                except ValueError as error:
-                    raise ProviderPayloadError(
-                        "provider returned duplicate or mixed pools"
-                    ) from error
-                pool_count += len(snapshots)
+            for pool in page.items:
+                address = pool.address.root
+                if address in seen_pools:
+                    raise ProviderPayloadError("provider returned duplicate or mixed pools")
+                seen_pools.add(address)
+                (priority if address in self._priority_addresses else regular).append(pool)
             if page.next_cursor is None:
-                return pool_count
+                return (*priority, *regular)
             if page.next_cursor in seen_cursors:
                 raise ProviderPayloadError("provider returned a pagination cursor cycle")
             seen_cursors.add(page.next_cursor)
             cursor = page.next_cursor
+
+    async def _stage_snapshots(
+        self,
+        stage: UniverseSnapshotStage,
+        pools: tuple[PoolRef, ...],
+        observed_at: datetime,
+    ) -> int:
+        pool_count = 0
+        for offset in range(0, len(pools), self._batch_size):
+            batch = pools[offset : offset + self._batch_size]
+            snapshots = await self._snapshot_batch(batch, observed_at)
+            try:
+                await stage.stage(snapshots)
+            except ValueError as error:
+                raise ProviderPayloadError("provider returned duplicate or mixed pools") from error
+            pool_count += len(snapshots)
+        return pool_count
 
     async def _snapshot_batch(
         self, pools: tuple[PoolRef, ...], observed_at: datetime
@@ -234,6 +240,15 @@ class UniverseSync:
                 raise ProviderUnavailableError("market provider failed") from result
             snapshots.append(result)
         return tuple(snapshots)
+
+
+def _failed(sync_id: UUID, error: ProviderError) -> SyncResult:
+    return SyncResult(
+        sync_id=sync_id,
+        status=SyncStatus.FAILED,
+        pool_count=0,
+        error_code=_provider_error_code(error),
+    )
 
 
 def _provider_error_code(error: ProviderError) -> str:

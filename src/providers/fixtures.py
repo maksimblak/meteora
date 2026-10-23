@@ -1,4 +1,8 @@
-"""Deterministic provider fixtures for pipeline and degradation tests."""
+"""Deterministic provider fixtures for pipeline and degradation tests.
+
+Synthetic, provider-neutral snapshots built in code - not the Meteora wire format. Tests of
+the real Data API format use recorded responses in ``tests/providers/fixtures/meteora_live``.
+"""
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime

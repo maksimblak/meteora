@@ -1,5 +1,10 @@
-"""Solana JSON-RPC adapter for mint authorities, holder concentration, mint age and wallets."""
+"""Solana JSON-RPC adapter: mint authorities, holder concentration, mint age, wallets and
+the DLMM execution anchor (active bin, token decimals)."""
 
+import base64
+import binascii
+import hashlib
+import struct
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,6 +18,7 @@ from src.market.models import (
     DataQuality,
     EnhancedTokenSignals,
     Freshness,
+    PoolRef,
     ProviderHealth,
     RiskSignal,
     TokenRiskSnapshot,
@@ -20,6 +26,7 @@ from src.market.models import (
 )
 from src.providers.contracts import (
     EnhancedTokenIntelligenceProvider,
+    LbPairState,
     ProviderError,
     ProviderPayloadError,
     ProviderUnavailableError,
@@ -47,6 +54,21 @@ KNOWN_LIQUIDITY_PROGRAMS: frozenset[str] = frozenset(
 KNOWN_PROGRAM_AUTHORITIES: frozenset[str] = frozenset(
     {"5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"}  # Raydium AMM v4 authority
 )
+DLMM_PROGRAM_ID = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+# Prefix of the DLMM ``LbPair`` account (Anchor zero-copy, little-endian): discriminator (8),
+# StaticParameters (32), VariableParameters (32), bump_seed (1), bin_step_seed (2),
+# pair_type (1), active_id i32 at 76, bin_step u16 at 80, status, require_base_factor_seed,
+# base_factor_seed (2), activation_type, creator_pool_on_off_control, token_x_mint at 88,
+# token_y_mint at 120. Checked on mainnet on 2026-10-23: for three pools the mints, bin step
+# and the price implied by active_id matched the Data API. Anything else is not read.
+_LB_PAIR_DISCRIMINATOR = hashlib.sha256(b"account:LbPair").digest()[:8]
+_LB_PAIR_PREFIX_LENGTH = 152
+_ACTIVE_ID_OFFSET = 76
+_BIN_STEP_OFFSET = 80
+_TOKEN_X_MINT_OFFSET = 88
+_TOKEN_Y_MINT_OFFSET = 120
+_ACCOUNTS_PER_CALL = 100
+_BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _TOP_HOLDERS = 10
 _SIGNATURE_PAGE = 1_000
 _MAX_CACHED_MINTS = 4_096
@@ -207,6 +229,40 @@ class SolanaRpcProvider:
             data_quality=DataQuality.COMPLETE,
         )
 
+    async def get_pool_states(self, pools: Sequence[PoolRef]) -> dict[str, LbPairState]:
+        """Active bin, bin step and mints of each DLMM pair; non-pair accounts are left out."""
+
+        addresses = [pool.address.root for pool in pools]
+        states: dict[str, LbPairState] = {}
+        options = {
+            "encoding": "base64",
+            "commitment": "confirmed",
+            "dataSlice": {"offset": 0, "length": _LB_PAIR_PREFIX_LENGTH},
+        }
+        for offset in range(0, len(addresses), _ACCOUNTS_PER_CALL):
+            chunk = addresses[offset : offset + _ACCOUNTS_PER_CALL]
+            values = _accounts(await self._call("getMultipleAccounts", [chunk, options]), chunk)
+            for address, raw in zip(chunk, values, strict=True):
+                state = _lb_pair_state(raw)
+                if state is not None:
+                    states[address] = state
+        return states
+
+    async def get_mint_decimals(self, mints: Sequence[PublicKey]) -> dict[str, int]:
+        """Decimals of parsed SPL mint accounts; any other account is left out."""
+
+        addresses = [mint.root for mint in mints]
+        decimals: dict[str, int] = {}
+        options = {"encoding": "jsonParsed", "commitment": "confirmed"}
+        for offset in range(0, len(addresses), _ACCOUNTS_PER_CALL):
+            chunk = addresses[offset : offset + _ACCOUNTS_PER_CALL]
+            values = _accounts(await self._call("getMultipleAccounts", [chunk, options]), chunk)
+            for address, raw in zip(chunk, values, strict=True):
+                value = _mint_decimals(raw)
+                if value is not None:
+                    decimals[address] = value
+        return decimals
+
     async def _enhanced_signals(
         self, mint: PublicKey, observed_at: datetime
     ) -> EnhancedTokenSignals:
@@ -361,6 +417,68 @@ def _account_key(value: Any, field: str) -> str:
         return PublicKey(value).root
     except ValueError as error:
         raise ProviderPayloadError(f"Solana {field} is not a public key") from error
+
+
+def _accounts(response: Mapping[str, Any], addresses: Sequence[str]) -> Sequence[Any]:
+    values = _rpc_list(_rpc_value(response), "accounts")
+    if len(values) != len(addresses):
+        raise ProviderPayloadError("Solana returned a different number of accounts")
+    return values
+
+
+def _lb_pair_state(raw: Any) -> LbPairState | None:
+    if raw is None:
+        return None
+    account = _mapping(raw, "LB pair account")
+    if account.get("owner") != DLMM_PROGRAM_ID:
+        return None
+    data = account.get("data")
+    if (
+        not isinstance(data, list)
+        or len(data) != 2
+        or not isinstance(data[0], str)
+        or data[1] != "base64"
+    ):
+        raise ProviderPayloadError("Solana account data must be base64")
+    try:
+        prefix = base64.b64decode(data[0], validate=True)
+    except binascii.Error as error:
+        raise ProviderPayloadError("Solana account data is not base64") from error
+    if len(prefix) != _LB_PAIR_PREFIX_LENGTH or prefix[:8] != _LB_PAIR_DISCRIMINATOR:
+        return None  # another DLMM account type (position, bin array, ...)
+    (active_bin_id,) = struct.unpack_from("<i", prefix, _ACTIVE_ID_OFFSET)
+    (bin_step,) = struct.unpack_from("<H", prefix, _BIN_STEP_OFFSET)
+    return LbPairState(
+        active_bin_id=active_bin_id,
+        bin_step=bin_step,
+        token_x_mint=_base58(prefix[_TOKEN_X_MINT_OFFSET : _TOKEN_X_MINT_OFFSET + 32]),
+        token_y_mint=_base58(prefix[_TOKEN_Y_MINT_OFFSET : _TOKEN_Y_MINT_OFFSET + 32]),
+    )
+
+
+def _mint_decimals(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    data = _mapping(raw, "mint account").get("data")
+    if not isinstance(data, Mapping):
+        return None  # not parsed by the RPC: not a token-program account
+    parsed = data.get("parsed")
+    if not isinstance(parsed, Mapping) or parsed.get("type") != "mint":
+        return None
+    info = parsed.get("info")
+    value = info.get("decimals") if isinstance(info, Mapping) else None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255:
+        raise ProviderPayloadError("Solana mint decimals must be an integer in [0, 255]")
+    return value
+
+
+def _base58(raw: bytes) -> str:
+    number = int.from_bytes(raw, "big")
+    encoded = ""
+    while number:
+        number, remainder = divmod(number, 58)
+        encoded = _BASE58[remainder] + encoded
+    return "1" * (len(raw) - len(raw.lstrip(b"\x00"))) + encoded
 
 
 def _supply(response: Mapping[str, Any]) -> int:
