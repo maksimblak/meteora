@@ -27,6 +27,7 @@ COPY --chown=app:app Dockerfile Dockerfile.executor docker-compose.yml .env.exam
 COPY --chown=app:app executor/eslint.config.js executor/tsconfig.json ./executor/
 COPY --chown=app:app executor/src ./executor/src
 COPY --chown=app:app executor/tests ./executor/tests
+COPY --chown=app:app contracts ./contracts
 COPY --chown=app:app migrations ./migrations
 COPY --chown=app:app src ./src
 COPY --chown=app:app tests ./tests

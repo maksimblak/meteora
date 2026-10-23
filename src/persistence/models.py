@@ -1,4 +1,8 @@
-"""Database-only records; domain code never imports this module."""
+"""Database-only records; domain code never imports this module.
+
+The schema is owned by Alembic (``migrations/versions``); these mappings mirror it
+so repositories can build typed statements.
+"""
 
 from datetime import date, datetime
 from decimal import Decimal
@@ -6,11 +10,13 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     Numeric,
@@ -97,13 +103,16 @@ class CandidateDecisionRecord(Base):
         ForeignKey("feature_vectors.id"), nullable=False
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
-    score: Mapped[Decimal] = mapped_column(Numeric(20, 10), nullable=False)
+    score: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     reasons: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
     missing_signals: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
     evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     ruleset_version: Mapped[str] = mapped_column(String(64), nullable=False)
     correlation_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, index=True)
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, server_default="SHADOW")
+    config_version: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
 
 
 class StrategyPlanRecord(Base):
@@ -179,6 +188,12 @@ class ModeTransitionRecord(Base):
     promotion_authorized: Mapped[bool] = mapped_column(Boolean, nullable=False)
     correlation_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, index=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    operator_confirmation_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, server_default=""
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    evidence_id: Mapped[str | None] = mapped_column(String(64))
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
 
     __table_args__ = (
         CheckConstraint("from_mode IN ('SHADOW', 'APPROVAL', 'LIVE')"),
@@ -191,11 +206,14 @@ class RiskDayRecord(Base):
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
     risk_date: Mapped[date] = mapped_column(Date, nullable=False, unique=True)
-    starting_equity: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
-    realized_pnl: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
-    unrealized_pnl: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
+    starting_equity: Mapped[Decimal] = mapped_column(Numeric(), nullable=False)
+    realized_pnl: Mapped[Decimal] = mapped_column(Numeric(), nullable=False)
+    unrealized_pnl: Mapped[Decimal] = mapped_column(Numeric(), nullable=False)
     daily_stop_triggered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     ruleset_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    baseline_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class AlertRecord(Base):
@@ -208,6 +226,10 @@ class AlertRecord(Base):
     correlation_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    code: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
+    ruleset_version: Mapped[str] = mapped_column(String(128), nullable=False, server_default="")
+    resolution: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
 
 
 class SystemLeaseRecord(Base):
@@ -219,6 +241,7 @@ class SystemLeaseRecord(Base):
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
+    token: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
 
     __table_args__ = (CheckConstraint("expires_at > acquired_at"),)
 
@@ -236,6 +259,7 @@ class AuditEventRecord(Base):
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
 
     __table_args__ = (CheckConstraint("schema_version >= 1"),)
 
@@ -253,9 +277,204 @@ class OutboxEventRecord(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     publish_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claimed_by: Mapped[str | None] = mapped_column(String(128))
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         CheckConstraint("schema_version >= 1"),
         CheckConstraint("publish_attempts >= 0"),
         Index("ix_outbox_unpublished", "occurred_at", postgresql_where=published_at.is_(None)),
     )
+
+
+# --- T07: mode, risk-day, entry and kill-switch state (D01) -------------------------
+
+
+class ModeStateRecord(Base):
+    __tablename__ = "mode_state"
+
+    singleton: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    promotion_authorized: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    kill_switch_active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    daily_stop_date: Mapped[date | None] = mapped_column(Date)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ModeApprovalRecord(Base):
+    __tablename__ = "mode_approvals"
+
+    approval_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    command_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, index=True)
+    command_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    simulation_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    operator_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    comment: Mapped[str] = mapped_column(Text, nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PortfolioEquityRecord(Base):
+    __tablename__ = "portfolio_equity"
+
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    equity: Mapped[Decimal] = mapped_column(Numeric(), nullable=False)
+    ruleset_version: Mapped[str] = mapped_column(String(128), nullable=False)
+
+
+class EntryPlanRecord(Base):
+    __tablename__ = "entry_plans"
+
+    plan_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    correlation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    admitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    position_id: Mapped[str | None] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
+
+
+class OpenPositionRecord(Base):
+    __tablename__ = "open_positions"
+
+    position_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    plan_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+
+
+class PromotionObservationRecord(Base):
+    __tablename__ = "promotion_observations"
+
+    risk_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    ruleset_version: Mapped[str] = mapped_column(String(128), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(16), primary_key=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+
+class PromotionEvidenceRecord(Base):
+    __tablename__ = "promotion_evidence"
+
+    evidence_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+
+class LivePromotionClaimRecord(Base):
+    __tablename__ = "live_promotion_claims"
+
+    promotion_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class KillPositionActionRecord(Base):
+    __tablename__ = "kill_position_actions"
+
+    action_key: Mapped[str] = mapped_column(String(256), primary_key=True)
+    alert_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, index=True)
+    position_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
+
+
+# --- T07: shadow accounting (D01) ----------------------------------------------------
+
+
+class ShadowReceiptRecord(Base):
+    __tablename__ = "shadow_receipts"
+
+    idempotency_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    command_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, unique=True)
+    command_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
+
+
+class ShadowPositionRecord(Base):
+    __tablename__ = "shadow_positions"
+
+    position_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+    __table_args__ = (CheckConstraint("version >= 1"),)
+
+
+class ShadowLedgerRecord(Base):
+    __tablename__ = "shadow_ledger"
+
+    entry_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    position_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
+
+
+class PositionOutcomeRecord(Base):
+    __tablename__ = "position_outcomes"
+
+    position_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
+
+
+# --- T07: execution store, universe history and position context -------------------
+
+
+class ExecutionStateRecord(Base):
+    __tablename__ = "execution_records"
+
+    command_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    phase: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ExecutionApprovalClaimRecord(Base):
+    __tablename__ = "execution_approval_claims"
+
+    approval_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    command_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    simulation_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class UniverseSyncRecord(Base):
+    __tablename__ = "universe_syncs"
+
+    sync_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    pool_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    duplicate_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    committed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class UniverseMemberRecord(Base):
+    __tablename__ = "universe_members"
+
+    sync_id: Mapped[UUID] = mapped_column(
+        ForeignKey("universe_syncs.sync_id"), primary_key=True
+    )
+    pool_snapshot_id: Mapped[UUID] = mapped_column(
+        ForeignKey("pool_snapshots.id"), primary_key=True
+    )
+
+
+class PositionContextRecord(Base):
+    __tablename__ = "position_contexts"
+
+    position_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    plan_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, unique=True)
+    pool_address: Mapped[str] = mapped_column(String(44), nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)

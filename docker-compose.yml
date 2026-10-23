@@ -63,7 +63,7 @@ services:
 
   worker:
     <<: *python-service
-    command: ["uv", "run", "python", "-m", "src.core.worker"]
+    command: ["uv", "run", "python", "-m", "src.worker"]
     depends_on:
       migrate:
         condition: service_completed_successfully

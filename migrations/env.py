@@ -1,6 +1,12 @@
-"""Alembic runtime configured for the async PostgreSQL driver."""
+"""Alembic runtime configured for the async PostgreSQL driver.
+
+A caller may pass an already open synchronous connection through
+``config.attributes["connection"]`` (used by the isolated-schema test fixture);
+otherwise the DSN comes from the typed application configuration.
+"""
 
 from asyncio import run
+from typing import Any
 
 from alembic import context
 from sqlalchemy import pool
@@ -12,11 +18,11 @@ from src.persistence.models import Base
 
 config = context.config
 target_metadata = Base.metadata
-settings = AppConfig.load()
-configure_logging(settings)
 
 
 def database_url() -> str:
+    settings = AppConfig.load()
+    configure_logging(settings)
     value = settings.database_dsn()
     if not value:
         raise RuntimeError("DATABASE_URL is required for migrations")
@@ -37,7 +43,7 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def do_run_migrations(connection: object) -> None:
+def do_run_migrations(connection: Any) -> None:
     context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
     with context.begin_transaction():
         context.run_migrations()
@@ -56,7 +62,10 @@ async def run_async_migrations() -> None:
     await connectable.dispose()
 
 
-if context.is_offline_mode():
+provided_connection = config.attributes.get("connection")
+if provided_connection is not None:
+    do_run_migrations(provided_connection)
+elif context.is_offline_mode():
     run_migrations_offline()
 else:
     run(run_async_migrations())
