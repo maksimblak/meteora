@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Ошибка{% endblock %}
+{% block content %}
+<h1>{{ error.message }}</h1>
+<p><code>{{ error.code }}</code> · HTTP {{ error.status_code }}</p>
+{% if error.details %}
+  <section class="card">
+    {% if error.details.blockers %}<h2>Что мешает</h2><ul>{% for code in error.details.blockers %}<li>{{ labels.readiness_label(code) }} <code>{{ code }}</code></li>{% endfor %}</ul>{% endif %}
+    {% if error.details.missing %}<h2>Не отмечено</h2><ul>{% for key in error.details.missing %}<li><code>{{ key }}</code></li>{% endfor %}</ul>{% endif %}
+    {% if error.details.fields %}<h2>Поля</h2><ul>{% for item in error.details.fields %}<li><code>{{ item.field }}</code>: {{ item.reason }}</li>{% endfor %}</ul>{% endif %}
+    {% if error.details.reason %}<p>Причина: <code>{{ error.details.reason }}</code></p>{% endif %}
+    {% if error.details.phase %}<p>Текущее состояние: <strong>{{ labels.label(labels.EXECUTION_PHASE, error.details.phase) }}</strong></p>{% endif %}
+  </section>
+{% endif %}
+<p><a href="{{ back }}">Вернуться</a> · <a href="/">На обзор</a></p>
+{% endblock %}

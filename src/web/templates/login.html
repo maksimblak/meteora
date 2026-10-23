@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Вход{% endblock %}
+{% block content %}
+<h1>Вход оператора</h1>
+{% if not auth_configured %}
+  <p class="card warn">Вход закрыт: не задан токен оператора (APP_OPERATOR_TOKEN). Просмотр доступен без входа.</p>
+{% else %}
+  {% if failed %}<p class="flash bad">Неверный токен оператора.</p>{% endif %}
+  <form method="post" action="/login" class="card">
+    <input type="hidden" name="next" value="{{ next }}">
+    <label>Токен оператора <input type="password" name="token" autocomplete="off" required autofocus></label>
+    <button type="submit">Войти</button>
+  </form>
+  <p class="muted small">Сессия хранится в HttpOnly-cookie; каждое действие дополнительно защищено CSRF-токеном.</p>
+{% endif %}
+{% endblock %}

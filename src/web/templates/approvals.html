@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Подтверждения{% endblock %}
+{% block content %}
+<h1>Очередь подтверждений</h1>
+{% if queue.blockers %}
+<section class="card warn">
+  <h2>Почему команды сейчас не готовы к подтверждению</h2>
+  <ul>{% for item in queue.blockers %}<li>{{ item.message }} <code>{{ item.code }}</code></li>{% endfor %}</ul>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>Ждут подтверждения</h2>
+  {% if queue.pending %}
+  <table>
+    <tr><th>Команда</th><th>Операция</th><th>Пул</th><th>Симуляция</th><th>Истекает</th></tr>
+    {% for item in queue.pending %}
+      <tr><td><a href="/approvals/{{ item.command_id }}"><code>{{ item.command_id }}</code></a></td><td>{{ item.operation }}</td><td><code>{{ item.pool_address[:8] }}…</code></td><td>{{ item.simulated_at | dt }}</td><td>{{ item.command_expires_at | dt }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+    <p class="muted">Нет команд, ждущих подтверждения.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Недавние</h2>
+  {% if queue.recent %}
+  <table>
+    <tr><th>Команда</th><th>Операция</th><th>Состояние</th><th>Симуляция</th></tr>
+    {% for item in queue.recent %}
+      <tr><td><a href="/approvals/{{ item.command_id }}"><code>{{ item.command_id }}</code></a></td><td>{{ item.operation }}</td><td>{{ item.phase_label }}</td><td>{{ item.simulated_at | dt }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">Нет.</p>{% endif %}
+</section>
+{% endblock %}

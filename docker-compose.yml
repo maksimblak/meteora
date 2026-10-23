@@ -37,11 +37,27 @@ services:
       - uv
       - run
       - uvicorn
-      - src.core.app:app
+      - src.api.main:app
       - --host
       - 0.0.0.0
       - --port
       - "8000"
+    environment:
+      <<: *python-environment
+      WORKER_HEALTH_URL: http://worker:9100
+      # Operator login (writes, kill switch, downgrade) from .env: set the value or its
+      # *_FILE, not both. Unset -> the stack still starts and the panel says login is off.
+      APP_OPERATOR_TOKEN: ${APP_OPERATOR_TOKEN:-}
+      APP_OPERATOR_TOKEN_FILE: ${APP_OPERATOR_TOKEN_FILE:-}
+      APP_SESSION_SECRET: ${APP_SESSION_SECRET:-}
+      APP_SESSION_SECRET_FILE: ${APP_SESSION_SECRET_FILE:-}
+      # APPROVAL wiring; empty by default, so the shadow stack starts without it and the
+      # panel reports approvals as not configured. *_FILE are paths inside this container
+      # (mount the files with a docker-compose.override.yml); values never go in here.
+      TRADING_MODE: ${TRADING_MODE:-}
+      EXECUTOR_URL: ${EXECUTOR_URL:-}
+      EXECUTOR_INTERNAL_TOKEN_FILE: ${EXECUTOR_INTERNAL_TOKEN_FILE:-}
+      EXECUTOR_APPROVAL_SECRET_FILE: ${EXECUTOR_APPROVAL_SECRET_FILE:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,6 +80,12 @@ services:
   worker:
     <<: *python-service
     command: ["uv", "run", "python", "-m", "src.worker"]
+    environment:
+      <<: *python-environment
+      # Health/metrics for the api on the internal compose network only (not published).
+      WORKER_METRICS_HOST: 0.0.0.0
+    expose:
+      - "9100"
     depends_on:
       migrate:
         condition: service_completed_successfully

@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Настройки{% endblock %}
+{% block content %}
+<h1>Действующая конфигурация</h1>
+<p>Правила <strong>{{ config.ruleset_version }}</strong> · конфигурация {{ config.config_version }}</p>
+
+<section class="grid">
+  <div class="card">
+    <h2>Секреты (только наличие)</h2>
+    <table>
+      {% for item in config.secrets %}
+        <tr><td><code>{{ item.name }}</code></td><td>{% if item.configured %}<span class="ok">задан</span>{% else %}<span class="muted">не задан</span>{% endif %}</td></tr>
+      {% endfor %}
+    </table>
+    <p class="muted small">Значения секретов не показываются нигде: ни здесь, ни в API, ни в логах.</p>
+  </div>
+  <div class="card">
+    <h2>Готовность режимов</h2>
+    {% for item in config.readiness %}
+      <h3>{{ item.mode.value }}: {% if item.ready %}<span class="ok">готов</span>{% else %}<span class="bad">не готов</span>{% endif %}</h3>
+      {% if item.missing %}<p>Не хватает переменных: {% for name in item.missing %}<code>{{ name }}</code> {% endfor %}</p>{% endif %}
+      {% for note in item.notes %}<p class="muted small">{{ note.message }} <code>{{ note.code }}</code></p>{% endfor %}
+    {% endfor %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>Параметры</h2>
+  <table>
+    {% for key, value in config.settings.items() %}
+      <tr><td><code>{{ key }}</code></td><td>{{ value if value is not none else '—' }}</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+<section class="card">
+  <h2>Пороги правил</h2>
+  {% for group, values in config.thresholds.items() %}
+    <details><summary>{{ group }}</summary><pre>{{ values | tojson(indent=2) }}</pre></details>
+  {% endfor %}
+</section>
+
+<section class="card">
+  <h2>Журнал режимов</h2>
+  {% if journal.transitions %}
+    <table>
+      <tr><th>Время</th><th>Из</th><th>В</th><th>Повышение</th><th>Причина</th><th>Evidence</th></tr>
+      {% for t in journal.transitions %}
+        <tr><td>{{ t.occurred_at | dt }}</td><td>{{ t.from_mode.value }}</td><td>{{ t.to_mode.value }}</td><td>{{ 'да' if t.promotion else 'нет' }}</td><td>{{ t.reason }}</td><td><code>{{ t.evidence_id or '—' }}</code></td></tr>
+      {% endfor %}
+    </table>
+  {% else %}<p class="muted">Переходов не было: система работает в начальном режиме SHADOW.</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>Открытые critical alerts</h2>
+  {% if alerts %}
+    <ul>{% for alert in alerts %}<li>{{ alert.created_at | dt }} <code>{{ alert.code }}</code> {{ alert.message }}</li>{% endfor %}</ul>
+  {% else %}<p class="muted">Нет.</p>{% endif %}
+</section>
+{% endblock %}

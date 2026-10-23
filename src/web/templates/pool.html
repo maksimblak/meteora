@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Пул{% endblock %}
+{% block content %}
+{% set pool = detail.pool %}
+<h1>Пул <code>{{ pool.address }}</code></h1>
+<p>Base mint <code>{{ pool.base_mint }}</code> · quote mint <code>{{ pool.quote_mint }}</code></p>
+
+<section class="card {% if detail.warmup.state == 'WARMING_UP' %}warn{% endif %}">
+  <h2>{% if detail.warmup.state == 'WARMING_UP' %}WARMING_UP{% else %}Готовность истории{% endif %}</h2>
+  <p>{{ detail.warmup.message }}</p>
+  <p>Снимков истории: {{ detail.history_points }}; базовых окон: {{ detail.warmup.accumulated }} из {{ detail.warmup.required }}.</p>
+</section>
+
+<section class="grid">
+  <div class="card">
+    <h2>Снимок</h2>
+    <p>TVL {{ pool.tvl | dec(2) }} · глубина {{ detail.depth | dec(2) }} · цена {{ pool.price | dec }}</p>
+    <p>Bin step {{ pool.bin_step }} · возраст пула {{ detail.pool_age_seconds }} с</p>
+    <p>Наблюдение {{ pool.observed_at | dt }} · свежесть {{ pool.freshness }} · качество {{ pool.data_quality }}</p>
+    <p>Источник {{ detail.provider }}{% if detail.short_window_source %} · короткое окно взято из {{ detail.short_window_source }}{% endif %}</p>
+    {% if detail.missing_fields %}<p class="bad">Нет полей: {{ detail.missing_fields | join(', ') }}</p>{% endif %}
+  </div>
+  <div class="card">
+    <h2>Окна</h2>
+    <table>
+      <tr><th>Окно</th><th>Объём</th><th>Комиссии</th><th>Сделок</th><th>Участников</th></tr>
+      {% for name, window in detail.windows.items() %}
+        <tr><td>{{ name }}</td><td>{{ window.volume | dec(2) }}</td><td>{{ window.fees | dec(4) }}</td><td>{{ window.transaction_count if window.transaction_count is not none else '—' }}</td><td>{{ window.unique_participants if window.unique_participants is not none else '—' }}</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Последнее решение</h2>
+  {% if detail.latest_decision %}
+    {% set d = detail.latest_decision %}
+    <p><a href="/decisions/{{ d.decision_id }}">{{ d.status_label }}</a> · {{ d.decided_at | dt }} · правила {{ d.ruleset_version }}</p>
+    {% for reason in d.reasons %}<span class="tag">{{ reason.message }}</span>{% endfor %}
+  {% else %}
+    <p class="muted">Решений по пулу ещё нет.</p>
+  {% endif %}
+  <p><a href="/decisions?pool={{ pool.address }}">Все решения по пулу →</a></p>
+</section>
+{% endblock %}

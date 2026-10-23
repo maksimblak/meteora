@@ -1,0 +1,338 @@
+"""Domain records -> presentation models. Pure functions, no I/O."""
+
+from collections.abc import Iterable, Sequence
+from decimal import Decimal, InvalidOperation
+
+from src.accounting.models import LedgerEntry
+from src.api import labels
+from src.api.schemas import (
+    AlertView,
+    DecisionDetail,
+    DecisionSummary,
+    EvidenceView,
+    FactsView,
+    LifecycleStepView,
+    MetricView,
+    ModeTransitionView,
+    ModeView,
+    Notice,
+    PerformanceGroupView,
+    PoolSummary,
+    PositionSummary,
+    ScoreComponentView,
+    StrategyView,
+    TokenRiskView,
+    ValuationView,
+    WindowView,
+)
+from src.domain.screening.models import EvidenceItem
+from src.market.models import PoolSnapshot, TokenRiskSnapshot, WindowMetrics
+from src.modes.models import CriticalAlert, ModeState, ModeTransition
+from src.persistence.contracts import DecisionRecord, PlanRecord
+from src.portfolio.models import (
+    PerformanceGroup,
+    PositionOutcome,
+    PositionValuation,
+    ShadowPosition,
+)
+
+# Evidence row -> the rejection code its threshold produces (spec 6.3, 6.6).
+_TRIGGERS: dict[str, frozenset[str]] = {
+    "market_cap": frozenset({"MARKET_CAP_BELOW_THRESHOLD"}),
+    "token_age_seconds": frozenset({"TOKEN_TOO_YOUNG"}),
+    "top10_holder_share": frozenset({"HOLDER_CONCENTRATION_HIGH"}),
+    "volume_per_minute": frozenset({"VOLUME_PER_MINUTE_BELOW_THRESHOLD"}),
+    "volume_to_liquidity": frozenset({"VOLUME_TO_LIQUIDITY_BELOW_THRESHOLD"}),
+    "fee_efficiency": frozenset({"ARTIFICIAL_VOLUME_SUSPECTED"}),
+    "total_fees_sol": frozenset({"TOTAL_FEES_BELOW_THRESHOLD"}),
+    "tvl": frozenset({"LOW_TVL"}),
+    "depth": frozenset({"LOW_DEPTH"}),
+    "price_impact": frozenset({"PRICE_IMPACT_HIGH"}),
+    "volume_integrity": frozenset({"ARTIFICIAL_VOLUME_CONFIRMED", "VOLUME_INTEGRITY_UNKNOWN"}),
+}
+# Several minimums share one code; the row that fell short of its own threshold is marked.
+_SPIKE_MINIMUMS = frozenset({"short_ratio", "long_ratio", "robust_z_score", "fee_tvl"})
+_SPIKE_CODE = "VOLUME_SIGNAL_BELOW_THRESHOLD"
+# GMGN metrics (G18, spec 6.7); top-10 and total fees join them once GMGN reports any.
+_GMGN_MARKERS = ("gmgn", "insider", "bundl", "phish", "developer", "dev_")
+_GMGN_COMPANIONS = ("top10_holder_share", "total_fees_sol")
+
+
+def notice(table: dict[str, str], code: str) -> Notice:
+    return Notice(code=code, message=labels.label(table, code))
+
+
+def readiness_notices(codes: Iterable[str]) -> list[Notice]:
+    return [Notice(code=code, message=labels.readiness_label(code)) for code in codes]
+
+
+def flag_notices(codes: Iterable[str]) -> list[Notice]:
+    return [notice(labels.FLAG_NOTICES, code) for code in codes]
+
+
+def mode_view(state: ModeState) -> ModeView:
+    return ModeView(
+        mode=state.mode,
+        label=labels.label(labels.MODE, state.mode.value),
+        version=state.version,
+        promotion_authorized=state.promotion_authorized,
+        kill_switch_active=state.kill_switch_active,
+        daily_stop_date=state.daily_stop_date,
+    )
+
+
+def alert_view(alert: CriticalAlert) -> AlertView:
+    return AlertView(
+        alert_id=alert.alert_id,
+        code=alert.code,
+        message=alert.message,
+        created_at=alert.created_at,
+        open=alert.open,
+    )
+
+
+def transition_view(transition: ModeTransition) -> ModeTransitionView:
+    return ModeTransitionView(
+        transition_id=transition.transition_id,
+        from_mode=transition.from_mode,
+        to_mode=transition.to_mode,
+        occurred_at=transition.occurred_at,
+        promotion=transition.promotion_authorized,
+        reason=transition.reason,
+        evidence_id=transition.evidence_id,
+    )
+
+
+def window_view(window: WindowMetrics) -> WindowView:
+    return WindowView(
+        volume=window.volume,
+        fees=window.fees,
+        transaction_count=window.transaction_count,
+        unique_participants=window.unique_participants,
+    )
+
+
+def pool_summary(snapshot: PoolSnapshot, decision: DecisionRecord | None) -> PoolSummary:
+    day = snapshot.windows.get("24h")
+    status = None if decision is None else decision.decision.status.value
+    return PoolSummary(
+        address=snapshot.pool.address.root,
+        base_mint=snapshot.pool.base_mint.root,
+        quote_mint=snapshot.pool.quote_mint.root,
+        tvl=snapshot.tvl,
+        volume_24h=None if day is None else day.volume,
+        price=snapshot.price,
+        bin_step=snapshot.bin_step,
+        freshness=snapshot.freshness.value,
+        data_quality=snapshot.data_quality.value,
+        observed_at=snapshot.observed_at,
+        decision_id=None if decision is None else decision.decision_id,
+        decision_status=status,
+        decision_label=None if status is None else labels.label(labels.CANDIDATE_STATUS, status),
+    )
+
+
+def decision_summary(record: DecisionRecord) -> DecisionSummary:
+    decision = record.decision
+    return DecisionSummary(
+        decision_id=record.decision_id,
+        pool_address=decision.pool_address.root,
+        token_mint=decision.token_mint.root,
+        status=decision.status.value,
+        status_label=labels.label(labels.CANDIDATE_STATUS, decision.status.value),
+        score=decision.score,
+        reasons=[notice(labels.REJECTION, reason.value) for reason in decision.reasons],
+        missing_signals=list(decision.missing_signals),
+        flags=flag_notices(flag.value for flag in decision.flags),
+        decided_at=decision.decision_at,
+        mode=decision.mode,
+        ruleset_version=decision.ruleset_version,
+        config_version=decision.config_version,
+        freshness=decision.features.freshness.value,
+        correlation_id=decision.correlation_id,
+    )
+
+
+def evidence_views(items: Sequence[EvidenceItem], reasons: Iterable[str]) -> list[EvidenceView]:
+    fired = set(reasons)
+    return [
+        EvidenceView(
+            name=item.name,
+            value=item.value,
+            threshold=item.threshold,
+            triggered=_triggered(item, fired),
+        )
+        for item in items
+    ]
+
+
+def gmgn_metrics(items: Sequence[EvidenceItem]) -> list[MetricView]:
+    """GMGN metrics next to their thresholds, only when GMGN reported any (G18)."""
+
+    def is_gmgn(name: str) -> bool:
+        lowered = name.lower()
+        return any(marker in lowered for marker in _GMGN_MARKERS)
+
+    if not any(is_gmgn(item.name) for item in items):
+        return []
+    return [
+        MetricView(name=item.name, value=item.value, threshold=item.threshold)
+        for item in items
+        if is_gmgn(item.name) or item.name in _GMGN_COMPANIONS
+    ]
+
+
+def decision_detail(record: DecisionRecord, plan: PlanRecord | None) -> DecisionDetail:
+    decision = record.decision
+    reasons = [reason.value for reason in decision.reasons]
+    facts = record.facts
+    return DecisionDetail(
+        decision=decision_summary(record),
+        evidence=evidence_views(decision.evidence, reasons),
+        score_components=[
+            ScoreComponentView(
+                name=component.name,
+                normalized_value=component.normalized_value,
+                weight=component.weight,
+                contribution=component.contribution,
+            )
+            for component in decision.score_components
+        ],
+        gmgn=gmgn_metrics(decision.evidence),
+        facts=FactsView(
+            volume_short=facts.volume_short,
+            volume_long=facts.volume_long,
+            volume_24h=facts.volume_24h,
+            tvl=facts.tvl,
+            fee_tvl=facts.fee_tvl,
+            price=facts.price,
+            price_volatility=facts.price_volatility,
+            pool_age_seconds=facts.pool_age_seconds,
+            freshness=facts.freshness.value,
+            source_age_seconds=facts.source_age_seconds,
+            observed_at=facts.observed_at,
+        ),
+        token=token_view(record.token),
+        volume_window_source=decision.features.volume_window_source,
+        strategy=None if plan is None else strategy_view(plan),
+    )
+
+
+def token_view(token: TokenRiskSnapshot) -> TokenRiskView:
+    return TokenRiskView(
+        mint=token.mint.root,
+        mint_authority=token.mint_authority.value,
+        freeze_authority=token.freeze_authority.value,
+        blacklisted=token.blacklisted.value,
+        verified=token.verified.value,
+        wash_trading=token.wash_trading.value,
+        holder_concentration=token.holder_concentration,
+        total_fees_sol=token.total_fees_sol,
+        freshness=token.freshness.value,
+        data_quality=token.data_quality.value,
+        missing_signals=list(token.missing_signals),
+        provider=token.provider,
+    )
+
+
+def strategy_view(record: PlanRecord) -> StrategyView:
+    sized = record.sized_plan
+    plan = sized.plan
+    reason = None if plan.selection_reason is None else plan.selection_reason.value
+    return StrategyView(
+        plan_id=record.plan_id,
+        strategy=plan.strategy.value,
+        direction=plan.direction.value,
+        selection_reason=reason,
+        selection_label=None if reason is None else labels.label(labels.STRATEGY_SELECTION, reason),
+        selection_evidence=evidence_views(plan.selection_evidence, ()),
+        lower_bin_offset=plan.lower_bin_offset,
+        upper_bin_offset=plan.upper_bin_offset,
+        holding_horizon_seconds=int(plan.holding_horizon.total_seconds()),
+        expires_at=plan.expires_at,
+        size_base_units=sized.size_base_units,
+        estimated_loss_base_units=sized.estimated_loss_base_units,
+        binding_caps=[cap.value for cap in sized.binding_caps],
+        admitted=record.admitted,
+        admission_reasons=list(record.admission_reasons),
+    )
+
+
+def valuation_view(valuation: PositionValuation) -> ValuationView:
+    return ValuationView(
+        valued_at=valuation.valued_at,
+        market_price=valuation.market_price,
+        invested_base_units=valuation.invested_base_units,
+        liquidity_value_base_units=valuation.liquidity_value_base_units,
+        hodl_value_base_units=valuation.hodl_value_base_units,
+        fee_income_base_units=valuation.fee_income_base_units,
+        divergence_loss_base_units=valuation.divergence_loss_base_units,
+        slippage_base_units=valuation.slippage_base_units,
+        network_base_units=valuation.network_base_units,
+        jito_base_units=valuation.jito_base_units,
+        total_costs_base_units=valuation.total_costs_base_units,
+        realized_pnl_base_units=valuation.realized_pnl_base_units,
+        unrealized_pnl_base_units=valuation.unrealized_pnl_base_units,
+        net_pnl_base_units=valuation.net_pnl_base_units,
+        hodl_pnl_base_units=valuation.hodl_pnl_base_units,
+        excess_vs_hodl_base_units=valuation.excess_vs_hodl_base_units,
+    )
+
+
+def position_summary(
+    position: ShadowPosition,
+    valuation: PositionValuation | None,
+    outcome: PositionOutcome | None,
+) -> PositionSummary:
+    chosen = outcome.valuation if outcome is not None else valuation
+    source = "OUTCOME" if outcome is not None else "MARKET" if valuation is not None else None
+    return PositionSummary(
+        position_id=position.position_id,
+        pool_address=position.pool_address,
+        status=position.status.value,
+        mode=position.mode,
+        ruleset_version=position.ruleset_version,
+        opened_at=position.opened_at,
+        closed_at=position.closed_at,
+        invested_base_units=position.invested_base_units,
+        net_pnl_base_units=None if chosen is None else chosen.net_pnl_base_units,
+        hodl_pnl_base_units=None if chosen is None else chosen.hodl_pnl_base_units,
+        excess_vs_hodl_base_units=None if chosen is None else chosen.excess_vs_hodl_base_units,
+        valuation_source=source or "UNAVAILABLE",
+    )
+
+
+def lifecycle_view(entry: LedgerEntry) -> LifecycleStepView:
+    return LifecycleStepView(
+        kind=entry.kind.value,
+        occurred_at=entry.occurred_at,
+        price=entry.price,
+        capital_delta_base_units=entry.capital_delta_base_units,
+        realized_pnl_base_units=entry.realized_pnl_base_units,
+        fee_income_base_units=entry.fee_income_base_units,
+        slippage_base_units=entry.slippage_base_units,
+        network_base_units=entry.network_base_units,
+        jito_base_units=entry.jito_base_units,
+    )
+
+
+def performance_group_view(group: PerformanceGroup) -> PerformanceGroupView:
+    return PerformanceGroupView(**group.model_dump())
+
+
+def _triggered(item: EvidenceItem, fired: set[str]) -> bool:
+    if item.name in _SPIKE_MINIMUMS:
+        if _SPIKE_CODE not in fired:
+            return False
+        value, threshold = _decimal(item.value), _decimal(item.threshold)
+        return value is None or (threshold is not None and value < threshold)
+    return bool(_TRIGGERS.get(item.name, frozenset()) & fired)
+
+
+def _decimal(value: str | None) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(value)
+    except InvalidOperation:
+        return None

@@ -1,0 +1,76 @@
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --text: #1d2330;
+  --muted: #667085;
+  --line: #d9dee7;
+  --accent: #2f5bd3;
+  --ok: #1b7f4b;
+  --bad: #b42318;
+  --warn-bg: #fff7e6;
+  --warn-line: #f0b44c;
+  --danger-line: #e5a39d;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--text); background: var(--bg); }
+a { color: var(--accent); }
+code { font: 12.5px ui-monospace, SFMono-Regular, Consolas, monospace; background: #eef1f6; padding: 0 3px; border-radius: 3px; word-break: break-all; }
+pre { overflow-x: auto; background: #eef1f6; padding: 8px; border-radius: 6px; font-size: 12.5px; }
+h1 { font-size: 1.45rem; margin: 0 0 12px; }
+h2 { font-size: 1.05rem; margin: 0 0 8px; }
+h3 { font-size: .95rem; margin: 12px 0 6px; }
+
+.topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.brand { font-weight: 700; text-decoration: none; color: var(--text); }
+.topbar nav { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; }
+.topbar nav a { padding: 4px 10px; border-radius: 6px; text-decoration: none; color: var(--text); }
+.topbar nav a.active, .topbar nav a:hover { background: #e7ecf8; color: var(--accent); }
+.statusbar { display: flex; flex-wrap: wrap; gap: 18px; padding: 6px 20px; font-size: 13.5px; background: #eef1f6; border-bottom: 1px solid var(--line); }
+
+main { max-width: 1280px; margin: 0 auto; padding: 18px 20px 32px; }
+footer { max-width: 1280px; margin: 0 auto; padding: 0 20px 24px; font-size: 12.5px; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-bottom: 14px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+.grid .card { margin-bottom: 0; }
+.card.warn { background: var(--warn-bg); border-color: var(--warn-line); }
+.card.danger { border-color: var(--danger-line); }
+.big { font-size: 1.6rem; font-weight: 700; margin: 0; }
+
+table { width: 100%; border-collapse: collapse; background: var(--panel); font-size: 13.5px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+tr.triggered td { background: #fdecea; }
+
+.tag { display: inline-block; padding: 1px 7px; margin: 1px 3px 1px 0; border-radius: 10px; background: #eef1f6; font-size: 12.5px; }
+.tag.warn { background: var(--warn-bg); border: 1px solid var(--warn-line); }
+.ok, .state-ok { color: var(--ok); }
+.bad, .state-down { color: var(--bad); }
+.state-degraded, .state-not_configured { color: #a15c00; }
+.muted { color: var(--muted); }
+.small { font-size: 12.5px; }
+ul.plain { list-style: none; padding: 0; margin: 0; }
+ul.plain li { margin-bottom: 4px; }
+
+.flash { padding: 8px 12px; border-radius: 8px; margin-bottom: 14px; }
+.flash.ok { background: #e7f6ee; color: var(--ok); }
+.flash.bad { background: #fdecea; color: var(--bad); }
+
+form { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; margin: 8px 0; }
+form.inline, form.filters { flex-direction: row; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
+label { display: flex; flex-direction: column; gap: 3px; font-size: 13.5px; }
+label.check { flex-direction: row; align-items: center; gap: 6px; }
+input, select, textarea { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; min-width: 240px; }
+input[type="checkbox"] { min-width: 0; }
+fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+button.danger { background: var(--bad); border-color: var(--bad); }
+button.link { background: none; border: none; color: var(--accent); padding: 0; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+
+@media (max-width: 720px) {
+  main { padding: 12px; }
+  input, select, textarea { min-width: 0; width: 100%; }
+  table { display: block; overflow-x: auto; }
+}

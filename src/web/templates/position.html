@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Позиция{% endblock %}
+{% block content %}
+{% set p = detail.position %}
+<h1>Позиция <code>{{ p.position_id }}</code></h1>
+<p>Пул <a href="/pools/{{ p.pool_address }}"><code>{{ p.pool_address }}</code></a> · {{ p.status }} · {{ p.mode.value }} · правила {{ p.ruleset_version }}</p>
+<p>Открыта {{ p.opened_at | dt }} · закрыта {{ p.closed_at | dt }}{% if detail.decision_id %} · <a href="/decisions/{{ detail.decision_id }}">решение</a>{% endif %}</p>
+<p class="muted">correlation ID <code>{{ detail.correlation_id }}</code></p>
+
+<section class="grid">
+  <div class="card">
+    <h2>Диапазон</h2>
+    {% if detail.range %}
+      {% set r = detail.range %}
+      <p>Цена входа {{ r.entry_price | dec }} · диапазон {{ r.lower_price | dec }} … {{ r.upper_price | dec }}</p>
+      <p>Бины {{ r.min_bin_id }}..{{ r.max_bin_id }}</p>
+      <p>Текущая цена {{ r.current_price | dec }} —
+        {% if r.in_range is none %}<span class="muted">нет свежей цены</span>{% elif r.in_range %}<span class="ok">в диапазоне</span>{% else %}<strong class="bad">вне диапазона</strong>{% endif %}</p>
+    {% else %}
+      <p class="muted">Контекст диапазона не записан.</p>
+    {% endif %}
+  </div>
+  <div class="card">
+    <h2>Оценка и P&amp;L</h2>
+    {% if detail.valuation %}
+      {% set v = detail.valuation %}
+      <p>На {{ v.valued_at | dt }} по цене {{ v.market_price | dec }}</p>
+      <table>
+        <tr><td>Вложено</td><td>{{ v.invested_base_units | dec(0) }}</td></tr>
+        <tr><td>Стоимость ликвидности</td><td>{{ v.liquidity_value_base_units | dec(0) }}</td></tr>
+        <tr><td>Стоимость HODL</td><td>{{ v.hodl_value_base_units | dec(0) }}</td></tr>
+        <tr><td>Доход комиссий</td><td>{{ v.fee_income_base_units | dec(0) }}</td></tr>
+        <tr><td>Divergence (IL)</td><td>{{ v.divergence_loss_base_units | dec(0) }}</td></tr>
+        <tr><td>Slippage</td><td>{{ v.slippage_base_units | dec(0) }}</td></tr>
+        <tr><td>Сеть</td><td>{{ v.network_base_units | dec(0) }}</td></tr>
+        <tr><td>Jito</td><td>{{ v.jito_base_units | dec(0) }}</td></tr>
+        <tr><td>Все издержки</td><td>{{ v.total_costs_base_units | dec(0) }}</td></tr>
+        <tr><td>Реализованный P&amp;L</td><td>{{ v.realized_pnl_base_units | dec(0) }}</td></tr>
+        <tr><td>Нереализованный P&amp;L</td><td>{{ v.unrealized_pnl_base_units | dec(0) }}</td></tr>
+        <tr><th>Net P&amp;L</th><th>{{ v.net_pnl_base_units | dec(0) }}</th></tr>
+        <tr><td>HODL P&amp;L</td><td>{{ v.hodl_pnl_base_units | dec(0) }}</td></tr>
+        <tr><th>Против HODL</th><th>{{ v.excess_vs_hodl_base_units | dec(0) }}</th></tr>
+      </table>
+    {% else %}
+      <p class="bad">Оценки нет: нет снимка цены пула.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>Жизненный цикл</h2>
+  {% if detail.lifecycle %}
+  <table>
+    <tr><th>Время</th><th>Шаг</th><th>Цена</th><th>Капитал</th><th>Реализовано</th><th>Комиссии</th><th>Slippage</th><th>Сеть</th><th>Jito</th></tr>
+    {% for step in detail.lifecycle %}
+      <tr><td>{{ step.occurred_at | dt }}</td><td>{{ step.kind }}</td><td>{{ step.price | dec }}</td><td>{{ step.capital_delta_base_units | dec(0) }}</td><td>{{ step.realized_pnl_base_units | dec(0) }}</td><td>{{ step.fee_income_base_units | dec(0) }}</td><td>{{ step.slippage_base_units | dec(0) }}</td><td>{{ step.network_base_units | dec(0) }}</td><td>{{ step.jito_base_units | dec(0) }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">Шагов учёта нет.</p>{% endif %}
+</section>
+{% endblock %}

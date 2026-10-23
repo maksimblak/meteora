@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% if csrf_token %}<meta name="csrf-token" content="{{ csrf_token }}">{% endif %}
+  <title>{% block title %}Операторская панель{% endblock %} · Meteora Volume Bot</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">Meteora Volume Bot</a>
+  <nav>
+    {% for path, title in navigation %}
+      <a href="{{ path }}" class="{% if current_path == path or (path != '/' and current_path.startswith(path)) %}active{% endif %}">{{ title }}</a>
+    {% endfor %}
+  </nav>
+  <div class="session">
+    {% if logged_in %}
+      <form method="post" action="/logout" class="inline">
+        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+        <button type="submit" class="link">Выйти</button>
+      </form>
+    {% elif auth_configured %}
+      <a href="/login?next={{ current_path | urlencode }}">Вход оператора</a>
+    {% else %}
+      <span class="muted" title="APP_OPERATOR_TOKEN не задан">действия закрыты</span>
+    {% endif %}
+  </div>
+</header>
+{% if pulse %}
+<div class="statusbar" data-stream="/api/v1/stream/status">
+  <span>Режим: <strong data-pulse="mode">{{ pulse.mode.mode.value }}</strong></span>
+  <span>Kill switch: <strong data-pulse="kill" class="{% if pulse.mode.kill_switch_active %}bad{% else %}ok{% endif %}">{% if pulse.mode.kill_switch_active %}активен{% else %}выключен{% endif %}</strong></span>
+  <span>Critical alerts: <strong data-pulse="alerts">{{ pulse.open_alerts }}</strong></span>
+  <span>Ждут подтверждения: <strong data-pulse="approvals">{{ pulse.approvals_pending }}</strong></span>
+  <span>Universe: <strong data-pulse="universe">{{ pulse.universe_state }}</strong></span>
+  <span class="muted" data-pulse="time">{{ pulse.generated_at | dt }}</span>
+</div>
+{% endif %}
+<main>
+  {% if done %}<div class="flash ok">{{ done }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+<footer class="muted">Время — UTC. Денежные значения — base units котируемого токена ({{ units | dec }} base units = 1 единица), если не указано иное.</footer>
+</body>
+</html>

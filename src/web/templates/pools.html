@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Пулы{% endblock %}
+{% block content %}
+<h1>DLMM-пулы</h1>
+<form method="get" action="/pools" class="filters">
+  <label>Поиск по адресу или mint <input name="q" value="{{ query or '' }}" maxlength="64"></label>
+  <button type="submit">Найти</button>
+</form>
+
+{% if universe.state == "NOT_SYNCED" %}
+  <div class="card warn">
+    <h2>Прогрев</h2>
+    <p>{{ universe.message }}.</p>
+    <p class="muted">Worker синхронизирует все DLMM-пулы постранично; таблица появится после первой полной синхронизации.</p>
+  </div>
+{% elif not page.items %}
+  <div class="card warn">
+    <h2>Пулов нет</h2>
+    <p>{{ universe.message }}. Последняя синхронизация: {{ universe.last_sync_at | dt }}.</p>
+    {% if universe.reject_reasons %}
+      <h3>Причины отсева по категориям</h3>
+      <ul>{% for item in universe.reject_reasons %}<li>{{ item.label }} <code>{{ item.code }}</code>: {{ item.count }}</li>{% endfor %}</ul>
+    {% endif %}
+  </div>
+{% else %}
+  <p class="muted">Последняя синхронизация: {{ universe.last_sync_at | dt }} · всего пулов: {{ universe.pool_count }} · {{ universe.message }}</p>
+  <table>
+    <tr><th>Пул</th><th>TVL</th><th>Объём 24ч</th><th>Цена</th><th>Bin step</th><th>Свежесть</th><th>Качество</th><th>Решение</th></tr>
+    {% for pool in page.items %}
+    <tr>
+      <td><a href="/pools/{{ pool.address }}"><code>{{ pool.address }}</code></a></td>
+      <td>{{ pool.tvl | dec(2) }}</td>
+      <td>{{ pool.volume_24h | dec(2) }}</td>
+      <td>{{ pool.price | dec }}</td>
+      <td>{{ pool.bin_step }}</td>
+      <td>{{ pool.freshness }}</td>
+      <td>{{ pool.data_quality }}</td>
+      <td>{% if pool.decision_id %}<a href="/decisions/{{ pool.decision_id }}">{{ pool.decision_label }}</a>{% else %}<span class="muted">ещё не оценён</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% if universe.reject_reasons %}
+    <details><summary>Причины отсева по категориям</summary>
+      <ul>{% for item in universe.reject_reasons %}<li>{{ item.label }} <code>{{ item.code }}</code>: {{ item.count }}</li>{% endfor %}</ul>
+    </details>
+  {% endif %}
+  {% if page.next_cursor %}<p><a href="/pools?cursor={{ page.next_cursor }}{% if query %}&q={{ query | urlencode }}{% endif %}">Следующая страница →</a></p>{% endif %}
+{% endif %}
+{% endblock %}

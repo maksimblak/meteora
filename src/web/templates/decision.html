@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Решение{% endblock %}
+{% block content %}
+{% set d = detail.decision %}
+<h1>Решение: {{ d.status_label }}</h1>
+<p>Пул <a href="/pools/{{ d.pool_address }}"><code>{{ d.pool_address }}</code></a> · токен <code>{{ d.token_mint }}</code></p>
+<p>{{ d.decided_at | dt }} · режим {{ d.mode.value }} · правила <strong>{{ d.ruleset_version }}</strong> · конфигурация {{ d.config_version }} · свежесть {{ d.freshness }} · score {{ d.score | dec(4) }}</p>
+<p class="muted">correlation ID <code>{{ d.correlation_id }}</code> · decision ID <code>{{ d.decision_id }}</code></p>
+
+{% if d.flags %}
+<section class="card warn">
+  <h2>Проверить вручную</h2>
+  <ul>{% for flag in d.flags %}<li>{{ flag.message }} <code>{{ flag.code }}</code></li>{% endfor %}</ul>
+</section>
+{% endif %}
+
+<section class="grid">
+  <div class="card">
+    <h2>Причины</h2>
+    {% if d.reasons %}<ul>{% for reason in d.reasons %}<li>{{ reason.message }} <code>{{ reason.code }}</code></li>{% endfor %}</ul>{% else %}<p>Причин отказа нет.</p>{% endif %}
+    <h3>Недоступные сигналы</h3>
+    <p>{{ d.missing_signals | join(', ') or 'нет' }}</p>
+  </div>
+  <div class="card">
+    <h2>Стратегия</h2>
+    {% if detail.strategy %}
+      {% set s = detail.strategy %}
+      <p class="big">{{ s.strategy }}</p>
+      <p>Причина выбора: <strong>{{ s.selection_label or 'не записана' }}</strong>{% if s.selection_reason %} <code>{{ s.selection_reason }}</code>{% endif %}</p>
+      <p>Направление {{ s.direction }} · бины {{ s.lower_bin_offset }}..{{ s.upper_bin_offset }} · горизонт {{ s.holding_horizon_seconds }} с · истекает {{ s.expires_at | dt }}</p>
+      <p>Размер {{ s.size_base_units }} · расчётный убыток {{ s.estimated_loss_base_units }} · ограничили: {{ s.binding_caps | join(', ') or '—' }}</p>
+      <p>Допуск: {% if s.admitted %}<span class="ok">допущен</span>{% else %}<span class="bad">не допущен</span> {{ s.admission_reasons | join(', ') }}{% endif %}</p>
+      {% if s.selection_evidence %}
+        <table><tr><th>Признак выбора</th><th>Значение</th><th>Порог</th></tr>
+        {% for item in s.selection_evidence %}<tr><td>{{ item.name }}</td><td>{{ item.value }}</td><td>{{ item.threshold or '—' }}</td></tr>{% endfor %}
+        </table>
+      {% endif %}
+    {% else %}
+      <p class="muted">План не строился: стратегию выбирают только для принятого кандидата.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>Признаки и пороги ({{ d.ruleset_version }})</h2>
+  <table>
+    <tr><th>Признак</th><th>Значение</th><th>Порог</th><th></th></tr>
+    {% for item in detail.evidence %}
+      <tr class="{% if item.triggered %}triggered{% endif %}"><td>{{ item.name }}</td><td>{{ item.value }}</td><td>{{ item.threshold or '—' }}</td><td>{% if item.triggered %}<strong class="bad">сработал</strong>{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+  {% if detail.volume_window_source %}<p class="muted">Объём в минуту посчитан из окна {{ detail.volume_window_source }}.</p>{% endif %}
+</section>
+
+{% if detail.gmgn %}
+<section class="card">
+  <h2>Метрики GMGN</h2>
+  <table><tr><th>Метрика</th><th>Значение</th><th>Порог</th></tr>
+  {% for item in detail.gmgn %}<tr><td>{{ item.name }}</td><td>{{ item.value }}</td><td>{{ item.threshold or '—' }}</td></tr>{% endfor %}
+  </table>
+</section>
+{% endif %}
+
+<section class="grid">
+  <div class="card">
+    <h2>Рыночные факты</h2>
+    {% set f = detail.facts %}
+    <p>Объём короткого окна {{ f.volume_short | dec(2) }} · длинного {{ f.volume_long | dec(2) }} · 24ч {{ f.volume_24h | dec(2) }}</p>
+    <p>TVL {{ f.tvl | dec(2) }} · fee/TVL {{ f.fee_tvl | dec(6) }} · цена {{ f.price | dec }} · волатильность {{ f.price_volatility | dec(6) }}</p>
+    <p>Возраст пула {{ f.pool_age_seconds }} с · возраст данных {{ f.source_age_seconds }} с · наблюдение {{ f.observed_at | dt }}</p>
+  </div>
+  <div class="card">
+    <h2>Риск токена</h2>
+    {% set t = detail.token %}
+    <p>Mint authority {{ t.mint_authority }} · freeze {{ t.freeze_authority }} · blacklist {{ t.blacklisted }} · verified {{ t.verified }} · wash trading {{ t.wash_trading }}</p>
+    <p>Top-10 {{ t.holder_concentration | pct }} · total fees {{ t.total_fees_sol | dec(4) }} SOL · {{ t.freshness }} / {{ t.data_quality }} · источник {{ t.provider }}</p>
+    {% if t.missing_signals %}<p class="bad">Нет сигналов: {{ t.missing_signals | join(', ') }}</p>{% endif %}
+  </div>
+</section>
+
+{% if detail.score_components %}
+<section class="card">
+  <h2>Состав score</h2>
+  <table><tr><th>Компонент</th><th>Нормированное</th><th>Вес</th><th>Вклад</th></tr>
+  {% for c in detail.score_components %}<tr><td>{{ c.name }}</td><td>{{ c.normalized_value | dec(4) }}</td><td>{{ c.weight | dec(4) }}</td><td>{{ c.contribution | dec(4) }}</td></tr>{% endfor %}
+  </table>
+</section>
+{% endif %}
+{% endblock %}
