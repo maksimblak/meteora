@@ -8,6 +8,7 @@ from src.domain.screening.models import (
     DepthEvidence,
     DepthSource,
     EvidenceItem,
+    GmgnScreeningRules,
     GuideAssessment,
     GuideScreeningRules,
     IntegrityStatus,
@@ -23,6 +24,7 @@ from src.domain.screening.screener import (
     PoolScreener,
     assess_guide_thresholds,
     assess_volume_integrity,
+    merge_enhanced_signals,
     merge_pool_token_signals,
 )
 
@@ -34,6 +36,7 @@ __all__ = [
     "DepthEvidence",
     "DepthSource",
     "EvidenceItem",
+    "GmgnScreeningRules",
     "GuideAssessment",
     "GuideScreeningRules",
     "IntegrityStatus",
@@ -47,5 +50,6 @@ __all__ = [
     "VolumeRegime",
     "assess_guide_thresholds",
     "assess_volume_integrity",
+    "merge_enhanced_signals",
     "merge_pool_token_signals",
 ]

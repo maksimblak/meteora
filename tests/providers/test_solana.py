@@ -308,6 +308,30 @@ def test_enhanced_provider_outage_does_not_turn_unknown_into_safe() -> None:
     asyncio.run(exercise())
 
 
+def test_without_an_enhanced_provider_the_rpc_read_itself_is_fresh() -> None:
+    """D09: a missing optional source leaves its signals unknown; it does not age the RPC read."""
+
+    class OutageEnhancedProvider:
+        async def get_token_signals(self, mint: PublicKey) -> Any:
+            raise ProviderTimeoutError("fixture enhanced timeout")
+
+    async def exercise() -> None:
+        plain = SolanaRpcProvider(StubRpcClient(MINT_RESPONSE), clock=FrozenClock(NOW))
+        outage = SolanaRpcProvider(
+            StubRpcClient(MINT_RESPONSE),
+            clock=FrozenClock(NOW),
+            enhanced_provider=OutageEnhancedProvider(),
+        )
+
+        for risk in (await plain.get_token_risk(MINT), await outage.get_token_risk(MINT)):
+            assert risk.freshness is Freshness.FRESH
+            assert risk.source_at == NOW
+            assert {"blacklisted", "verified", "wash_trading"} <= set(risk.missing_signals)
+            assert risk.blacklisted is RiskSignal.UNKNOWN
+
+    asyncio.run(exercise())
+
+
 def test_stale_enhanced_risk_remains_stale_after_rpc_merge() -> None:
     source_at = NOW - timedelta(minutes=10)
 

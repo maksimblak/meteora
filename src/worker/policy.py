@@ -21,7 +21,12 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from src.accounting.models import CostModel
 from src.domain.features import GuideFeatureRules, VolumeFeatureRules
 from src.domain.risk.models import RiskPolicy
-from src.domain.screening import GuideScreeningRules, ScreeningPolicy, VolumeIntegrityMode
+from src.domain.screening import (
+    GmgnScreeningRules,
+    GuideScreeningRules,
+    ScreeningPolicy,
+    VolumeIntegrityMode,
+)
 from src.domain.strategy import GuideStrategyRules, StrategyPolicy
 from src.market.windows import ShortWindowRules
 from src.modes.models import KillSwitchPolicy
@@ -33,6 +38,10 @@ DEFAULT_CONFIG_VERSION = "worker-config-v1"
 RULESET_VERSION_ENV = "RULESET_VERSION"
 RULESET_OVERRIDES_ENV = "RULESET_OVERRIDES_FILE"
 UNIVERSE_INTERVAL_ENV = "WORKER_UNIVERSE_INTERVAL_SECONDS"
+# G18: LIVE needs fresh GMGN data unless this is switched off explicitly ("false").
+GMGN_REQUIRED_FOR_LIVE_ENV = "GMGN_REQUIRED_FOR_LIVE"
+_TRUE = frozenset({"1", "true", "yes", "on"})
+_FALSE = frozenset({"0", "false", "no", "off"})
 DEFAULT_UNIVERSE_INTERVAL = timedelta(minutes=5)
 # Bins the pool may move between the snapshot an entry was planned on and the fresh read
 # (and the executor's simulation) before the planned range counts as stale.
@@ -222,6 +231,11 @@ class GuidePolicySettings(BaseModel):
     minimum_volume_to_liquidity: Decimal = Decimal("0.5")
     minimum_fee_efficiency: Decimal = Decimal("0.5")
     minimum_total_fees_sol: Decimal = Decimal("30")
+    # GMGN holder structure (spec 6.7): a share at or above its maximum rejects.
+    maximum_insiders_share: Decimal = Decimal("0.10")
+    maximum_bundling_share: Decimal = Decimal("0.70")
+    maximum_phishing_share: Decimal = Decimal("0.30")
+    maximum_gmgn_top10_holder_share: Decimal = Decimal("0.30")
     baseline_points: int = 12
     minimum_baseline_points: int = 6
     maximum_history_points: int = 288
@@ -272,14 +286,28 @@ def guide_policy(
     config_version: str = DEFAULT_CONFIG_VERSION,
     kill_switch_policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT,
     universe_interval: timedelta = DEFAULT_UNIVERSE_INTERVAL,
+    gmgn_required_for_live: bool | None = None,
 ) -> PipelinePolicy:
     """``guide-v1``: spec 6.2-6.4 plus the LexDollar thresholds and strategy choice (6.6).
 
     On live data (D07) artificial volume is judged on the signals the Data API has, and the
-    observation gap of the ATH proof follows ``universe_interval``.
+    observation gap of the ATH proof follows ``universe_interval``. ``gmgn_required_for_live``
+    adds the GMGN rules of spec 6.7 with that LIVE requirement; ``None`` builds the bundle
+    without them (the worker and the API always load them through ``load_pipeline_policy``).
     """
 
     values = settings or GuidePolicySettings()
+    gmgn = (
+        None
+        if gmgn_required_for_live is None
+        else GmgnScreeningRules(
+            maximum_insiders_share=values.maximum_insiders_share,
+            maximum_bundling_share=values.maximum_bundling_share,
+            maximum_phishing_share=values.maximum_phishing_share,
+            maximum_top10_holder_share=values.maximum_gmgn_top10_holder_share,
+            required_for_live=gmgn_required_for_live,
+        )
+    )
     return PipelinePolicy(
         short_window=_short_window_rules(
             universe_interval,
@@ -324,6 +352,7 @@ def guide_policy(
                 minimum_volume_to_liquidity=values.minimum_volume_to_liquidity,
                 minimum_fee_efficiency=values.minimum_fee_efficiency,
                 minimum_total_fees_sol=values.minimum_total_fees_sol,
+                gmgn=gmgn,
             ),
             volume_integrity=VolumeIntegrityMode.AVAILABLE_SIGNALS,
             maximum_burst_spread=values.maximum_burst_spread,
@@ -370,6 +399,8 @@ def load_pipeline_policy(environ: Mapping[str, str]) -> PipelinePolicy:
     ``RULESET_VERSION`` picks ``guide-v1`` (default) or ``shadow-hypothesis-v1``.
     ``RULESET_OVERRIDES_FILE`` points to YAML with ``config_version`` and a ``thresholds``
     mapping of ``GuidePolicySettings`` fields; tuned numbers must carry their own version.
+    ``guide-v1`` always carries the GMGN rules (G18); ``GMGN_REQUIRED_FOR_LIVE=false``
+    is the only way to let LIVE enter without fresh GMGN data.
     """
 
     version = environ.get(RULESET_VERSION_ENV) or DEFAULT_RULESET_VERSION
@@ -381,8 +412,9 @@ def load_pipeline_policy(environ: Mapping[str, str]) -> PipelinePolicy:
         return hypothesis_policy(universe_interval=interval)
     if version != GUIDE_RULESET_VERSION:
         raise ValueError(f"unknown ruleset version {version!r}")
+    required = gmgn_required_for_live(environ)
     if not overrides_path:
-        return guide_policy(universe_interval=interval)
+        return guide_policy(universe_interval=interval, gmgn_required_for_live=required)
     document = yaml.safe_load(Path(overrides_path).read_text(encoding="utf-8")) or {}
     if not isinstance(document, dict):
         raise ValueError("ruleset overrides must be a mapping")
@@ -401,7 +433,23 @@ def load_pipeline_policy(environ: Mapping[str, str]) -> PipelinePolicy:
         settings = GuidePolicySettings.model_validate(thresholds)
     except ValidationError as error:
         raise ValueError(f"invalid guide-v1 thresholds: {error}") from error
-    return guide_policy(settings, config_version=config_version, universe_interval=interval)
+    return guide_policy(
+        settings,
+        config_version=config_version,
+        universe_interval=interval,
+        gmgn_required_for_live=required,
+    )
+
+
+def gmgn_required_for_live(environ: Mapping[str, str]) -> bool:
+    """``GMGN_REQUIRED_FOR_LIVE``: unset or empty keeps LIVE closed without fresh GMGN data."""
+
+    raw = (environ.get(GMGN_REQUIRED_FOR_LIVE_ENV) or "").strip().lower()
+    if not raw or raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    raise ValueError(f"{GMGN_REQUIRED_FOR_LIVE_ENV} must be true or false")
 
 
 def _shadow_costs(slippage_bps: int = 50) -> CostModel:

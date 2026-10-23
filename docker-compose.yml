@@ -58,6 +58,8 @@ services:
       EXECUTOR_URL: ${EXECUTOR_URL:-}
       EXECUTOR_INTERNAL_TOKEN_FILE: ${EXECUTOR_INTERNAL_TOKEN_FILE:-}
       EXECUTOR_APPROVAL_SECRET_FILE: ${EXECUTOR_APPROVAL_SECRET_FILE:-}
+      # The same GMGN rule the worker applies, for the effective configuration (G18).
+      GMGN_REQUIRED_FOR_LIVE: ${GMGN_REQUIRED_FOR_LIVE:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -100,6 +102,13 @@ services:
       EXECUTOR_URL: ${EXECUTOR_URL:-}
       EXECUTOR_INTERNAL_TOKEN: ${EXECUTOR_INTERNAL_TOKEN:-}
       EXECUTOR_INTERNAL_TOKEN_FILE: ${EXECUTOR_INTERNAL_TOKEN_FILE:-}
+      # GMGN metrics of candidates (G18) from the ``gmgn`` service below: empty = not asked,
+      # decisions as before. With ``--profile gmgn`` set GMGN_URL=http://gmgn:8080. LIVE stays
+      # closed without fresh GMGN data until GMGN_REQUIRED_FOR_LIVE=false is set explicitly.
+      GMGN_URL: ${GMGN_URL:-}
+      GMGN_REQUIRED_FOR_LIVE: ${GMGN_REQUIRED_FOR_LIVE:-}
+      GMGN_TIMEOUT_SECONDS: ${GMGN_TIMEOUT_SECONDS:-}
+      GMGN_STALE_AFTER_SECONDS: ${GMGN_STALE_AFTER_SECONDS:-}
     expose:
       - "9100"
     depends_on:
@@ -132,6 +141,36 @@ services:
       retries: 10
     expose:
       - "3000"
+
+  # GMGN metrics (G18, spec 6.7): the public token page in the official Playwright Chromium
+  # with its defaults, as a plain visitor; no account, cookies, captcha solving or stealth.
+  # Off by default (profile ``gmgn``); reachable on the compose network only.
+  gmgn:
+    profiles: ["gmgn"]
+    build:
+      context: .
+      dockerfile: Dockerfile.gmgn
+      target: runtime
+    init: true
+    shm_size: "1gb"
+    environment:
+      GMGN_PAGE_TIMEOUT_SECONDS: ${GMGN_PAGE_TIMEOUT_SECONDS:-}
+      GMGN_CACHE_TTL_SECONDS: ${GMGN_CACHE_TTL_SECONDS:-}
+      GMGN_MAX_PAGES: ${GMGN_MAX_PAGES:-}
+      GMGN_BREAKER_COOLDOWN_SECONDS: ${GMGN_BREAKER_COOLDOWN_SECONDS:-}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/health/live', timeout=2)
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    expose:
+      - "8080"
 
   executor:
     profiles: ["live"]

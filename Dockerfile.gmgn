@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.7
+
+# The gmgn service (G18): the official Playwright image for Python, pinned. Its bundled
+# Chromium (/ms-playwright) is the one playwright==1.63.0 in services/gmgn/uv.lock drives;
+# the two versions change together. Nothing else from the browser stack is added.
+FROM mcr.microsoft.com/playwright/python:v1.63.0-noble AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/gmgn-venv \
+    PATH="/opt/gmgn-venv/bin:${PATH}"
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir uv==0.12.4
+
+COPY services/gmgn/pyproject.toml services/gmgn/uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY services/gmgn/gmgn_service ./gmgn_service
+
+# Service checks in the image's own environment:
+#   docker build -f Dockerfile.gmgn --target check -t gmgn-check . && docker run --rm gmgn-check
+FROM base AS check
+RUN uv sync --frozen --no-install-project
+COPY services/gmgn/tests ./tests
+COPY tests/gmgn/contract ./contract
+RUN chown -R pwuser:pwuser /app
+USER pwuser
+CMD ["sh", "-ec", "ruff check gmgn_service tests && mypy && pytest -q -p no:cacheprovider --basetemp /tmp/pytest"]
+
+FROM base AS runtime
+# The image's unprivileged user; Chromium needs no extra capability or host IPC here.
+USER pwuser
+EXPOSE 8080
+CMD ["python", "-m", "gmgn_service"]

@@ -13,6 +13,7 @@ from src.domain.screening.models import (
     DepthEvidence,
     DepthSource,
     EvidenceItem,
+    GmgnScreeningRules,
     GuideAssessment,
     IntegrityStatus,
     RejectionCode,
@@ -25,6 +26,7 @@ from src.domain.screening.models import (
 from src.market.models import (
     AuthorityStatus,
     DataQuality,
+    EnhancedTokenSignals,
     Freshness,
     PoolSnapshot,
     RiskSignal,
@@ -186,6 +188,34 @@ def merge_pool_token_signals(token: TokenRiskSnapshot, pool: PoolSnapshot) -> To
     return TokenRiskSnapshot.model_validate(data)
 
 
+def merge_enhanced_signals(
+    token: TokenRiskSnapshot, signals: EnhancedTokenSignals
+) -> TokenRiskSnapshot:
+    """The token's risk with an enhanced provider's reading attached (GMGN, G18).
+
+    The reading is kept as received, with its own source time and freshness, for the GMGN
+    thresholds and the decision record. Only a fresh reading fills what the token lacks:
+    the total fees of the conditional D03 threshold. The token's own risk signals,
+    freshness and missing signals stay as they are, and its RPC top-10 share is
+    cross-checked against the reading's own figure, never replaced by it. ``ingested_at``
+    moves up to the reading's source time, so no input of the token is newer than it.
+    """
+
+    data = token.model_dump()
+    data.update(
+        enhanced=signals,
+        provider=f"{token.provider}+{signals.provider}",
+        ingested_at=max(token.ingested_at, signals.source_at),
+    )
+    if (
+        signals.freshness is Freshness.FRESH
+        and token.total_fees_sol is None
+        and signals.total_fees_sol is not None
+    ):
+        data["total_fees_sol"] = signals.total_fees_sol
+    return TokenRiskSnapshot.model_validate(data)
+
+
 def _negated(value: bool | None) -> bool | None:
     return None if value is None else not value
 
@@ -322,6 +352,109 @@ def assess_guide_thresholds(
     )
 
 
+_UNAVAILABLE = "UNAVAILABLE"
+
+
+def _gmgn_assessment(
+    token: TokenRiskSnapshot, rules: GmgnScreeningRules, mode: TradingMode
+) -> tuple[list[RejectionCode], list[EvidenceItem], list[DecisionFlag]]:
+    """GMGN holder structure (spec 6.7): reasons, evidence and flags of one token.
+
+    Only a fresh reading is applied. A reading that is stale, unavailable or misses a
+    threshold metric (e.g. a changed GMGN format) is ``GMGN_UNAVAILABLE``; the metrics it
+    did report still reject. A token no enhanced source read (the service is not wired)
+    is ``GMGN_UNAVAILABLE`` too, with ``gmgn_status=NOT_CONFIGURED``: never "all clear".
+    Outside LIVE the flag changes no status; LIVE is closed while ``required_for_live``.
+    """
+
+    closes_live = mode is TradingMode.LIVE and rules.required_for_live
+    reading = token.enhanced
+    if reading is None:
+        return (
+            [RejectionCode.GMGN_UNAVAILABLE] if closes_live else [],
+            [EvidenceItem(name="gmgn_status", value="NOT_CONFIGURED")],
+            [DecisionFlag.GMGN_UNAVAILABLE],
+        )
+    fresh = reading.freshness is Freshness.FRESH
+    if fresh:
+        status = "FRESH"
+    elif reading.detail:
+        status = f"{_UNAVAILABLE}:{reading.detail}"
+    else:
+        status = Freshness.STALE.value
+    reported = (
+        reading.insiders_share,
+        reading.bundling_share,
+        reading.phishing_share,
+        reading.top10_holder_share,
+        reading.developer_share,
+        reading.total_fees_sol,
+    )
+    has_values = any(value is not None for value in reported)
+    evidence = [
+        EvidenceItem(name="gmgn_status", value=status),
+        EvidenceItem(
+            name="gmgn_source_at",
+            value=reading.source_at.isoformat() if fresh or has_values else _UNAVAILABLE,
+        ),
+    ]
+    reasons: list[RejectionCode] = []
+    flags: list[DecisionFlag] = []
+    complete = fresh
+    for name, value, maximum, code in (
+        (
+            "insiders_share",
+            reading.insiders_share,
+            rules.maximum_insiders_share,
+            RejectionCode.INSIDERS_SHARE_HIGH,
+        ),
+        (
+            "bundling_share",
+            reading.bundling_share,
+            rules.maximum_bundling_share,
+            RejectionCode.BUNDLING_SHARE_HIGH,
+        ),
+        (
+            "phishing_share",
+            reading.phishing_share,
+            rules.maximum_phishing_share,
+            RejectionCode.PHISHING_SHARE_HIGH,
+        ),
+        (
+            "gmgn_top10_holder_share",
+            reading.top10_holder_share,
+            rules.maximum_top10_holder_share,
+            RejectionCode.GMGN_TOP10_HOLDER_SHARE_HIGH,
+        ),
+    ):
+        used = value if fresh else None
+        if used is None:
+            complete = False
+        elif used >= maximum:
+            # The guide asks for "below the maximum": the maximum itself already fails.
+            reasons.append(code)
+        evidence.append(
+            EvidenceItem(
+                name=name, value=_UNAVAILABLE if used is None else str(used), threshold=str(maximum)
+            )
+        )
+    developer = reading.developer_share if fresh else None
+    evidence.append(
+        EvidenceItem(
+            name="developer_share",
+            value=_UNAVAILABLE if developer is None else str(developer),
+            threshold="0",
+        )
+    )
+    if developer is not None and developer > 0:
+        flags.append(DecisionFlag.DEVELOPER_HOLDS_TOKENS)
+    if not complete:
+        flags.append(DecisionFlag.GMGN_UNAVAILABLE)
+        if closes_live:
+            reasons.append(RejectionCode.GMGN_UNAVAILABLE)
+    return reasons, evidence, flags
+
+
 def _token_age(
     pool: PoolSnapshot, token: TokenRiskSnapshot, decision_at: datetime
 ) -> tuple[timedelta, bool]:
@@ -389,6 +522,13 @@ class PoolScreener:
             missing.update(guide.missing_signals)
             evidence = (*evidence, *guide.evidence)
             flags.extend(guide.flags)
+            if policy.guide.gmgn is not None:
+                gmgn_reasons, gmgn_evidence, gmgn_flags = _gmgn_assessment(
+                    token, policy.guide.gmgn, context.mode
+                )
+                reasons.extend(gmgn_reasons)
+                evidence = (*evidence, *gmgn_evidence)
+                flags.extend(gmgn_flags)
         flags.extend(integrity.flags)
         if depth is not None and depth.source is DepthSource.UNAVAILABLE:
             flags.append(DecisionFlag.DEPTH_UNAVAILABLE)
@@ -399,11 +539,16 @@ class PoolScreener:
             and context.mode is TradingMode.LIVE
         ):
             reasons.append(RejectionCode.VOLUME_PARTICIPANTS_UNAVAILABLE)
+        if not token.source_configured:
+            flags.append(DecisionFlag.TOKEN_RISK_UNAVAILABLE)
+            if context.mode is not TradingMode.SHADOW:
+                reasons.append(RejectionCode.TOKEN_RISK_UNAVAILABLE)
         reasons = list(dict.fromkeys(reasons))
 
         warming = features.readiness is SignalReadiness.WARMING_UP
         unknown_codes = {
             RejectionCode.TOKEN_RISK_UNKNOWN,
+            RejectionCode.TOKEN_RISK_UNAVAILABLE,
             RejectionCode.VOLUME_INTEGRITY_UNKNOWN,
             RejectionCode.GUIDE_SIGNAL_UNKNOWN,
         }
@@ -544,9 +689,11 @@ class PoolScreener:
             and token.holder_concentration > policy.maximum_holder_concentration
         ):
             reasons.append(RejectionCode.HOLDER_CONCENTRATION_HIGH)
-        if token.freshness is Freshness.STALE:
+        # D09: a token with no configured source carries no data that could be stale or
+        # unresolved; it is the TOKEN_RISK_UNAVAILABLE flag instead (see ``evaluate``).
+        if token.source_configured and token.freshness is Freshness.STALE:
             reasons.append(RejectionCode.TOKEN_RISK_STALE)
-        if not _token_resolved(token, policy):
+        if token.source_configured and not _token_resolved(token, policy):
             reasons.append(RejectionCode.TOKEN_RISK_UNKNOWN)
         if integrity.status is IntegrityStatus.CONFIRMED:
             reasons.append(RejectionCode.ARTIFICIAL_VOLUME_CONFIRMED)

@@ -89,11 +89,15 @@ _DATA_GAPS = frozenset(
         RejectionCode.FUTURE_TOKEN_RISK_DATA,
         RejectionCode.TOKEN_RISK_STALE,
         RejectionCode.TOKEN_RISK_UNKNOWN,
+        RejectionCode.TOKEN_RISK_UNAVAILABLE,
         RejectionCode.VOLUME_INTEGRITY_UNKNOWN,
         RejectionCode.GUIDE_SIGNAL_UNKNOWN,
         RejectionCode.DEPTH_UNAVAILABLE,
     }
 )
+# The same gaps when the stage lets them pass as a flag (SHADOW). Optional sources
+# (GMGN, total fees, participant counts) are not gaps of the data the rules require.
+_GAP_FLAGS = frozenset({DecisionFlag.DEPTH_UNAVAILABLE, DecisionFlag.TOKEN_RISK_UNAVAILABLE})
 _BPS = Decimal(10_000)
 _MINIMUM_IMPACT = Decimal(1) / _BPS
 
@@ -594,5 +598,5 @@ def _covered(decision: CandidateDecision) -> bool:
     return (
         decision.status is not CandidateStatus.WARMING_UP
         and not _DATA_GAPS.intersection(decision.reasons)
-        and DecisionFlag.DEPTH_UNAVAILABLE not in decision.flags
+        and not _GAP_FLAGS.intersection(decision.flags)
     )

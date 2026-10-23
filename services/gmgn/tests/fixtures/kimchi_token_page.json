@@ -1,0 +1,132 @@
+{
+ "recorded_at": "2026-10-23T17:31:00+00:00",
+ "source": "https://gmgn.ai/sol/token/CSocnzcRpgSCr1naKcNTieWZUxb6rABe45j844m7pump (public page; query identifiers removed, unrelated fields trimmed)",
+ "responses": [
+  {
+   "method": "GET",
+   "path": "/api/v1/gas_price_list",
+   "status": 200,
+   "body": {
+    "code": 0,
+    "reason": "",
+    "message": "success",
+    "data": {
+     "note": "trimmed: unrelated to the token metrics"
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/token_pool_fee_info/sol/CSocnzcRpgSCr1naKcNTieWZUxb6rABe45j844m7pump",
+   "status": 200,
+   "body": {
+    "code": 0,
+    "reason": "",
+    "message": "success",
+    "data": {
+     "list": [
+      {
+       "address": "EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx",
+       "exchange": "Ray V2",
+       "liquidity": 5717953.888765758,
+       "fee_ratio": 0,
+       "is_dynamic_fee": false,
+       "pool_type": "ray_v2"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/mutil_window_token_info",
+   "status": 200,
+   "body": {
+    "code": 0,
+    "reason": "",
+    "message": "success",
+    "data": [
+     {
+      "address": "CSocnzcRpgSCr1naKcNTieWZUxb6rABe45j844m7pump",
+      "symbol": "Kimchi",
+      "name": "Aura Final Boss",
+      "decimals": 6,
+      "holder_count": 23400,
+      "creation_timestamp": 1792537215,
+      "liquidity": "355313.476786249",
+      "price": {
+       "price": "0.010434341",
+       "volume_24h": "14013448.93844396",
+       "swaps_24h": 88053
+      },
+      "priority_fee": "406.54613475838335",
+      "tip_fee": "230.345884532",
+      "trade_fee": "1285.4076709753544",
+      "total_fee": "1922.2996902657378",
+      "dev": {
+       "address": "CSocnzcRpgSCr1naKcNTieWZUxb6rABe45j844m7pump",
+       "creator_address": "EFSr396A6Jh7bNCSujGRLMkyXspbWitEvjNVatGD56oF",
+       "creator_token_balance": "0",
+       "creator_token_status": "creator_close",
+       "top_10_holder_rate": "0.7904"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/token_stat/sol/CSocnzcRpgSCr1naKcNTieWZUxb6rABe45j844m7pump",
+   "status": 200,
+   "body": {
+    "code": 0,
+    "reason": "",
+    "message": "success",
+    "data": {
+     "holder_count": 23400,
+     "bluechip_owner_count": 0,
+     "bluechip_owner_percentage": "0",
+     "signal_count": 0,
+     "degen_call_count": 0,
+     "top_rat_trader_percentage": "0.7533",
+     "top_bundler_trader_percentage": "0.1139",
+     "top_entrapment_trader_percentage": "0.8081",
+     "top_bot_degen_percentage": "0.1136",
+     "creator_created_count": 337,
+     "bot_degen_count": 1073,
+     "bot_degen_rate": "0.1136",
+     "fresh_wallet_rate": "0.7798",
+     "top_10_holder_rate": "0.7904",
+     "dev_team_hold_rate": "0",
+     "creator_hold_rate": "0",
+     "creator_token_balance": "0",
+     "private_vault_hold_rate": "0",
+     "top70_sniper_hold_rate": "0.0000000003"
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/vas/api/v1/token_holder_stat/sol/CSocnzcRpgSCr1naKcNTieWZUxb6rABe45j844m7pump",
+   "status": 200,
+   "body": {
+    "code": 0,
+    "reason": "",
+    "message": "success",
+    "data": {
+     "smart_degen_count": 133,
+     "renowned_count": 1000,
+     "fresh_wallet_count": 1000,
+     "dex_bot_count": 1000,
+     "insider_count": 0,
+     "following_count": 0,
+     "dev_count": 0,
+     "bluechip_owner_count": 1000,
+     "bundler_count": 1000,
+     "sniper_count": 160,
+     "fomo_count": 1000
+    }
+   }
+  }
+ ]
+}

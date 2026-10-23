@@ -1,0 +1,19 @@
+{
+  "schema_version": "gmgn-signals.v1",
+  "chain": "sol",
+  "mint": "CSocnzcRpgSCr1naKcNTieWZUxb6rABe45j844m7pump",
+  "status": "AVAILABLE",
+  "reason": null,
+  "source_at": "2026-10-23T17:33:16Z",
+  "freshness": "FRESH",
+  "signals": {
+    "top10_holder_share": "0.7904",
+    "insiders_share": "0.7533",
+    "bundling_share": "0.1139",
+    "phishing_share": "0.8081",
+    "developer_share": "0",
+    "total_fees_sol": "1922.2996902657378"
+  },
+  "missing": [],
+  "sources": ["mutil_window_token_info", "token_stat"]
+}

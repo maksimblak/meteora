@@ -72,6 +72,8 @@ _BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _TOP_HOLDERS = 10
 _SIGNATURE_PAGE = 1_000
 _MAX_CACHED_MINTS = 4_096
+# Signals vanilla RPC cannot give: unknown (and missing) without an enhanced reading.
+_ENHANCED_ONLY_SIGNALS = ("blacklisted", "holder_concentration", "verified", "wash_trading")
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +138,18 @@ class SolanaRpcProvider:
         missing: list[str] = []
         mint_authority = _authority(info, "mintAuthority", missing)
         freeze_authority = _authority(info, "freezeAuthority", missing)
-        enhanced = await self._enhanced_signals(mint, now)
-        if enhanced.source_at > now:
+        received = await self._enhanced_signals(mint)
+        if received is not None and received.source_at > now:
             raise ProviderPayloadError("enhanced token source time is in the future")
+        # D09: the token is as fresh as the data it carries. The RPC read is from now; an
+        # enhanced reading counts only when one was received (with its own age), never its
+        # absence, whose signals stay unknown and are listed as missing.
+        enhanced = received or EnhancedTokenSignals(
+            provider="unavailable",
+            source_at=now,
+            freshness=Freshness.FRESH,
+            missing_signals=_ENHANCED_ONLY_SIGNALS,
+        )
         missing.extend(enhanced.missing_signals)
         # The more concentrated reading wins: a risk filter must never under-report it.
         readings = [
@@ -263,35 +274,15 @@ class SolanaRpcProvider:
                     decimals[address] = value
         return decimals
 
-    async def _enhanced_signals(
-        self, mint: PublicKey, observed_at: datetime
-    ) -> EnhancedTokenSignals:
+    async def _enhanced_signals(self, mint: PublicKey) -> EnhancedTokenSignals | None:
+        """The enhanced provider's reading, or ``None`` when there is none or it is down."""
+
         if self._enhanced is None:
-            return EnhancedTokenSignals(
-                provider="none",
-                source_at=observed_at,
-                freshness=Freshness.STALE,
-                missing_signals=(
-                    "blacklisted",
-                    "holder_concentration",
-                    "verified",
-                    "wash_trading",
-                ),
-            )
+            return None
         try:
             return await self._enhanced.get_token_signals(mint)
         except ProviderUnavailableError:
-            return EnhancedTokenSignals(
-                provider="unavailable",
-                source_at=observed_at,
-                freshness=Freshness.STALE,
-                missing_signals=(
-                    "blacklisted",
-                    "holder_concentration",
-                    "verified",
-                    "wash_trading",
-                ),
-            )
+            return None
 
     async def _top_holder_share(self, mint: PublicKey) -> Decimal | None:
         """Top-10 wallet share of supply, excluding pool vaults and known programs.

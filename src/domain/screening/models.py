@@ -66,6 +66,14 @@ class RejectionCode(StrEnum):
     BLACKLISTED_POOL = "BLACKLISTED_POOL"
     DEPTH_UNAVAILABLE = "DEPTH_UNAVAILABLE"
     VOLUME_PARTICIPANTS_UNAVAILABLE = "VOLUME_PARTICIPANTS_UNAVAILABLE"
+    # GMGN holder structure (spec 6.7, G18)
+    INSIDERS_SHARE_HIGH = "INSIDERS_SHARE_HIGH"
+    BUNDLING_SHARE_HIGH = "BUNDLING_SHARE_HIGH"
+    PHISHING_SHARE_HIGH = "PHISHING_SHARE_HIGH"
+    GMGN_TOP10_HOLDER_SHARE_HIGH = "GMGN_TOP10_HOLDER_SHARE_HIGH"
+    GMGN_UNAVAILABLE = "GMGN_UNAVAILABLE"
+    # D09: no on-chain source configured; APPROVAL and LIVE only (SHADOW has the flag).
+    TOKEN_RISK_UNAVAILABLE = "TOKEN_RISK_UNAVAILABLE"  # noqa: S105 - stable domain code
 
 
 class DecisionFlag(StrEnum):
@@ -82,6 +90,16 @@ class DecisionFlag(StrEnum):
     # is judged on turnover, fee organicity and burst self-similarity; SHADOW and APPROVAL go
     # on, LIVE is closed (reason ``VOLUME_PARTICIPANTS_UNAVAILABLE``) until a provider has them.
     VOLUME_PARTICIPANTS_UNAVAILABLE = "VOLUME_PARTICIPANTS_UNAVAILABLE"
+    # G18: no fresh GMGN reading of every threshold metric. SHADOW and APPROVAL go on (the
+    # approval preview asks for a manual check); LIVE is closed (reason ``GMGN_UNAVAILABLE``)
+    # unless ``GmgnScreeningRules.required_for_live`` was switched off.
+    GMGN_UNAVAILABLE = "GMGN_UNAVAILABLE"
+    # G18: GMGN reports a developer share above zero ("желательно 0" in the guide): shown and
+    # recorded for the operator's checklist, never a reject.
+    DEVELOPER_HOLDS_TOKENS = "DEVELOPER_HOLDS_TOKENS"  # noqa: S105 - stable domain code
+    # D09: no on-chain source (RPC) is configured, every base token signal is unknown.
+    # SHADOW goes on; APPROVAL and LIVE are closed (reason ``TOKEN_RISK_UNAVAILABLE``).
+    TOKEN_RISK_UNAVAILABLE = "TOKEN_RISK_UNAVAILABLE"  # noqa: S105 - stable domain code
 
 
 class VolumeIntegrityMode(StrEnum):
@@ -206,6 +224,46 @@ class ScoreWeights(BaseModel):
         return self
 
 
+class GmgnScreeningRules(BaseModel):
+    """GMGN thresholds of ``guide-v1`` (spec 6.7, G18), from the article's checklist.
+
+    The guide asks for insiders < 10%, bundling < 70%, phishing < 30% and top-10 < 30%, so
+    a share equal to its maximum already rejects. The developer share is a flag. Only a
+    fresh reading is applied; without one the decision carries ``GMGN_UNAVAILABLE`` and
+    LIVE is closed while ``required_for_live`` holds (``GMGN_REQUIRED_FOR_LIVE``).
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    maximum_insiders_share: Decimal = Decimal("0.10")
+    maximum_bundling_share: Decimal = Decimal("0.70")
+    maximum_phishing_share: Decimal = Decimal("0.30")
+    maximum_top10_holder_share: Decimal = Decimal("0.30")
+    required_for_live: bool = True
+
+    _reject_float = field_validator(
+        "maximum_insiders_share",
+        "maximum_bundling_share",
+        "maximum_phishing_share",
+        "maximum_top10_holder_share",
+        mode="before",
+    )(_exact_decimal)
+
+    @model_validator(mode="after")
+    def validate_gmgn(self) -> "GmgnScreeningRules":
+        if not all(
+            Decimal(0) < value <= Decimal(1)
+            for value in (
+                self.maximum_insiders_share,
+                self.maximum_bundling_share,
+                self.maximum_phishing_share,
+                self.maximum_top10_holder_share,
+            )
+        ):
+            raise ValueError("GMGN share thresholds must be fractions in (0, 1]")
+        return self
+
+
 class GuideScreeningRules(BaseModel):
     """Starting thresholds of the LexDollar guide (spec 6.6, G16) — a shadow hypothesis.
 
@@ -225,6 +283,8 @@ class GuideScreeningRules(BaseModel):
     minimum_volume_to_liquidity: Decimal = Decimal("0.5")
     minimum_fee_efficiency: Decimal = Decimal("0.5")
     minimum_total_fees_sol: Decimal = Decimal("30")
+    # GMGN holder structure (G18); ``None`` = the bundle has no GMGN rules at all.
+    gmgn: GmgnScreeningRules | None = None
 
     _reject_float = field_validator(
         "minimum_market_cap",

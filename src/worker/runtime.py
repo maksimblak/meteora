@@ -9,6 +9,11 @@ any new action) -> lease-guarded scheduler. Jobs, by priority:
 3. ``universe_sync``   - paginated discovery, open-position pools first;
 4. ``outbox_relay`` / 5. ``retention`` - publication and telemetry clean-up.
 
+GMGN (G18): with ``GMGN_URL`` the candidate pipeline's token risk carries the reading of
+the internal ``gmgn`` service (``GmgnProvider``); positions keep the plain provider, so
+page loads stay with candidates. Without it nothing is asked and nothing changes, except
+that the loaded guide-v1 rules keep LIVE closed until ``GMGN_REQUIRED_FOR_LIVE=false``.
+
 The default stack is SHADOW-only: without an execution gateway, APPROVAL/LIVE
 entries are cancelled as ``EXECUTION_GATEWAY_NOT_CONFIGURED`` and nothing is sent.
 A gateway is wired only for ``TRADING_MODE`` APPROVAL or LIVE with ``EXECUTOR_URL``,
@@ -45,6 +50,8 @@ from src.execution.service import (
     ReceiptLookup,
 )
 from src.execution.settings import ExecutorSettings
+from src.gmgn import GmgnProvider
+from src.gmgn.enrichment import EnhancedSignalSource, EnrichedOnChainProvider
 from src.market.contracts import MarketDataProvider, OnChainProvider, VolumeHistorySource
 from src.market.models import (
     AuthorityStatus,
@@ -101,6 +108,9 @@ GATEWAY_READINESS_INTERVAL = timedelta(seconds=15)
 UNIVERSE_FILTER_ENV = "METEORA_UNIVERSE_FILTER"
 FULL_SWEEP = "all"
 QUOTES_URL_ENV = "EXECUTOR_QUOTES_URL"
+GMGN_URL_ENV = "GMGN_URL"
+GMGN_TIMEOUT_ENV = "GMGN_TIMEOUT_SECONDS"
+GMGN_STALE_AFTER_ENV = "GMGN_STALE_AFTER_SECONDS"
 
 _UNKNOWN_SIGNALS = (
     "blacklisted",
@@ -181,7 +191,11 @@ class GatewayWiring:
 
 
 class UnavailableOnChainProvider:
-    """Used when no Solana RPC is configured: every strict signal is ``UNKNOWN``."""
+    """Used when no Solana RPC is configured: every strict signal is ``UNKNOWN``.
+
+    The snapshot says so (``source_configured=False``, D09): SHADOW goes on with the
+    ``TOKEN_RISK_UNAVAILABLE`` flag, APPROVAL and LIVE are closed.
+    """
 
     def __init__(self, clock: Clock) -> None:
         self._clock = clock
@@ -207,6 +221,7 @@ class UnavailableOnChainProvider:
             data_quality=DataQuality.UNAVAILABLE,
             missing_signals=_UNKNOWN_SIGNALS,
             provider="not_configured",
+            source_configured=False,
         )
 
     async def get_wallet_state(self, wallet: PublicKey) -> WalletState:
@@ -232,10 +247,12 @@ class WorkerRuntime:
         pool_states: PoolStateReader | None = None,
         quotes: QuoteSource | None = None,
         warmup: VolumeHistorySource | None = None,
+        gmgn: EnhancedSignalSource | None = None,
     ) -> None:
         """``pool_states`` re-reads the active bin before a non-SHADOW entry, ``quotes``
         measures candidates' depth (``POST /v1/quotes``) and ``warmup`` serves a new
-        candidate's volume history (D07); each is optional and its absence fails closed."""
+        candidate's volume history (D07); each is optional and its absence fails closed.
+        ``gmgn`` attaches GMGN metrics to candidates' token risk (G18)."""
 
         self.settings = settings
         self.policy = policy
@@ -245,6 +262,7 @@ class WorkerRuntime:
         self.health = health or HealthMonitor(clock)
         self._market = market
         self._onchain = onchain
+        self.gmgn = gmgn
         self._log = get_logger("worker.runtime")
         repos = repositories
         self.alerts = CriticalAlertReporter(
@@ -331,7 +349,10 @@ class WorkerRuntime:
         )
         self.pipeline = CandidatePipeline(
             history=repos.history,
-            onchain=onchain,
+            # Only candidates reach the token-risk read, so only they cost a GMGN page.
+            onchain=onchain
+            if gmgn is None
+            else EnrichedOnChainProvider(onchain, gmgn, clock=clock),
             decisions=repos.decisions,
             modes=repos.mode,
             entries=self.entries,
@@ -381,6 +402,8 @@ class WorkerRuntime:
         if market is not None:
             self.health.register_provider("meteora", lambda: market.health)
         self.health.register_provider("solana", lambda: onchain.health)
+        if gmgn is not None:
+            self.health.register_provider("gmgn", lambda: gmgn.health)
         self.scheduler = Scheduler(
             self.jobs(),
             repos.leases,
@@ -525,6 +548,8 @@ class WorkerRuntime:
         if self._market is not None:
             self.metrics.provider_state("meteora", self._market.health)
         self.metrics.provider_state("solana", self._onchain.health)
+        if self.gmgn is not None:
+            self.metrics.provider_state("gmgn", self.gmgn.health)
 
     async def run(self, stop: asyncio.Event) -> None:
         await self.refresh_health()
@@ -631,6 +656,7 @@ def build_runtime(
     executor_transport: httpx.AsyncBaseTransport | None = None,
     market_transport: httpx.AsyncBaseTransport | None = None,
     rpc_transport: httpx.AsyncBaseTransport | None = None,
+    gmgn_transport: httpx.AsyncBaseTransport | None = None,
 ) -> tuple[WorkerRuntime, list[httpx.AsyncClient]]:
     # The rule bundle (RULESET_VERSION, RULESET_OVERRIDES_FILE) is resolved first: an
     # unknown or invalid ruleset stops the start before any store or client is opened.
@@ -677,6 +703,9 @@ def build_runtime(
     quotes, quote_client = build_quotes(config, environ, transport=executor_transport)
     if quote_client is not None:
         clients.append(quote_client)
+    gmgn, gmgn_client = build_gmgn(environ, clock=clock, transport=gmgn_transport)
+    if gmgn_client is not None:
+        clients.append(gmgn_client)
     runtime = WorkerRuntime(
         settings=settings,
         policy=policy,
@@ -690,6 +719,7 @@ def build_runtime(
         pool_states=pool_states,
         quotes=quotes,
         warmup=warmup,
+        gmgn=gmgn,
     )
     return runtime, clients
 
@@ -745,6 +775,32 @@ def build_quotes(
         base_url=url, timeout=settings.timeout.total_seconds(), transport=transport
     )
     return HttpQuoteClient(client, internal_token=token.get_secret_value()), client
+
+
+def build_gmgn(
+    environ: Mapping[str, str],
+    *,
+    clock: Clock,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[GmgnProvider | None, httpx.AsyncClient | None]:
+    """The client of the internal ``gmgn`` service (compose profile ``gmgn``), or ``None``.
+
+    ``GMGN_URL`` (e.g. ``http://gmgn:8080``) switches it on; ``GMGN_TIMEOUT_SECONDS``
+    bounds one answer of the service, ``GMGN_STALE_AFTER_SECONDS`` the age of fresh data.
+    """
+
+    url = (environ.get(GMGN_URL_ENV) or "").strip()
+    if not url:
+        return None, None
+    timeout = _seconds(environ, GMGN_TIMEOUT_ENV, 20)
+    client = httpx.AsyncClient(base_url=url, transport=transport)
+    provider = GmgnProvider(
+        client,
+        clock=clock,
+        timeout=timeout.total_seconds(),
+        stale_after=_seconds(environ, GMGN_STALE_AFTER_ENV, 900),
+    )
+    return provider, client
 
 
 async def run_worker() -> None:

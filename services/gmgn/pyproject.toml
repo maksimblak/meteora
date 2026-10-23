@@ -1,0 +1,55 @@
+[project]
+name = "gmgn-signals-service"
+version = "0.1.0"
+description = "Internal service: GMGN token-page metrics read by a real headless browser (G18)"
+requires-python = ">=3.12,<3.13"
+# The official Playwright for Python, pinned to the version of the base image in
+# Dockerfile.gmgn (its bundled Chromium); the HTTP stack is the main project's.
+dependencies = [
+    "fastapi>=0.115,<0.300",
+    "playwright==1.63.0",
+    "pydantic>=2.10,<3",
+    "uvicorn>=0.34,<1",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28,<1",
+    "mypy>=1.15,<2",
+    "pytest>=8.3,<10",
+    "ruff>=0.11,<1",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+package = false
+# The same versions as the main project's uv.lock, so the service adds only Playwright.
+constraint-dependencies = [
+    "fastapi==0.143.5",
+    "httpx==0.28.1",
+    "mypy==1.20.2",
+    "pydantic==2.14.1",
+    "pytest==9.1.1",
+    "ruff==0.17.1",
+    "starlette==1.8.0",
+    "uvicorn==0.54.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["gmgn_service"]

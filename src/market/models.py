@@ -383,6 +383,60 @@ class PoolSnapshot(BaseModel):
         return self.observed_at - self.created_at
 
 
+_SHARE_FIELDS = (
+    "top10_holder_share",
+    "insiders_share",
+    "bundling_share",
+    "phishing_share",
+    "developer_share",
+)
+
+
+class EnhancedTokenSignals(BaseModel):
+    """Optional signals that are not available from vanilla Solana RPC.
+
+    ``holder_concentration`` is a top-10 share in the RPC sense (pool vaults and programs
+    excluded) that may replace an unknown RPC reading. The holder-structure shares of a
+    token page (GMGN, G18) are fractions in [0, 1] as the source reports them: its own
+    ``top10_holder_share``, ``insiders_share``, ``bundling_share``, ``phishing_share`` and
+    the developer's ``developer_share``. ``None`` = the source did not report it;
+    ``detail`` says why a reading is unavailable.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    blacklisted: RiskSignal = RiskSignal.UNKNOWN
+    verified: RiskSignal = RiskSignal.UNKNOWN
+    wash_trading: RiskSignal = RiskSignal.UNKNOWN
+    holder_concentration: Decimal | None = None
+    total_fees_sol: Decimal | None = None
+    top10_holder_share: Decimal | None = None
+    insiders_share: Decimal | None = None
+    bundling_share: Decimal | None = None
+    phishing_share: Decimal | None = None
+    developer_share: Decimal | None = None
+    missing_signals: tuple[str, ...] = ()
+    provider: str
+    source_at: datetime
+    freshness: Freshness
+    detail: str | None = None
+
+    _reject_binary_float = field_validator(
+        "holder_concentration", "total_fees_sol", *_SHARE_FIELDS, mode="before"
+    )(_exact_decimal)
+    _normalize_utc = field_validator("source_at")(_utc)
+
+    @model_validator(mode="after")
+    def validate_signals(self) -> "EnhancedTokenSignals":
+        for name in ("holder_concentration", *_SHARE_FIELDS):
+            value = getattr(self, name)
+            if value is not None and not Decimal(0) <= value <= Decimal(1):
+                raise ValueError(f"{name} must be a fraction in [0, 1]")
+        if self.total_fees_sol is not None and self.total_fees_sol < 0:
+            raise ValueError("total_fees_sol must not be negative")
+        return self
+
+
 class TokenRiskSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True)
 
@@ -406,6 +460,12 @@ class TokenRiskSnapshot(BaseModel):
     earliest_activity_at: datetime | None = None
     activity_history_complete: bool = False
     total_fees_sol: Decimal | None = None
+    # The enhanced provider's reading for this token as received (GMGN, G18), with its own
+    # ``source_at`` and freshness; ``None`` when no enhanced source was consulted.
+    enhanced: EnhancedTokenSignals | None = None
+    # D09: ``False`` when no on-chain source is configured at all (no RPC): every base
+    # signal is unknown by deployment, not by a failure, and the snapshot is UNAVAILABLE.
+    source_configured: bool = True
 
     _reject_binary_float = field_validator("holder_concentration", "total_fees_sol", mode="before")(
         _exact_decimal
@@ -446,30 +506,11 @@ class TokenRiskSnapshot(BaseModel):
             raise ValueError("unknown risk signals must be listed in missing_signals")
         if self.data_quality is DataQuality.COMPLETE and self.missing_signals:
             raise ValueError("complete token risk snapshot cannot have missing signals")
+        if not self.source_configured and self.data_quality is not DataQuality.UNAVAILABLE:
+            raise ValueError("a token without a configured source has no data")
         if self.source_at > self.observed_at or self.observed_at > self.ingested_at:
             raise ValueError("risk timestamps must be source <= observed <= ingested")
         return self
-
-
-class EnhancedTokenSignals(BaseModel):
-    """Optional signals that are not available from vanilla Solana RPC."""
-
-    model_config = ConfigDict(frozen=True, strict=True)
-
-    blacklisted: RiskSignal = RiskSignal.UNKNOWN
-    verified: RiskSignal = RiskSignal.UNKNOWN
-    wash_trading: RiskSignal = RiskSignal.UNKNOWN
-    holder_concentration: Decimal | None = None
-    total_fees_sol: Decimal | None = None
-    missing_signals: tuple[str, ...] = ()
-    provider: str
-    source_at: datetime
-    freshness: Freshness
-
-    _reject_binary_float = field_validator("holder_concentration", "total_fees_sol", mode="before")(
-        _exact_decimal
-    )
-    _normalize_utc = field_validator("source_at")(_utc)
 
 
 class WalletState(BaseModel):

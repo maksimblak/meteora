@@ -1,0 +1,26 @@
+{
+  "schema_version": "gmgn-signals.v1",
+  "chain": "sol",
+  "mint": "CSocnzcRpgSCr1naKcNTieWZUxb6rABe45j844m7pump",
+  "status": "UNAVAILABLE",
+  "reason": "ACCESS_BLOCKED",
+  "source_at": null,
+  "freshness": "STALE",
+  "signals": {
+    "top10_holder_share": null,
+    "insiders_share": null,
+    "bundling_share": null,
+    "phishing_share": null,
+    "developer_share": null,
+    "total_fees_sol": null
+  },
+  "missing": [
+    "top10_holder_share",
+    "insiders_share",
+    "bundling_share",
+    "phishing_share",
+    "developer_share",
+    "total_fees_sol"
+  ],
+  "sources": []
+}

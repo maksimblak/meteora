@@ -1,0 +1,132 @@
+{
+ "recorded_at": "2026-10-23T17:31:00+00:00",
+ "source": "https://gmgn.ai/sol/token/EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm (public page; query identifiers removed, unrelated fields trimmed)",
+ "responses": [
+  {
+   "method": "GET",
+   "path": "/api/v1/gas_price_list",
+   "status": 200,
+   "body": {
+    "code": 0,
+    "reason": "",
+    "message": "success",
+    "data": {
+     "note": "trimmed: unrelated to the token metrics"
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/token_pool_fee_info/sol/EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+   "status": 200,
+   "body": {
+    "code": 0,
+    "reason": "",
+    "message": "success",
+    "data": {
+     "list": [
+      {
+       "address": "EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx",
+       "exchange": "Ray V2",
+       "liquidity": 5717953.888765758,
+       "fee_ratio": 0,
+       "is_dynamic_fee": false,
+       "pool_type": "ray_v2"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/mutil_window_token_info",
+   "status": 200,
+   "body": {
+    "code": 0,
+    "reason": "",
+    "message": "success",
+    "data": [
+     {
+      "address": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+      "symbol": "$WIF",
+      "name": "dogwifhat",
+      "decimals": 6,
+      "holder_count": 537199,
+      "creation_timestamp": 1700508163,
+      "liquidity": "5717953.888765758",
+      "price": {
+       "price": "0.19726465",
+       "volume_24h": "190527.36517163",
+       "swaps_24h": 989
+      },
+      "priority_fee": "378.1721380380055",
+      "tip_fee": "505.4437192495989",
+      "trade_fee": "338.80915518658685",
+      "total_fee": "1222.4250124741914",
+      "dev": {
+       "address": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+       "creator_address": "",
+       "creator_token_balance": "0",
+       "creator_token_status": "creator_close",
+       "top_10_holder_rate": "0.3217"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/token_stat/sol/EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+   "status": 200,
+   "body": {
+    "code": 0,
+    "reason": "",
+    "message": "success",
+    "data": {
+     "holder_count": 537199,
+     "bluechip_owner_count": 0,
+     "bluechip_owner_percentage": "0",
+     "signal_count": 0,
+     "degen_call_count": 0,
+     "top_rat_trader_percentage": "0.0001",
+     "top_bundler_trader_percentage": "0.0028",
+     "top_entrapment_trader_percentage": "0.738",
+     "top_bot_degen_percentage": "0.0002",
+     "creator_created_count": 0,
+     "bot_degen_count": 14,
+     "bot_degen_rate": "0.0002",
+     "fresh_wallet_rate": "0.0002",
+     "top_10_holder_rate": "0.3217",
+     "dev_team_hold_rate": "0",
+     "creator_hold_rate": "0",
+     "creator_token_balance": "0",
+     "private_vault_hold_rate": "0",
+     "top70_sniper_hold_rate": "0.0000000125"
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/vas/api/v1/token_holder_stat/sol/EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+   "status": 200,
+   "body": {
+    "code": 0,
+    "reason": "",
+    "message": "success",
+    "data": {
+     "smart_degen_count": 133,
+     "renowned_count": 1000,
+     "fresh_wallet_count": 1000,
+     "dex_bot_count": 1000,
+     "insider_count": 0,
+     "following_count": 0,
+     "dev_count": 0,
+     "bluechip_owner_count": 1000,
+     "bundler_count": 1000,
+     "sniper_count": 160,
+     "fomo_count": 1000
+    }
+   }
+  }
+ ]
+}
