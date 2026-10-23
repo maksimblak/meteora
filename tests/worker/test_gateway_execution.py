@@ -1,8 +1,10 @@
 """APPROVAL / LIVE through the worker: durable approved entries, gateway exits, fail-closed.
 
-The executor is an in-process fake with its own durable receipts (it survives a
-worker restart, as the real executor's state file does); nothing reaches a network.
-A "restart" is a new ``WorkerRuntime`` over the same durable repositories.
+The executor is an in-process fake of contract V2 with its own durable receipts (it
+survives a worker restart, as the real executor's state file does): like the real one
+it creates the position of every OPEN it simulates and names it in the receipt, and it
+reports the pool's active bin and mint decimals. Nothing reaches a network. A
+"restart" is a new ``WorkerRuntime`` over the same durable repositories.
 """
 
 import asyncio
@@ -17,20 +19,24 @@ import pytest
 from prometheus_client import CollectorRegistry
 
 from src.core.clock import FrozenClock
+from src.domain.models.events import EventType
 from src.domain.models.trading import TradingMode
 from src.domain.strategy import PositionActionKind
 from src.execution.contracts import (
     ChainReceiptV1,
     ChainState,
+    DlmmCommand,
     DlmmCommandV1,
+    DlmmCommandV2,
     DlmmOperation,
     ExecutionPhase,
-    GatewayReceiptV1,
+    GatewayReceiptV2,
     GatewayState,
     LivePromotionEvidence,
     OperatorApproval,
-    SimulationResultV1,
-    bind_simulation_result,
+    SimulationErrorV1,
+    SimulationResultV2,
+    bind_simulation_result_v2,
     canonical_command_digest,
 )
 from src.execution.service import (
@@ -47,14 +53,18 @@ from src.persistence.factory import Repositories
 from src.persistence.memory import InMemoryEventSink
 from src.portfolio.models import PositionStatus
 from src.providers.fixtures import FixtureOnChainProvider
+from src.recovery.service import RecoveryAction
 from src.worker.execution import (
+    ACTIVE_BIN_TOLERANCE,
     AnchorSource,
     BinAnchor,
     EntryCommandUnavailable,
     PositionActionStatus,
     build_entry_command,
     entry_idempotency_key,
+    entry_position_address,
     position_action_command_id,
+    shadow_address,
     snapshot_anchor,
 )
 from src.worker.policy import PipelinePolicy
@@ -75,42 +85,78 @@ ANCHOR = BinAnchor(active_bin_id=8_000, base_decimals=6, quote_decimals=6)
 
 
 class FakeExecutor:
-    """The TS executor's contract in-process: idempotent by key, receipts kept durably."""
+    """The TS executor's contract V2 in-process: idempotent by key, receipts kept durably."""
 
     def __init__(self, clock: FrozenClock) -> None:
         self.clock = clock
-        self.simulated: list[tuple[DlmmCommandV1, SimulationResultV1]] = []
-        self.submitted: list[DlmmCommandV1] = []
-        self.receipts: dict[UUID, GatewayReceiptV1] = {}
+        self.simulated: list[tuple[DlmmCommand, SimulationResultV2]] = []
+        self.submitted: list[DlmmCommand] = []
+        self.receipts: dict[UUID, GatewayReceiptV2] = {}
         self.submit_behavior = "confirm"
         self.reachable = True
         # (transaction_count, broadcast signatures) of a FAILED receipt, or None.
         self.failed_shape: tuple[int, int] | None = None
+        # Bins the pool moved since the command's anchor was observed.
+        self.active_bin_drift = 0
+        self.created_positions: list[str] = []
+        # Executor error code of a refused simulation, per operation.
+        self.simulation_failures: dict[DlmmOperation, str] = {}
+        # Quoted price impact of the swap leg, per operation (default 5 bps).
+        self.price_impacts: dict[DlmmOperation, int | None] = {}
 
-    async def simulate(self, command: DlmmCommandV1) -> SimulationResultV1:
+    async def simulate(self, command: DlmmCommand) -> SimulationResultV2:
         if not self.reachable:
             raise GatewayRejected("EXECUTOR_UNREACHABLE")
-        simulation = bind_simulation_result(
+        assert isinstance(command, DlmmCommandV2), "the executor speaks contract V2 only"
+        anchor = command.active_bin_id
+        active = None if anchor is None else anchor + self.active_bin_drift
+        failure = self.simulation_failures.get(command.operation)
+        if (
+            active is not None
+            and command.active_bin_tolerance is not None
+            and anchor is not None
+            and abs(active - anchor) > command.active_bin_tolerance
+        ):
+            failure = "ACTIVE_BIN_DRIFT"
+        drifted = failure is not None
+        if command.operation is DlmmOperation.OPEN and not drifted:
+            # Like the real executor: a fresh key per simulated OPEN, only its address leaves.
+            position: str | None = shadow_address(f"executor-key:{len(self.simulated)}")
+            assert position is not None
+            self.created_positions.append(position)
+        elif drifted:
+            position = None
+        else:
+            position = command.position_address
+        simulation = bind_simulation_result_v2(
             command_id=command.command_id,
             command_digest=canonical_command_digest(command),
-            success=True,
+            success=not drifted,
             simulated_at=self.clock.now(),
-            blockhash="blockhash",
-            last_valid_block_height=1,
+            blockhash="blockhash" if not drifted else None,
+            last_valid_block_height=1 if not drifted else None,
             compute_units=1,
             network_fee_lamports="5000",
             priority_fee_lamports="0",
-            price_impact_bps=5,
+            price_impact_bps=self.price_impacts.get(command.operation, 5),
             min_bin_id=command.min_bin_id,
             max_bin_id=command.max_bin_id,
-            errors=(),
+            position_address=position,
+            active_bin_id=active if active is not None else 8_000,
+            token_x_decimals=6 if command.token_x_decimals is None else command.token_x_decimals,
+            token_y_decimals=6 if command.token_y_decimals is None else command.token_y_decimals,
+            errors=(
+                (SimulationErrorV1(code=failure, message="the executor refused the command"),)
+                if failure is not None
+                else ()
+            ),
         )
         self.simulated.append((command, simulation))
         return simulation
 
     async def submit(
-        self, command: DlmmCommandV1, idempotency_key: str, approval: OperatorApproval | None
-    ) -> GatewayReceiptV1:
+        self, command: DlmmCommand, idempotency_key: str, approval: OperatorApproval | None
+    ) -> GatewayReceiptV2:
         if not self.reachable:
             raise GatewayRejected("EXECUTOR_UNREACHABLE")
         if self.submit_behavior == "reject":
@@ -123,12 +169,14 @@ class FakeExecutor:
             self.submitted.append(command)
             count, signed = (1, 1) if self.failed_shape is None else self.failed_shape
             signatures = tuple(f"sig-{len(self.submitted)}-{n}" for n in range(signed))
-            receipt = GatewayReceiptV1(
+            assert simulation.position_address is not None
+            receipt = GatewayReceiptV2(
                 command_id=command.command_id,
                 command_digest=simulation.command_digest,
                 simulation_digest=simulation.simulation_digest,
                 idempotency_key=idempotency_key,
                 state=GatewayState.CONFIRMED if self.failed_shape is None else GatewayState.FAILED,
+                position_address=simulation.position_address,
                 signature=signatures[-1] if signatures else None,
                 signatures=signatures,
                 transaction_count=count,
@@ -140,9 +188,12 @@ class FakeExecutor:
             raise TimeoutError("the answer was lost after the broadcast")
         if self.submit_behavior == "mismatch":
             return receipt.model_copy(update={"simulation_digest": "f" * 64})
+        if self.submit_behavior == "submitted":
+            # Broadcast and later confirmed on chain; the first answer only says SUBMITTED.
+            return receipt.model_copy(update={"state": GatewayState.SUBMITTED})
         return receipt
 
-    async def lookup(self, command_id: UUID) -> GatewayReceiptV1 | None:
+    async def lookup(self, command_id: UUID) -> GatewayReceiptV2 | None:
         return self.receipts.get(command_id)
 
     async def status(self, signature: str) -> ChainReceiptV1:
@@ -372,8 +423,9 @@ def test_an_approved_entry_executes_exactly_once_after_restarts() -> None:
     repos = third.repositories
     assert [command.command_id for command in executor.submitted] == [record.command.command_id]
     assert plan_status(repos, plan_id) is PendingPlanStatus.OPENED
-    assert repos.mode.open_positions() == (record.command.position_address,)
-    booked = repos.accounting.position_for(record.command.position_address)
+    (position_id,) = executor.created_positions
+    assert repos.mode.open_positions() == (position_id,)
+    booked = repos.accounting.position_for(position_id)
     assert booked is not None and booked.mode is TradingMode.APPROVAL
 
 
@@ -599,10 +651,10 @@ def test_an_approval_mode_exit_waits_for_its_own_one_shot_approval() -> None:
     entry = asyncio.run(first.repositories.execution.get_by_idempotency_key(
         entry_idempotency_key(plan_id)
     ))
-    assert entry is not None and entry.command.position_address is not None
+    assert entry is not None and entry.command.position_address is None
     approve(first, entry.command.command_id, timedelta(seconds=60))
     run_job(first, "candidate")
-    position_id = entry.command.position_address
+    (position_id,) = executor.created_positions
     assert isinstance(first.clock, FrozenClock)
     decay(first, first.clock)
 
@@ -642,12 +694,18 @@ def test_kill_switch_policy_decides_whether_a_live_position_exits(
 # --- a non-SHADOW entry never sends a relative bin offset ----------------------------------
 
 
-def _entry(mode: TradingMode, anchor: BinAnchor | None) -> DlmmCommandV1:
+def _entry(
+    mode: TradingMode,
+    anchor: BinAnchor | None,
+    *,
+    price: str = "2",
+    size: int = 1_000,
+) -> DlmmCommand:
     return build_entry_command(
         plan_id=UUID(int=3),
         mode=mode,
-        market=snapshot(NOW, price="2"),
-        size_base_units=1_000,
+        market=snapshot(NOW, price=price),
+        size_base_units=size,
         strategy_kind="SPOT",
         lower_bin_offset=-5,
         upper_bin_offset=5,
@@ -655,7 +713,6 @@ def _entry(mode: TradingMode, anchor: BinAnchor | None) -> DlmmCommandV1:
         correlation_id="cycle",
         ruleset_version="rules-1",
         wallet_address="SysvarC1ock11111111111111111111111111111111",
-        position_address="11111111111111111111111111111111",
         max_slippage_bps=100,
         anchor=anchor,
     )
@@ -667,39 +724,59 @@ def test_a_gateway_entry_without_active_bin_and_decimals_is_refused(mode: Tradin
         _entry(mode, None)
 
 
-def test_a_gateway_entry_uses_absolute_bins_and_token_base_units() -> None:
+def test_a_gateway_entry_is_a_v2_command_without_a_position_and_with_its_anchor() -> None:
     anchor = BinAnchor(active_bin_id=5_000, base_decimals=9, quote_decimals=6)
     command = _entry(TradingMode.LIVE, anchor)
 
+    assert isinstance(command, DlmmCommandV2)
+    assert command.position_address is None
     # 1000 quote units: 500 stay Y; 500 / price 2 = 250 X tokens = 250 * 10^9 / 10^6 base units.
     assert (command.min_bin_id, command.max_bin_id) == (4_995, 5_005)
     assert (command.amount_x, command.amount_y) == ("250000", "500")
+    assert (command.active_bin_id, command.active_bin_tolerance) == (5_000, ACTIVE_BIN_TOLERANCE)
+    assert (command.token_x_decimals, command.token_y_decimals) == (9, 6)
+
+
+@pytest.mark.parametrize(
+    ("anchor", "price", "size", "amount_x"),
+    [
+        # X has 3 more decimals than Y: whole accounting units only, 501/7 -> 71 -> 71 * 10^3.
+        (BinAnchor(active_bin_id=1, base_decimals=9, quote_decimals=6), "7", 1_001, "71000"),
+        # Y (SOL) has 3 more decimals than X: 0.5 SOL / 0.002 SOL = 250 tokens of 6 decimals.
+        (
+            BinAnchor(active_bin_id=1, base_decimals=6, quote_decimals=9),
+            "0.002",
+            1_000_000_000,
+            "250000000",
+        ),
+    ],
+    ids=["x-finer-than-y", "y-finer-than-x"],
+)
+def test_entry_amounts_are_exact_in_both_token_scales(
+    anchor: BinAnchor, price: str, size: int, amount_x: str
+) -> None:
+    command = _entry(TradingMode.LIVE, anchor, price=price, size=size)
+
+    assert command.amount_x == amount_x
 
 
 def test_shadow_entries_keep_the_relative_bins_of_the_shadow_model() -> None:
     command = _entry(TradingMode.SHADOW, None)
 
+    assert isinstance(command, DlmmCommandV1)
+    assert command.position_address == entry_position_address(UUID(int=3))
     assert (command.min_bin_id, command.max_bin_id) == (-5, 5)
     assert (command.amount_x, command.amount_y) == ("250", "500")
 
 
-@pytest.mark.parametrize(
-    ("anchors", "reason"),
-    [
-        (snapshot_anchor, "ENTRY_ANCHOR_UNAVAILABLE"),
-        (lambda market: BinAnchor(8_000, 9, 6), "ACCOUNTING_UNITS_UNSUPPORTED"),
-    ],
-    ids=["no-anchor-in-snapshot", "unequal-decimals"],
-)
-def test_the_worker_cancels_a_gateway_entry_it_cannot_express_safely(
-    anchors: AnchorSource, reason: str
-) -> None:
+def test_the_worker_cancels_a_gateway_entry_it_cannot_express_safely() -> None:
     clock = FrozenClock(NOW)
     repos = memory_repositories(clock)
     executor = FakeExecutor(clock)
     promote(repos, TradingMode.LIVE)
     ingest(repos, *spike_history())
-    runtime = worker(repos, clock, executor, TradingMode.LIVE, anchors=anchors)
+    runtime = worker(repos, clock, executor, TradingMode.LIVE, anchors=snapshot_anchor)
+    reason = "ENTRY_ANCHOR_UNAVAILABLE"
 
     async def evaluate() -> Any:
         runtime.keeper.ensure_open()
@@ -722,3 +799,208 @@ def test_the_booked_live_entry_matches_the_sized_capital() -> None:
     assert position is not None and context is not None
     assert (context.min_bin_id, context.max_bin_id) != (-5, 5)
     assert position.open_cost_basis_base_units > Decimal(0)
+
+
+# --- contract V2: the executor creates the position, Python only reads it from the receipt ---
+
+
+def test_a_live_entry_opens_the_position_the_executor_created_never_a_derived_one() -> None:
+    runtime, executor, _ = live_world()
+
+    position_id = open_live_position(runtime)
+
+    repos = runtime.repositories
+    (plan,) = repos.mode.entry_plans()
+    (created,) = executor.created_positions
+    entry_command, _ = executor.simulated[0]
+    record = asyncio.run(
+        repos.execution.get_by_idempotency_key(entry_idempotency_key(plan.plan_id))
+    )
+    assert record is not None and isinstance(record.receipt, GatewayReceiptV2)
+    assert position_id == created == record.receipt.position_address == plan.position_id
+    assert position_id != entry_position_address(plan.plan_id)
+    assert isinstance(entry_command, DlmmCommandV2) and entry_command.position_address is None
+    assert asyncio.run(repos.positions.get(created)) is not None
+    assert repos.accounting.position_for(created) is not None
+
+
+def test_an_entry_with_different_token_decimals_opens_and_is_booked_in_quote_units() -> None:
+    clock = FrozenClock(NOW)
+    repos = memory_repositories(clock)
+    executor = FakeExecutor(clock)
+    promote(repos, TradingMode.LIVE)
+    ingest(repos, *spike_history())
+    anchor = BinAnchor(active_bin_id=8_000, base_decimals=6, quote_decimals=9)
+    runtime = worker(repos, clock, executor, TradingMode.LIVE, anchors=lambda market: anchor)
+
+    position_id = open_live_position(runtime)
+
+    command, simulation = executor.simulated[0]
+    assert isinstance(command, DlmmCommandV2) and command.amount_x and command.amount_y
+    assert (simulation.token_x_decimals, simulation.token_y_decimals) == (6, 9)
+    position = repos.accounting.position_for(position_id)
+    assert position is not None
+    (tranche,) = position.tranches
+    # X is booked in Y's scale (10^(9-6) per X base unit) at the entry price 1, plus Y.
+    assert tranche.quantity_x == Decimal(command.amount_x) * 1_000
+    assert position.open_cost_basis_base_units == (
+        Decimal(command.amount_x) * 1_000 + Decimal(command.amount_y)
+    )
+
+
+def test_a_pool_that_moved_beyond_the_tolerance_fails_the_entry_without_a_submit() -> None:
+    runtime, executor, clock = live_world()
+    executor.active_bin_drift = ACTIVE_BIN_TOLERANCE + 1
+
+    run_job(runtime, "candidate")
+
+    repos = runtime.repositories
+    (plan,) = repos.mode.entry_plans()
+    assert plan.status is PendingPlanStatus.FAILED
+    assert executor.submitted == [] and executor.created_positions == []
+    assert repos.mode.committed_entry_count(clock.now()) == 0
+
+
+def test_the_position_context_is_durable_before_the_operator_approves() -> None:
+    first, executor, plan_id = approval_world()
+
+    (created,) = executor.created_positions
+    context = asyncio.run(first.repositories.positions.get(created))
+
+    assert context is not None and context.plan_id == plan_id
+    assert executor.submitted == []
+
+
+def test_restart_recovery_confirms_a_v2_entry_by_its_receipt_without_an_operator_alert() -> None:
+    runtime, executor, _ = live_world()
+    executor.submit_behavior = "submitted"
+    run_job(runtime, "candidate")
+    plan_id = executing_plan(runtime.repositories)
+    executor.submit_behavior = "confirm"
+
+    assert isinstance(runtime.clock, FrozenClock)
+    again = worker(runtime.repositories, runtime.clock, executor, TradingMode.LIVE)
+    report = asyncio.run(again.recovery.reconcile(startup=True))
+
+    repos = again.repositories
+    (created,) = executor.created_positions
+    assert {item.plan_id: item.action for item in report.entries} == {
+        plan_id: RecoveryAction.CONFIRMED_ENTRY
+    }
+    assert report.operator_required == ()
+    assert repos.mode.open_positions() == (created,)
+    assert "EXECUTION_RECOVERY_REQUIRED" not in {
+        alert.code for alert in repos.mode.alerts() if alert.open
+    }
+    assert len(executor.submitted) == 1
+
+
+# --- review: settlement of reconciled entries, executor error codes, exits not gated ---------
+
+
+def test_the_settler_confirms_a_v2_entry_reconciled_to_confirmed_before_it_ran() -> None:
+    runtime, executor, _ = live_world()
+    executor.submit_behavior = "submitted"
+    run_job(runtime, "candidate")
+    repos = runtime.repositories
+    plan_id = executing_plan(repos)
+    key = entry_idempotency_key(plan_id)
+    executor.submit_behavior = "confirm"
+    # What the periodic recovery job's network pass does while the plan is KEPT_EXECUTING.
+    record = asyncio.run(repos.execution.get_by_idempotency_key(key))
+    assert record is not None and runtime.execution is not None
+    asyncio.run(runtime.execution.reconcile(record.command.command_id))
+    assert record_phase(repos, key) is ExecutionPhase.CONFIRMED
+
+    run_job(runtime, "candidate")
+
+    (created,) = executor.created_positions
+    assert plan_status(repos, plan_id) is PendingPlanStatus.OPENED
+    assert repos.mode.open_positions() == (created,)
+    assert repos.accounting.position_for(created) is not None
+
+
+def test_the_executor_code_of_a_refused_entry_is_the_entry_reason() -> None:
+    clock = FrozenClock(NOW)
+    repos = memory_repositories(clock)
+    executor = FakeExecutor(clock)
+    executor.simulation_failures[DlmmOperation.OPEN] = "INSUFFICIENT_FUNDS"
+    promote(repos, TradingMode.LIVE)
+    ingest(repos, *spike_history())
+    runtime = worker(repos, clock, executor, TradingMode.LIVE)
+
+    async def evaluate() -> Any:
+        runtime.keeper.ensure_open()
+        return await runtime.pipeline.evaluate(POOL.address.root, NOW)
+
+    outcome = asyncio.run(evaluate())
+
+    assert outcome.entry is not None and outcome.entry.reason == "INSUFFICIENT_FUNDS"
+    assert plan_status(repos, outcome.plan_id) is PendingPlanStatus.FAILED
+    assert executor.submitted == []
+
+
+def test_the_executor_code_of_a_refused_exit_reaches_the_operator_alert() -> None:
+    runtime, executor, _ = live_world()
+    position_id = open_live_position(runtime)
+    manager = runtime.gateway_positions
+    assert manager is not None
+    executor.simulation_failures[DlmmOperation.CLOSE] = "TRANSACTION_SIMULATION_FAILED"
+
+    (result,) = asyncio.run(manager.apply({position_id: PositionActionKind.EXIT}))
+
+    assert (result.status, result.detail) == (
+        PositionActionStatus.FAILED,
+        "TRANSACTION_SIMULATION_FAILED",
+    )
+    (alert,) = [a for a in runtime.repositories.mode.alerts() if a.code == "POSITION_ACTION_FAILED"]
+    assert "TRANSACTION_SIMULATION_FAILED" in alert.message
+
+
+def test_an_exit_from_a_thin_pool_leaves_and_its_quoted_impact_is_recorded() -> None:
+    runtime, executor, clock = live_world()
+    position_id = open_live_position(runtime)
+    # Far above the entry limit: the exit swaps nothing, so it is not stopped.
+    executor.price_impacts[DlmmOperation.CLOSE] = 9_000
+    decay(runtime, clock)
+
+    run_job(runtime, "position")
+
+    repos = runtime.repositories
+    assert executor.operations() == [DlmmOperation.OPEN, DlmmOperation.CLOSE]
+    assert repos.mode.open_positions() == ()
+    close = asyncio.run(repos.execution.get(position_action_command_id(position_id, 1)))
+    assert close is not None and close.simulation.price_impact_bps == 9_000
+    confirmed = [
+        event.payload
+        for event in repos.accounting.outbox_events()
+        if event.event_type is EventType.COMMAND_CONFIRMED
+        and event.payload.get("operation") == DlmmOperation.CLOSE.value
+    ]
+    assert [payload["price_impact_bps"] for payload in confirmed] == [9_000]
+
+
+def test_an_exit_whose_swap_cannot_be_quoted_still_leaves() -> None:
+    runtime, executor, clock = live_world()
+    open_live_position(runtime)
+    executor.price_impacts[DlmmOperation.CLOSE] = None
+    decay(runtime, clock)
+
+    run_job(runtime, "position")
+
+    assert executor.operations() == [DlmmOperation.OPEN, DlmmOperation.CLOSE]
+    assert runtime.repositories.mode.open_positions() == ()
+
+
+def test_an_entry_is_still_refused_above_the_price_impact_limit() -> None:
+    runtime, executor, _ = live_world()
+    executor.price_impacts[DlmmOperation.OPEN] = 9_000
+
+    async def evaluate() -> Any:
+        runtime.keeper.ensure_open()
+        return await runtime.pipeline.evaluate(POOL.address.root, NOW)
+
+    outcome = asyncio.run(evaluate())
+
+    assert outcome.entry is not None and outcome.entry.reason == "SLIPPAGE_BREACH"
+    assert executor.submitted == []

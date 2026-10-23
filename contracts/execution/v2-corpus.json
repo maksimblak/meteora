@@ -1,0 +1,604 @@
+{
+  "valid_commands": [
+    {
+      "schema_version": 2,
+      "command_id": "10000000-0000-4000-8000-000000000201",
+      "idempotency_key": "entry:plan-201",
+      "correlation_id": "20000000-0000-4000-8000-000000000201",
+      "ruleset_version": "guide-v1",
+      "mode": "APPROVAL",
+      "operation": "OPEN",
+      "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+      "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+      "expires_at": "2030-01-02T03:04:05Z",
+      "max_slippage_bps": 50,
+      "strategy": "BID_ASK",
+      "min_bin_id": 7990,
+      "max_bin_id": 8005,
+      "amount_x": "250000000",
+      "amount_y": "500000000",
+      "active_bin_id": 8000,
+      "active_bin_tolerance": 3,
+      "token_x_decimals": 6,
+      "token_y_decimals": 9
+    },
+    {
+      "schema_version": 2,
+      "command_id": "10000000-0000-4000-8000-000000000202",
+      "idempotency_key": "add:plan-202",
+      "correlation_id": "20000000-0000-4000-8000-000000000202",
+      "ruleset_version": "guide-v1",
+      "mode": "APPROVAL",
+      "operation": "ADD",
+      "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+      "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+      "position_address": "SysvarRent111111111111111111111111111111111",
+      "expires_at": "2030-01-02T03:04:05Z",
+      "max_slippage_bps": 50,
+      "strategy": "SPOT",
+      "min_bin_id": -4,
+      "max_bin_id": 7,
+      "amount_x": "100",
+      "amount_y": "200",
+      "active_bin_id": 1,
+      "active_bin_tolerance": 0,
+      "token_x_decimals": 9,
+      "token_y_decimals": 9
+    },
+    {
+      "schema_version": 2,
+      "command_id": "10000000-0000-4000-8000-000000000203",
+      "idempotency_key": "position-action:SysvarRent111111111111111111111111111111111:1",
+      "correlation_id": "20000000-0000-4000-8000-000000000203",
+      "ruleset_version": "guide-v1",
+      "mode": "LIVE",
+      "operation": "REMOVE",
+      "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+      "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+      "position_address": "SysvarRent111111111111111111111111111111111",
+      "expires_at": "2030-01-02T03:04:05Z",
+      "max_slippage_bps": 75,
+      "min_bin_id": 7990,
+      "max_bin_id": 8005,
+      "remove_bps": 5000
+    },
+    {
+      "schema_version": 2,
+      "command_id": "10000000-0000-4000-8000-000000000204",
+      "idempotency_key": "position-action:SysvarRent111111111111111111111111111111111:2",
+      "correlation_id": "20000000-0000-4000-8000-000000000204",
+      "ruleset_version": "guide-v1",
+      "mode": "LIVE",
+      "operation": "CLOSE",
+      "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+      "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+      "position_address": "SysvarRent111111111111111111111111111111111",
+      "expires_at": "2030-01-02T03:04:05+00:00",
+      "max_slippage_bps": 75,
+      "min_bin_id": 7990,
+      "max_bin_id": 8005,
+      "remove_bps": 10000
+    }
+  ],
+  "canonical_command_digests": [
+    "2f46c6cee7e19457802a40f3cc9b82aa2bcc63f59bd9235ef166ddde28e5f61f",
+    "b8919681f7181a1ee961240f29edc28263bad5ae8f013a2e2e6bb234a91a7835",
+    "7ab3cad8545017c153d161b8bb5f44ff86d5449b85826bb482282e960d8f7388",
+    "a9b065c113672e3c216420734475775fbab10ab6ea455cd092dc39c5c9416b1a"
+  ],
+  "invalid_commands": [
+    {
+      "case": "unknown command version",
+      "payload": {
+        "schema_version": 3,
+        "command_id": "10000000-0000-4000-8000-000000000201"
+      }
+    },
+    {
+      "case": "open with a caller-assigned position",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000201",
+        "idempotency_key": "entry:plan-201",
+        "correlation_id": "20000000-0000-4000-8000-000000000201",
+        "ruleset_version": "guide-v1",
+        "mode": "APPROVAL",
+        "operation": "OPEN",
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+        "position_address": "SysvarRent111111111111111111111111111111111",
+        "expires_at": "2030-01-02T03:04:05Z",
+        "max_slippage_bps": 50,
+        "strategy": "BID_ASK",
+        "min_bin_id": 7990,
+        "max_bin_id": 8005,
+        "amount_x": "250000000",
+        "amount_y": "500000000",
+        "active_bin_id": 8000,
+        "active_bin_tolerance": 3,
+        "token_x_decimals": 6,
+        "token_y_decimals": 9
+      }
+    },
+    {
+      "case": "open without the active bin anchor",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000201",
+        "idempotency_key": "entry:plan-201",
+        "correlation_id": "20000000-0000-4000-8000-000000000201",
+        "ruleset_version": "guide-v1",
+        "mode": "APPROVAL",
+        "operation": "OPEN",
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+        "expires_at": "2030-01-02T03:04:05Z",
+        "max_slippage_bps": 50,
+        "strategy": "BID_ASK",
+        "min_bin_id": 7990,
+        "max_bin_id": 8005,
+        "amount_x": "250000000",
+        "amount_y": "500000000",
+        "active_bin_tolerance": 3,
+        "token_x_decimals": 6,
+        "token_y_decimals": 9
+      }
+    },
+    {
+      "case": "open without token decimals",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000201",
+        "idempotency_key": "entry:plan-201",
+        "correlation_id": "20000000-0000-4000-8000-000000000201",
+        "ruleset_version": "guide-v1",
+        "mode": "APPROVAL",
+        "operation": "OPEN",
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+        "expires_at": "2030-01-02T03:04:05Z",
+        "max_slippage_bps": 50,
+        "strategy": "BID_ASK",
+        "min_bin_id": 7990,
+        "max_bin_id": 8005,
+        "amount_x": "250000000",
+        "amount_y": "500000000",
+        "active_bin_id": 8000,
+        "active_bin_tolerance": 3
+      }
+    },
+    {
+      "case": "add without a position",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000202",
+        "idempotency_key": "add:plan-202",
+        "correlation_id": "20000000-0000-4000-8000-000000000202",
+        "ruleset_version": "guide-v1",
+        "mode": "APPROVAL",
+        "operation": "ADD",
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+        "expires_at": "2030-01-02T03:04:05Z",
+        "max_slippage_bps": 50,
+        "strategy": "SPOT",
+        "min_bin_id": -4,
+        "max_bin_id": 7,
+        "amount_x": "100",
+        "amount_y": "200",
+        "active_bin_id": 1,
+        "active_bin_tolerance": 0,
+        "token_x_decimals": 9,
+        "token_y_decimals": 9
+      }
+    },
+    {
+      "case": "removal with an entry anchor",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000203",
+        "idempotency_key": "position-action:SysvarRent111111111111111111111111111111111:1",
+        "correlation_id": "20000000-0000-4000-8000-000000000203",
+        "ruleset_version": "guide-v1",
+        "mode": "LIVE",
+        "operation": "REMOVE",
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+        "position_address": "SysvarRent111111111111111111111111111111111",
+        "expires_at": "2030-01-02T03:04:05Z",
+        "max_slippage_bps": 75,
+        "min_bin_id": 7990,
+        "max_bin_id": 8005,
+        "remove_bps": 5000,
+        "active_bin_id": 8000
+      }
+    },
+    {
+      "case": "negative active bin tolerance",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000202",
+        "idempotency_key": "add:plan-202",
+        "correlation_id": "20000000-0000-4000-8000-000000000202",
+        "ruleset_version": "guide-v1",
+        "mode": "APPROVAL",
+        "operation": "ADD",
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+        "position_address": "SysvarRent111111111111111111111111111111111",
+        "expires_at": "2030-01-02T03:04:05Z",
+        "max_slippage_bps": 50,
+        "strategy": "SPOT",
+        "min_bin_id": -4,
+        "max_bin_id": 7,
+        "amount_x": "100",
+        "amount_y": "200",
+        "active_bin_id": 1,
+        "active_bin_tolerance": -1,
+        "token_x_decimals": 9,
+        "token_y_decimals": 9
+      }
+    },
+    {
+      "case": "token decimals outside u8",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000202",
+        "idempotency_key": "add:plan-202",
+        "correlation_id": "20000000-0000-4000-8000-000000000202",
+        "ruleset_version": "guide-v1",
+        "mode": "APPROVAL",
+        "operation": "ADD",
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+        "position_address": "SysvarRent111111111111111111111111111111111",
+        "expires_at": "2030-01-02T03:04:05Z",
+        "max_slippage_bps": 50,
+        "strategy": "SPOT",
+        "min_bin_id": -4,
+        "max_bin_id": 7,
+        "amount_x": "100",
+        "amount_y": "200",
+        "active_bin_id": 1,
+        "active_bin_tolerance": 0,
+        "token_x_decimals": 256,
+        "token_y_decimals": 9
+      }
+    },
+    {
+      "case": "float base units",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000202",
+        "idempotency_key": "add:plan-202",
+        "correlation_id": "20000000-0000-4000-8000-000000000202",
+        "ruleset_version": "guide-v1",
+        "mode": "APPROVAL",
+        "operation": "ADD",
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "wallet_address": "SysvarC1ock11111111111111111111111111111111",
+        "position_address": "SysvarRent111111111111111111111111111111111",
+        "expires_at": "2030-01-02T03:04:05Z",
+        "max_slippage_bps": 50,
+        "strategy": "SPOT",
+        "min_bin_id": -4,
+        "max_bin_id": 7,
+        "amount_x": 1.25,
+        "amount_y": "200",
+        "active_bin_id": 1,
+        "active_bin_tolerance": 0,
+        "token_x_decimals": 9,
+        "token_y_decimals": 9
+      }
+    }
+  ],
+  "valid_simulations": [
+    {
+      "schema_version": 2,
+      "command_id": "10000000-0000-4000-8000-000000000201",
+      "command_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "simulation_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "success": true,
+      "simulated_at": "2030-01-02T03:00:00Z",
+      "blockhash": "safe-blockhash",
+      "last_valid_block_height": 123456,
+      "compute_units": 210000,
+      "network_fee_lamports": "10000",
+      "priority_fee_lamports": "0",
+      "price_impact_bps": 12,
+      "min_bin_id": 7990,
+      "max_bin_id": 8005,
+      "position_address": "SysvarRent111111111111111111111111111111111",
+      "active_bin_id": 8001,
+      "token_x_decimals": 6,
+      "token_y_decimals": 9,
+      "errors": []
+    },
+    {
+      "schema_version": 2,
+      "command_id": "10000000-0000-4000-8000-000000000201",
+      "command_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "simulation_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "success": false,
+      "simulated_at": "2030-01-02T03:00:00+00:00",
+      "blockhash": null,
+      "last_valid_block_height": null,
+      "compute_units": 0,
+      "network_fee_lamports": "0",
+      "priority_fee_lamports": "0",
+      "price_impact_bps": 12,
+      "min_bin_id": 7990,
+      "max_bin_id": 8005,
+      "position_address": null,
+      "active_bin_id": 8004,
+      "token_x_decimals": 6,
+      "token_y_decimals": 9,
+      "errors": [
+        {
+          "code": "ACTIVE_BIN_DRIFT",
+          "message": "pool active bin moved beyond the command tolerance",
+          "retryable": false
+        }
+      ]
+    },
+    {
+      "schema_version": 2,
+      "command_id": "10000000-0000-4000-8000-000000000204",
+      "command_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "simulation_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "success": false,
+      "simulated_at": "2030-01-02T03:00:00Z",
+      "blockhash": null,
+      "last_valid_block_height": null,
+      "compute_units": 0,
+      "network_fee_lamports": "0",
+      "priority_fee_lamports": "0",
+      "price_impact_bps": null,
+      "min_bin_id": 7990,
+      "max_bin_id": 8005,
+      "position_address": null,
+      "active_bin_id": null,
+      "token_x_decimals": null,
+      "token_y_decimals": null,
+      "errors": [
+        {
+          "code": "SIMULATION_FAILED",
+          "message": "execution dependency rejected the command",
+          "retryable": true
+        }
+      ]
+    },
+    {
+      "schema_version": 2,
+      "command_id": "10000000-0000-4000-8000-000000000204",
+      "command_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "simulation_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "success": true,
+      "simulated_at": "2030-01-02T03:00:00Z",
+      "blockhash": "safe-blockhash",
+      "last_valid_block_height": 123456,
+      "compute_units": 90000,
+      "network_fee_lamports": "5000",
+      "priority_fee_lamports": "0",
+      "price_impact_bps": null,
+      "min_bin_id": 7990,
+      "max_bin_id": 8005,
+      "position_address": "SysvarRent111111111111111111111111111111111",
+      "active_bin_id": 7950,
+      "token_x_decimals": 6,
+      "token_y_decimals": 9,
+      "errors": []
+    }
+  ],
+  "canonical_simulation_digests": [
+    "b23f745de804ca10d61b373fbe99bef531afab3cde99ad3d780f92cf6f2ce16d",
+    "9509c5dda54f6d2761fb5e134d4505002b0c3b9fcd028f6e7dbea30feee5ad5e",
+    "ac16bdeedc2b9691959216b19e413eebd23c71b1ef726b2b9d4d8aa70faf8559",
+    "ece37318125e683793da7787601c8fd44d93067424f0f1f7f7e39afd3ab8381a"
+  ],
+  "invalid_simulations": [
+    {
+      "case": "unknown simulation version",
+      "payload": {
+        "schema_version": 3,
+        "command_id": "10000000-0000-4000-8000-000000000201"
+      }
+    },
+    {
+      "case": "success without the position address",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000201",
+        "command_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "simulation_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "success": true,
+        "simulated_at": "2030-01-02T03:00:00Z",
+        "blockhash": "safe-blockhash",
+        "last_valid_block_height": 123456,
+        "compute_units": 210000,
+        "network_fee_lamports": "10000",
+        "priority_fee_lamports": "0",
+        "price_impact_bps": 12,
+        "min_bin_id": 7990,
+        "max_bin_id": 8005,
+        "position_address": null,
+        "active_bin_id": 8001,
+        "token_x_decimals": 6,
+        "token_y_decimals": 9,
+        "errors": []
+      }
+    },
+    {
+      "case": "success without mint decimals",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000201",
+        "command_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "simulation_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "success": true,
+        "simulated_at": "2030-01-02T03:00:00Z",
+        "blockhash": "safe-blockhash",
+        "last_valid_block_height": 123456,
+        "compute_units": 210000,
+        "network_fee_lamports": "10000",
+        "priority_fee_lamports": "0",
+        "price_impact_bps": 12,
+        "min_bin_id": 7990,
+        "max_bin_id": 8005,
+        "position_address": "SysvarRent111111111111111111111111111111111",
+        "active_bin_id": 8001,
+        "token_x_decimals": null,
+        "token_y_decimals": 9,
+        "errors": []
+      }
+    },
+    {
+      "case": "success without the observed active bin",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000201",
+        "command_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "simulation_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "success": true,
+        "simulated_at": "2030-01-02T03:00:00Z",
+        "blockhash": "safe-blockhash",
+        "last_valid_block_height": 123456,
+        "compute_units": 210000,
+        "network_fee_lamports": "10000",
+        "priority_fee_lamports": "0",
+        "price_impact_bps": 12,
+        "min_bin_id": 7990,
+        "max_bin_id": 8005,
+        "position_address": "SysvarRent111111111111111111111111111111111",
+        "active_bin_id": null,
+        "token_x_decimals": 6,
+        "token_y_decimals": 9,
+        "errors": []
+      }
+    },
+    {
+      "case": "simulation without the market facts keys",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000204",
+        "command_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "simulation_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "success": false,
+        "simulated_at": "2030-01-02T03:00:00Z",
+        "blockhash": null,
+        "last_valid_block_height": null,
+        "compute_units": 0,
+        "network_fee_lamports": "0",
+        "priority_fee_lamports": "0",
+        "price_impact_bps": null,
+        "min_bin_id": 7990,
+        "max_bin_id": 8005,
+        "errors": [
+          {
+            "code": "SIMULATION_FAILED",
+            "message": "execution dependency rejected the command",
+            "retryable": true
+          }
+        ]
+      }
+    }
+  ],
+  "valid_gateway_receipts": [
+    {
+      "schema_version": 2,
+      "command_id": "10000000-0000-4000-8000-000000000201",
+      "command_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "simulation_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "idempotency_key": "entry:plan-201",
+      "state": "SUBMITTED",
+      "position_address": "SysvarRent111111111111111111111111111111111",
+      "signature": "signature-2",
+      "signatures": ["signature-1", "signature-2"],
+      "transaction_count": 2,
+      "submitted_at": "2030-01-02T03:00:01Z",
+      "attempt_count": 1,
+      "error": null
+    },
+    {
+      "schema_version": 2,
+      "command_id": "10000000-0000-4000-8000-000000000204",
+      "command_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "simulation_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "idempotency_key": "position-action:SysvarRent111111111111111111111111111111111:2",
+      "state": "UNKNOWN",
+      "position_address": "SysvarRent111111111111111111111111111111111",
+      "signature": null,
+      "signatures": [],
+      "transaction_count": 1,
+      "submitted_at": "2030-01-02T03:00:01+00:00",
+      "attempt_count": 1,
+      "error": {
+        "code": "SUBMIT_OUTCOME_UNKNOWN",
+        "message": "submit outcome requires reconciliation",
+        "retryable": false
+      }
+    }
+  ],
+  "invalid_gateway_receipts": [
+    {
+      "case": "unknown gateway receipt version",
+      "payload": {
+        "schema_version": 3,
+        "command_id": "10000000-0000-4000-8000-000000000201"
+      }
+    },
+    {
+      "case": "receipt without the position address",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000201",
+        "command_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "simulation_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "idempotency_key": "entry:plan-201",
+        "state": "SUBMITTED",
+        "signature": "signature-1",
+        "signatures": ["signature-1"],
+        "transaction_count": 1,
+        "submitted_at": "2030-01-02T03:00:01Z",
+        "attempt_count": 1,
+        "error": null
+      }
+    },
+    {
+      "case": "receipt with an invalid position address",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000201",
+        "command_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "simulation_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "idempotency_key": "entry:plan-201",
+        "state": "SUBMITTED",
+        "position_address": "not-a-public-key",
+        "signature": "signature-1",
+        "signatures": ["signature-1"],
+        "transaction_count": 1,
+        "submitted_at": "2030-01-02T03:00:01Z",
+        "attempt_count": 1,
+        "error": null
+      }
+    },
+    {
+      "case": "primary signature differs from transaction list",
+      "payload": {
+        "schema_version": 2,
+        "command_id": "10000000-0000-4000-8000-000000000201",
+        "command_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "simulation_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "idempotency_key": "entry:plan-201",
+        "state": "SUBMITTED",
+        "position_address": "SysvarRent111111111111111111111111111111111",
+        "signature": "signature-other",
+        "signatures": ["signature-1"],
+        "transaction_count": 1,
+        "submitted_at": "2030-01-02T03:00:01Z",
+        "attempt_count": 1,
+        "error": null
+      }
+    }
+  ]
+}

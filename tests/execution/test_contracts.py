@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -9,53 +10,131 @@ from pydantic import ValidationError
 from src.execution.contracts import (
     ChainReceiptV1,
     DlmmCommandV1,
+    DlmmCommandV2,
     GatewayReceiptV1,
+    GatewayReceiptV2,
+    QuoteDirection,
+    QuoteRequestV1,
+    QuoteResultV1,
     SimulationResultV1,
+    SimulationResultV2,
     canonical_command_digest,
     canonical_simulation_digest,
+    command_from_payload,
+    receipt_from_payload,
+    simulation_from_payload,
 )
 
-CORPUS = Path(__file__).parents[2] / "contracts" / "execution" / "v1-corpus.json"
+CONTRACTS = Path(__file__).parents[2] / "contracts" / "execution"
 
 
-def test_python_contract_accepts_only_v1_corpus() -> None:
-    corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+def corpus(name: str) -> dict[str, Any]:
+    loaded: dict[str, Any] = json.loads((CONTRACTS / name).read_text(encoding="utf-8"))
+    return loaded
 
-    commands = [DlmmCommandV1.model_validate(payload) for payload in corpus["valid_commands"]]
 
-    assert [command.operation.value for command in commands] == [
-        "OPEN",
-        "ADD",
-        "REMOVE",
-        "CLOSE",
+def test_python_contract_accepts_the_v2_corpus_with_shared_digests() -> None:
+    v2 = corpus("v2-corpus.json")
+
+    commands = [DlmmCommandV2.model_validate(payload) for payload in v2["valid_commands"]]
+    simulations = [
+        SimulationResultV2.model_validate(payload) for payload in v2["valid_simulations"]
     ]
-    assert [canonical_command_digest(command) for command in commands] == corpus[
+
+    assert [command.operation.value for command in commands] == ["OPEN", "ADD", "REMOVE", "CLOSE"]
+    assert commands[0].position_address is None
+    assert [canonical_command_digest(command) for command in commands] == v2[
         "canonical_command_digests"
     ]
-    for invalid in corpus["invalid_commands"]:
+    assert [canonical_simulation_digest(value) for value in simulations] == v2[
+        "canonical_simulation_digests"
+    ]
+    for payload in v2["valid_gateway_receipts"]:
+        assert GatewayReceiptV2.model_validate(payload).position_address == (
+            "SysvarRent111111111111111111111111111111111"
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "key"),
+    [
+        (DlmmCommandV2, "invalid_commands"),
+        (SimulationResultV2, "invalid_simulations"),
+        (GatewayReceiptV2, "invalid_gateway_receipts"),
+    ],
+)
+def test_python_contract_rejects_every_invalid_v2_payload(model: Any, key: str) -> None:
+    for invalid in corpus("v2-corpus.json")[key]:
         with pytest.raises(ValidationError):
-            DlmmCommandV1.model_validate(invalid["payload"])
+            model.model_validate(invalid["payload"])
 
 
-def test_python_contract_shares_simulation_submit_and_status_payloads() -> None:
-    corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+def test_retired_v1_payloads_are_never_read_as_v2() -> None:
+    v1 = corpus("v1-corpus.json")
+    cases = (
+        (DlmmCommandV2, "valid_commands"),
+        (SimulationResultV2, "valid_simulations"),
+        (GatewayReceiptV2, "valid_gateway_receipts"),
+    )
 
+    for model, key in cases:
+        for payload in v1[key]:
+            with pytest.raises(ValidationError):
+                model.model_validate(payload)
+
+
+def test_v1_remains_the_lifecycle_shape_of_stored_and_shadow_records() -> None:
+    v1 = corpus("v1-corpus.json")
+
+    commands = [DlmmCommandV1.model_validate(payload) for payload in v1["valid_commands"]]
+
+    assert [canonical_command_digest(command) for command in commands] == v1[
+        "canonical_command_digests"
+    ]
     contract_cases = (
         (SimulationResultV1, "valid_simulations", "invalid_simulations"),
         (GatewayReceiptV1, "valid_gateway_receipts", "invalid_gateway_receipts"),
         (ChainReceiptV1, "valid_chain_receipts", "invalid_chain_receipts"),
     )
     for model, valid_key, invalid_key in contract_cases:
-        for payload in corpus[valid_key]:
+        for payload in v1[valid_key]:
             model.model_validate(payload)
-        for invalid in corpus[invalid_key]:
+        for invalid in v1[invalid_key]:
             with pytest.raises(ValidationError):
                 model.model_validate(invalid["payload"])
 
-    simulations = [
-        SimulationResultV1.model_validate(payload)
-        for payload in corpus["valid_simulations"]
+
+def test_stored_payloads_are_read_by_their_own_version_and_unknown_ones_refused() -> None:
+    v1, v2 = corpus("v1-corpus.json"), corpus("v2-corpus.json")
+
+    assert isinstance(command_from_payload(v1["valid_commands"][0]), DlmmCommandV1)
+    assert isinstance(command_from_payload(v2["valid_commands"][0]), DlmmCommandV2)
+    assert isinstance(simulation_from_payload(v1["valid_simulations"][0]), SimulationResultV1)
+    assert isinstance(simulation_from_payload(v2["valid_simulations"][0]), SimulationResultV2)
+    assert isinstance(receipt_from_payload(v1["valid_gateway_receipts"][0]), GatewayReceiptV1)
+    assert isinstance(receipt_from_payload(v2["valid_gateway_receipts"][0]), GatewayReceiptV2)
+    for parse, payload in (
+        (command_from_payload, v2["invalid_commands"][0]["payload"]),
+        (simulation_from_payload, v2["invalid_simulations"][0]["payload"]),
+        (receipt_from_payload, v2["invalid_gateway_receipts"][0]["payload"]),
+    ):
+        with pytest.raises(ValidationError):
+            parse(payload)
+
+
+def test_python_quote_contract_shares_the_quote_corpus() -> None:
+    quotes = corpus("quote-v1-corpus.json")
+
+    requests = [QuoteRequestV1.model_validate(payload) for payload in quotes["valid_requests"]]
+    results = [QuoteResultV1.model_validate(payload) for payload in quotes["valid_results"]]
+
+    assert [request.direction for request in requests] == [
+        QuoteDirection.Y_TO_X,
+        QuoteDirection.X_TO_Y,
     ]
-    assert [canonical_simulation_digest(value) for value in simulations] == corpus[
-        "canonical_simulation_digests"
-    ]
+    assert [result.success for result in results] == [True, False]
+    assert results[0].price_impact_bps == 37
+    for model, key in ((QuoteRequestV1, "invalid_requests"), (QuoteResultV1, "invalid_results")):
+        for invalid in quotes[key]:
+            with pytest.raises(ValidationError):
+                model.model_validate(invalid["payload"])

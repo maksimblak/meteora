@@ -19,22 +19,31 @@ from src.domain.models.trading import TradingMode
 from src.execution.contracts import (
     ChainReceiptV1,
     ChainState,
-    DlmmCommandV1,
+    DlmmCommand,
+    DlmmCommandV2,
     DlmmOperation,
     ExecutionPhase,
     ExecutionPreview,
     ExecutionState,
-    GatewayReceiptV1,
+    GatewayReceipt,
+    GatewayReceiptV2,
     GatewayState,
     LivePromotionEvidence,
     OperatorApproval,
-    SimulationResultV1,
+    SimulationResult,
+    SimulationResultV2,
     canonical_command_digest,
     canonical_simulation_digest,
+    command_from_payload,
+    receipt_from_payload,
+    simulation_from_payload,
 )
 from src.modes.models import KillSwitchPolicy
 
 _EXIT_OPERATIONS = frozenset({DlmmOperation.REMOVE, DlmmOperation.CLOSE})
+# Only an entry is limited by the quoted price impact of its swap leg: an exit swaps
+# nothing, so its quote is recorded but never keeps a position open.
+_ENTRY_OPERATIONS = frozenset({DlmmOperation.OPEN, DlmmOperation.ADD})
 _UNRESOLVED = frozenset(
     {ExecutionPhase.SUBMITTING, ExecutionPhase.SUBMITTED, ExecutionPhase.UNKNOWN}
 )
@@ -48,6 +57,15 @@ class ExecutionOutcomeUnknown(ExecutionBlocked):
     """The command may already be broadcast: it is never resent, only reconciled."""
 
 
+class SimulationRejected(ExecutionBlocked):
+    """The simulation refused the command; ``code`` is the executor's error code (or
+    ``SLIPPAGE_BREACH`` / ``PRICE_IMPACT_UNAVAILABLE`` for an entry over its limit)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class GatewayRejected(ExecutionBlocked):
     """The gateway provably did not execute the request: nothing was broadcast."""
 
@@ -57,14 +75,14 @@ class GatewayRejected(ExecutionBlocked):
 
 
 class ExecutionGateway(Protocol):
-    async def simulate(self, command: DlmmCommandV1) -> SimulationResultV1: ...
+    async def simulate(self, command: DlmmCommand) -> SimulationResult: ...
 
     async def submit(
         self,
-        command: DlmmCommandV1,
+        command: DlmmCommand,
         idempotency_key: str,
         approval: OperatorApproval | None,
-    ) -> GatewayReceiptV1: ...
+    ) -> GatewayReceipt: ...
 
     async def status(self, signature: str) -> ChainReceiptV1: ...
 
@@ -72,7 +90,7 @@ class ExecutionGateway(Protocol):
 class ReceiptLookup(Protocol):
     """Command-level status (``GET /v1/commands/{id}``): the gateway's reconciled receipt."""
 
-    async def lookup(self, command_id: UUID) -> GatewayReceiptV1 | None: ...
+    async def lookup(self, command_id: UUID) -> GatewayReceipt | None: ...
 
 
 class KillSwitchProbe(Protocol):
@@ -80,7 +98,7 @@ class KillSwitchProbe(Protocol):
 
 
 class PlanResolver(Protocol):
-    async def resolve(self, plan_id: UUID) -> DlmmCommandV1: ...
+    async def resolve(self, plan_id: UUID) -> DlmmCommand: ...
 
 
 class ApprovalVerifier(Protocol):
@@ -135,12 +153,24 @@ def sign_operator_approval(
 
 @dataclass
 class ExecutionRecord:
-    command: DlmmCommandV1
-    simulation: SimulationResultV1
+    command: DlmmCommand
+    simulation: SimulationResult
     phase: ExecutionPhase
     approval: OperatorApproval | None = None
     approval_consumed: bool = False
-    receipt: GatewayReceiptV1 | None = None
+    receipt: GatewayReceipt | None = None
+
+    @property
+    def position_address(self) -> str | None:
+        """The position this command acts on, as far as it is known.
+
+        A V2 OPEN gets its position from the executor: only its receipt names it, so
+        before the receipt it is ``None``. A V1 lifecycle command carried its own.
+        """
+
+        if isinstance(self.receipt, GatewayReceiptV2):
+            return self.receipt.position_address
+        return self.command.position_address
 
 
 class ExecutionStore(Protocol):
@@ -319,10 +349,10 @@ class SqliteExecutionStore:
 
 
 class StaticPlanResolver:
-    def __init__(self, commands: Mapping[UUID, DlmmCommandV1]) -> None:
+    def __init__(self, commands: Mapping[UUID, DlmmCommand]) -> None:
         self._commands = dict(commands)
 
-    async def resolve(self, plan_id: UUID) -> DlmmCommandV1:
+    async def resolve(self, plan_id: UUID) -> DlmmCommand:
         try:
             return self._commands[plan_id]
         except KeyError as error:
@@ -395,6 +425,14 @@ class ExecutionService:
                 or self._simulation_is_fresh(existing, now)
             ):
                 return self._preview(existing)
+            if _position_simulated(existing):
+                # Its position key existed only for that simulation: a new one would be
+                # another position the stored context and any approval know nothing of.
+                existing.phase = ExecutionPhase.EXPIRED
+                await self._store.put(existing)
+                raise ExecutionBlocked(
+                    "the simulated position expired before submit; plan the entry again"
+                )
 
         simulation = await self._gateway.simulate(command)
         self._validate_simulation_binding(command, simulation)
@@ -415,17 +453,11 @@ class ExecutionService:
             record.phase = phase
             record.approval = None
             record.approval_consumed = False
-        if not simulation.success or simulation.errors:
+        rejection = _simulation_rejection(command, simulation)
+        if rejection is not None:
             record.phase = ExecutionPhase.FAILED
             await self._store.put(record)
-            raise ExecutionBlocked("simulation failed")
-        if (
-            simulation.price_impact_bps is None
-            or simulation.price_impact_bps > command.max_slippage_bps
-        ):
-            record.phase = ExecutionPhase.FAILED
-            await self._store.put(record)
-            raise ExecutionBlocked("simulation exceeds slippage limit")
+            raise SimulationRejected(rejection)
         await self._store.put(record)
         return self._preview(record)
 
@@ -466,7 +498,7 @@ class ExecutionService:
         await self._store.put(record)
         return self._state(record)
 
-    async def execute(self, command_id: UUID) -> GatewayReceiptV1:
+    async def execute(self, command_id: UUID) -> GatewayReceipt:
         record = await self._require_record(command_id)
         if record.receipt is not None:
             if record.receipt.state in {GatewayState.SUBMITTED, GatewayState.UNKNOWN} and (
@@ -596,7 +628,7 @@ class ExecutionService:
         return self._state(record)
 
     async def _adopt_receipt(
-        self, record: ExecutionRecord, receipt: GatewayReceiptV1
+        self, record: ExecutionRecord, receipt: GatewayReceipt
     ) -> ExecutionState:
         self._validate_receipt_binding(record, receipt)
         if record.receipt is not None and not set(record.receipt.signatures) <= set(
@@ -608,7 +640,7 @@ class ExecutionService:
         await self._store.put(record)
         return self._state(record)
 
-    async def _require_kill_switch_clear(self, command: DlmmCommandV1) -> None:
+    async def _require_kill_switch_clear(self, command: DlmmCommand) -> None:
         """Active kill switch: no entry ever; an exit only under ``ORDERLY_EXIT``."""
 
         if self._kill_switch is None:
@@ -634,18 +666,14 @@ class ExecutionService:
             record.phase = ExecutionPhase.EXPIRED
             raise ExecutionBlocked("plan expired")
         self._validate_simulation_binding(command, record.simulation)
-        if not record.simulation.success or record.simulation.errors:
-            raise ExecutionBlocked("simulation failed")
+        rejection = _simulation_rejection(command, record.simulation)
+        if rejection is not None:
+            raise SimulationRejected(rejection)
         if (
             record.simulation.simulated_at > now
             or record.simulation.simulated_at + self._simulation_ttl <= now
         ):
             raise ExecutionBlocked("simulation is stale")
-        if (
-            record.simulation.price_impact_bps is None
-            or record.simulation.price_impact_bps > command.max_slippage_bps
-        ):
-            raise ExecutionBlocked("simulation exceeds slippage limit")
         if command.mode is TradingMode.APPROVAL:
             approval = record.approval
             if approval is None:
@@ -657,7 +685,7 @@ class ExecutionService:
             self._validate_live_promotion(command, now)
 
     def _validate_live_promotion(
-        self, command: DlmmCommandV1, now: datetime
+        self, command: DlmmCommand, now: datetime
     ) -> None:
         evidence = self._live_promotion
         if (
@@ -701,11 +729,12 @@ class ExecutionService:
 
     @staticmethod
     def _validate_simulation_binding(
-        command: DlmmCommandV1, simulation: SimulationResultV1
+        command: DlmmCommand, simulation: SimulationResult
     ) -> None:
         digest = canonical_command_digest(command)
         if (
-            simulation.command_id != command.command_id
+            simulation.schema_version != command.schema_version
+            or simulation.command_id != command.command_id
             or simulation.command_digest != digest
             or simulation.simulation_digest
             != canonical_simulation_digest(simulation)
@@ -713,18 +742,33 @@ class ExecutionService:
             or simulation.max_bin_id != command.max_bin_id
         ):
             raise ExecutionBlocked("simulation does not match the command payload")
+        if (
+            isinstance(command, DlmmCommandV2)
+            and isinstance(simulation, SimulationResultV2)
+            and simulation.success
+            and not _market_bound(command, simulation)
+        ):
+            # The executor refuses these itself; a "successful" one is never trusted.
+            raise ExecutionBlocked("simulation contradicts the command's position or anchor")
 
     @staticmethod
     def _validate_receipt_binding(
-        record: ExecutionRecord, receipt: GatewayReceiptV1
+        record: ExecutionRecord, receipt: GatewayReceipt
     ) -> None:
         if (
-            receipt.command_id != record.command.command_id
+            receipt.schema_version != record.command.schema_version
+            or receipt.command_id != record.command.command_id
             or receipt.idempotency_key != record.command.idempotency_key
             or receipt.command_digest != record.simulation.command_digest
             or receipt.simulation_digest != record.simulation.simulation_digest
         ):
             raise ExecutionBlocked("gateway receipt does not match execution binding")
+        if (
+            isinstance(receipt, GatewayReceiptV2)
+            and isinstance(record.simulation, SimulationResultV2)
+            and receipt.position_address != record.simulation.position_address
+        ):
+            raise ExecutionBlocked("gateway receipt names another position than the simulated one")
 
     async def _require_record(self, command_id: UUID) -> ExecutionRecord:
         record = await self._store.get(command_id)
@@ -738,11 +782,7 @@ class ExecutionService:
         except ExecutionBlocked:
             return False
         return (
-            record.simulation.success
-            and not record.simulation.errors
-            and record.simulation.price_impact_bps is not None
-            and record.simulation.price_impact_bps
-            <= record.command.max_slippage_bps
+            _simulation_rejection(record.command, record.simulation) is None
             and record.simulation.simulated_at <= now
             and record.simulation.simulated_at + self._simulation_ttl > now
         )
@@ -800,16 +840,62 @@ def _serialize_record(record: ExecutionRecord) -> str:
 def _deserialize_record(payload: str) -> ExecutionRecord:
     value = json.loads(payload)
     return ExecutionRecord(
-        command=DlmmCommandV1.model_validate(value["command"]),
-        simulation=SimulationResultV1.model_validate(value["simulation"]),
+        command=command_from_payload(value["command"]),
+        simulation=simulation_from_payload(value["simulation"]),
         phase=ExecutionPhase(value["phase"]),
         approval=None
         if value["approval"] is None
         else OperatorApproval.model_validate(value["approval"]),
         approval_consumed=bool(value["approval_consumed"]),
-        receipt=None
-        if value["receipt"] is None
-        else GatewayReceiptV1.model_validate(value["receipt"]),
+        receipt=None if value["receipt"] is None else receipt_from_payload(value["receipt"]),
+    )
+
+
+def _simulation_rejection(command: DlmmCommand, simulation: SimulationResult) -> str | None:
+    """Why this simulation cannot be executed, as an executor error code; ``None`` if it can."""
+
+    if not simulation.success or simulation.errors:
+        return simulation.errors[0].code if simulation.errors else "SIMULATION_FAILED"
+    if command.operation in _ENTRY_OPERATIONS:
+        if simulation.price_impact_bps is None:
+            return "PRICE_IMPACT_UNAVAILABLE"
+        if simulation.price_impact_bps > command.max_slippage_bps:
+            return "SLIPPAGE_BREACH"
+    return None
+
+
+def _position_simulated(record: ExecutionRecord) -> bool:
+    """A V2 OPEN whose successful simulation already created (and named) a position key."""
+
+    return (
+        isinstance(record.command, DlmmCommandV2)
+        and record.command.operation is DlmmOperation.OPEN
+        and isinstance(record.simulation, SimulationResultV2)
+        and record.simulation.success
+        and record.simulation.position_address is not None
+    )
+
+
+def _market_bound(command: DlmmCommandV2, simulation: SimulationResultV2) -> bool:
+    """The simulated position is the command's and the chain still matches its anchor."""
+
+    if command.operation is DlmmOperation.OPEN:
+        if simulation.position_address in (None, command.wallet_address):
+            return False
+    elif simulation.position_address != command.position_address:
+        return False
+    if command.operation not in {DlmmOperation.OPEN, DlmmOperation.ADD}:
+        return True
+    if (
+        command.active_bin_id is None
+        or command.active_bin_tolerance is None
+        or simulation.active_bin_id is None
+    ):
+        return False
+    return (
+        abs(simulation.active_bin_id - command.active_bin_id) <= command.active_bin_tolerance
+        and simulation.token_x_decimals == command.token_x_decimals
+        and simulation.token_y_decimals == command.token_y_decimals
     )
 
 

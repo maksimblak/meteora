@@ -2,33 +2,54 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import type {
-  ChainReceiptV1,
-  DlmmCommandV1,
-  GatewayReceiptV1,
-  SimulationResultV1,
+import {
+  isPublicKey,
+  type ChainReceiptV1,
+  type DlmmCommandV2,
+  type GatewayReceiptV2,
+  type SimulationResultV2,
 } from "./contracts.js";
 
 export interface Clock {
   now(): Date;
 }
 
+/** What the official SDK read from chain for one command (LB pair, mints and its quote). */
+export interface MarketFacts {
+  /**
+   * Price impact of the command's swap leg from the SDK quote, rounded up to whole bps.
+   * `null` only for an exit whose quote was unavailable: an exit swaps nothing, so its
+   * impact is reported but never gates it; an entry needs a measured value.
+   */
+  priceImpactBps: number | null;
+  /** Active bin of the LB pair account. */
+  activeBinId: number;
+  /** Decimals of the X and Y mint accounts. */
+  tokenXDecimals: number;
+  tokenYDecimals: number;
+}
+
+/**
+ * A command built by the SDK boundary. `opaqueSigners` may hold the key of a position the
+ * boundary created for an OPEN: it lives only in this object, which the engine keeps in
+ * memory until the command is broadcast or its simulation expires, and never serializes.
+ */
 export interface BuiltCommand {
-  command: DlmmCommandV1;
+  command: DlmmCommandV2;
   opaqueTransactions: readonly unknown[];
   opaqueSigners?: readonly unknown[];
-  priceImpactBps?: number;
+  positionAddress: string;
+  market: MarketFacts;
 }
 
 export interface SdkBoundary {
-  build(command: DlmmCommandV1): Promise<BuiltCommand>;
+  build(command: DlmmCommandV2): Promise<BuiltCommand>;
 }
 
 export interface SimulationTransportResult {
   computeUnits: number;
   networkFeeLamports: bigint;
   priorityFeeLamports: bigint;
-  priceImpactBps: number;
   blockhash: string;
   lastValidBlockHeight: number;
   logs: string[];
@@ -124,7 +145,7 @@ export interface PersistedSubmission {
   simulationDigest: string;
   idempotencyKey: string;
   approvalId?: string;
-  receipt: GatewayReceiptV1;
+  receipt: GatewayReceiptV2;
 }
 
 export type ReserveSubmissionResult =
@@ -193,8 +214,9 @@ export class InMemoryExecutionStateStore implements ExecutionStateStore {
   }
 }
 
+// Version 2 holds V2 receipts; a document of another version is refused, never reinterpreted.
 interface StateDocument {
-  schemaVersion: 1;
+  schemaVersion: 2;
   submissions: PersistedSubmission[];
 }
 
@@ -280,13 +302,13 @@ export class FileExecutionStateStore implements ExecutionStateStore {
   async #read(): Promise<StateDocument> {
     try {
       const value = JSON.parse(await readFile(this.#path, "utf8")) as StateDocument;
-      if (value.schemaVersion !== 1 || !Array.isArray(value.submissions)) {
-        throw new Error("invalid durable execution state");
+      if (value.schemaVersion !== 2 || !Array.isArray(value.submissions)) {
+        throw new Error("durable execution state has an unsupported version");
       }
       return value;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return { schemaVersion: 1, submissions: [] };
+        return { schemaVersion: 2, submissions: [] };
       }
       throw error;
     }
@@ -343,7 +365,13 @@ const systemClock: Clock = { now: () => new Date() };
 interface PreparedCommand {
   built: BuiltCommand;
   commandDigest: string;
-  simulation: SimulationResultV1;
+  simulation: SimulationResultV2;
+  expiry: ReturnType<typeof setTimeout>;
+}
+
+interface Rejection {
+  code: string;
+  message: string;
 }
 
 export class ExecutionEngine {
@@ -357,10 +385,12 @@ export class ExecutionEngine {
   readonly #operationTimeoutMs: number;
   readonly #approvalProofVerifier: ApprovalProofVerifier | undefined;
   readonly #livePromotion: LivePromotionEvidence | undefined;
+  // Successful simulations only; for an OPEN this is the one place the new position's
+  // key exists. An entry leaves on broadcast, re-simulation, failure or TTL expiry.
   readonly #prepared = new Map<string, PreparedCommand>();
   readonly #submissionsByKey = new Map<
     string,
-    { commandDigest: string; promise: Promise<GatewayReceiptV1> }
+    { commandDigest: string; promise: Promise<GatewayReceiptV2> }
   >();
 
   constructor(options: ExecutionEngineOptions) {
@@ -382,82 +412,83 @@ export class ExecutionEngine {
     }
   }
 
-  async simulate(command: DlmmCommandV1): Promise<SimulationResultV1> {
+  /**
+   * Build through the SDK, check the market facts against the command and only then
+   * simulate the transactions. Market rejections (anchor drift, decimals, price impact
+   * above the command limit) are failed simulations that carry the observed facts.
+   */
+  async simulate(command: DlmmCommandV2): Promise<SimulationResultV2> {
     this.#assertNotExpired(command);
     const immutableCommand = deepFreeze(structuredClone(command));
     const digest = commandDigest(immutableCommand);
+    this.#release(immutableCommand.command_id);
+    let market: MarketFacts | undefined;
     try {
       const sdkBuilt = await this.#withTimeout(this.#sdk.build(immutableCommand));
       if (commandDigest(sdkBuilt.command) !== digest || sdkBuilt.opaqueTransactions.length === 0) {
         throw new GatewayError("BUILD_BINDING_MISMATCH", "SDK build does not match the command");
       }
+      market = measuredMarket(immutableCommand, sdkBuilt.market);
+      assertPositionBinding(immutableCommand, sdkBuilt.positionAddress);
+      const rejection = marketRejection(immutableCommand, market);
+      if (rejection !== undefined) {
+        return this.#failed(immutableCommand, digest, market, rejection);
+      }
       const built: BuiltCommand = {
-        ...sdkBuilt,
         command: immutableCommand,
         opaqueTransactions: Object.freeze([...sdkBuilt.opaqueTransactions]),
         ...(sdkBuilt.opaqueSigners === undefined
           ? {}
           : { opaqueSigners: Object.freeze([...sdkBuilt.opaqueSigners]) }),
+        positionAddress: sdkBuilt.positionAddress,
+        market,
       };
       const result = await this.#withTimeout(this.#rpc.simulate(built));
-      this.#assertMeasuredSimulation(result);
-      const success = result.priceImpactBps <= immutableCommand.max_slippage_bps;
+      assertCompleteSimulation(result);
       const normalized = deepFreeze(finalizeSimulation({
-        schema_version: 1,
+        schema_version: 2,
         command_id: immutableCommand.command_id,
         command_digest: digest,
-        success,
+        success: true,
         simulated_at: this.#clock.now().toISOString(),
         blockhash: result.blockhash,
         last_valid_block_height: result.lastValidBlockHeight,
         compute_units: result.computeUnits,
         network_fee_lamports: result.networkFeeLamports.toString(),
         priority_fee_lamports: result.priorityFeeLamports.toString(),
-        price_impact_bps: result.priceImpactBps,
+        price_impact_bps: market.priceImpactBps,
         min_bin_id: immutableCommand.min_bin_id,
         max_bin_id: immutableCommand.max_bin_id,
-        errors: success
-          ? []
-          : [
-              {
-                code: "SLIPPAGE_BREACH",
-                message: "simulation exceeds the command slippage limit",
-                retryable: false,
-              },
-            ],
+        position_address: built.positionAddress,
+        active_bin_id: market.activeBinId,
+        token_x_decimals: market.tokenXDecimals,
+        token_y_decimals: market.tokenYDecimals,
+        errors: [],
       }));
-      this.#prepared.set(immutableCommand.command_id, {
+      const entry: PreparedCommand = {
         built,
         commandDigest: digest,
         simulation: normalized,
-      });
+        expiry: setTimeout(() => this.#release(immutableCommand.command_id, entry), this.#simulationTtlMs),
+      };
+      entry.expiry.unref?.();
+      this.#prepared.set(immutableCommand.command_id, entry);
       return structuredClone(normalized);
     } catch (error) {
-      this.#prepared.delete(immutableCommand.command_id);
-      return deepFreeze(finalizeSimulation({
-        schema_version: 1,
-        command_id: immutableCommand.command_id,
-        command_digest: digest,
-        success: false,
-        simulated_at: this.#clock.now().toISOString(),
-        blockhash: null,
-        last_valid_block_height: null,
-        compute_units: 0,
-        network_fee_lamports: "0",
-        priority_fee_lamports: "0",
-        price_impact_bps: null,
-        min_bin_id: immutableCommand.min_bin_id,
-        max_bin_id: immutableCommand.max_bin_id,
-        errors: [this.#normalizeError(error, "SIMULATION_FAILED")],
-      }));
+      return this.#failed(
+        immutableCommand,
+        digest,
+        market,
+        this.#normalizeError(error, "SIMULATION_FAILED"),
+      );
     }
   }
 
   async submit(
-    command: DlmmCommandV1,
+    command: DlmmCommandV2,
     idempotencyKey: string,
     authorization: SubmitAuthorization = { modeTokenVerified: false },
-  ): Promise<GatewayReceiptV1> {
+  ): Promise<GatewayReceiptV2> {
     if (idempotencyKey.length === 0 || idempotencyKey !== command.idempotency_key) {
       throw new GatewayError("IDEMPOTENCY_MISMATCH", "idempotency key does not match command");
     }
@@ -487,10 +518,16 @@ export class ExecutionEngine {
       throw new GatewayError("FRESH_SIMULATION_REQUIRED", "a successful simulation is required");
     }
     this.#assertPreparedBinding(prepared, command, digest);
-    this.#assertFreshSimulation(prepared.simulation);
+    try {
+      this.#assertFreshSimulation(prepared.simulation);
+    } catch (error) {
+      this.#release(command.command_id, prepared);
+      throw error;
+    }
     if (
-      prepared.simulation.price_impact_bps === null ||
-      prepared.simulation.price_impact_bps > command.max_slippage_bps
+      isEntry(command) &&
+      (prepared.simulation.price_impact_bps === null ||
+        prepared.simulation.price_impact_bps > command.max_slippage_bps)
     ) {
       throw new GatewayError("SLIPPAGE_BREACH", "simulation exceeds the command slippage limit");
     }
@@ -524,6 +561,8 @@ export class ExecutionEngine {
       if (current?.promise === submission) {
         this.#submissionsByKey.delete(idempotencyKey);
       }
+      // Broadcast or not, the signed transactions and any new position key are done with.
+      this.#release(command.command_id, prepared);
     }
   }
 
@@ -542,16 +581,16 @@ export class ExecutionEngine {
     };
   }
 
-  async lookup(commandId: string): Promise<GatewayReceiptV1 | undefined> {
+  async lookup(commandId: string): Promise<GatewayReceiptV2 | undefined> {
     return (await this.#store.getByCommand(commandId))?.receipt;
   }
 
-  async get(commandId: string): Promise<GatewayReceiptV1 | undefined> {
+  async get(commandId: string): Promise<GatewayReceiptV2 | undefined> {
     const state = await this.#store.getByCommand(commandId);
     return state === undefined ? undefined : this.#reconcileReceipt(state);
   }
 
-  async #reconcileReceipt(state: PersistedSubmission): Promise<GatewayReceiptV1> {
+  async #reconcileReceipt(state: PersistedSubmission): Promise<GatewayReceiptV2> {
     const receipt = state.receipt;
     if (receipt.state === "CONFIRMED" || receipt.state === "FAILED") {
       return receipt;
@@ -568,7 +607,7 @@ export class ExecutionEngine {
         }
       }),
     );
-    let next: GatewayReceiptV1["state"];
+    let next: GatewayReceiptV2["state"];
     if (statuses.some((item) => item.state === "FAILED")) {
       next = "FAILED";
     } else if (
@@ -593,13 +632,13 @@ export class ExecutionEngine {
   }
 
   async #broadcast(
-    command: DlmmCommandV1,
+    command: DlmmCommandV2,
     digest: string,
-    simulation: SimulationResultV1,
+    simulation: SimulationResultV2,
     idempotencyKey: string,
     built: BuiltCommand,
     approvalId: string | undefined,
-  ): Promise<GatewayReceiptV1> {
+  ): Promise<GatewayReceiptV2> {
     const transactionCount = built.opaqueTransactions.length;
     const submittedAt = this.#clock.now().toISOString();
     let state: PersistedSubmission = {
@@ -609,12 +648,14 @@ export class ExecutionEngine {
       idempotencyKey,
       ...(approvalId === undefined ? {} : { approvalId }),
       receipt: {
-        schema_version: 1,
+        schema_version: 2,
         command_id: command.command_id,
         command_digest: digest,
         simulation_digest: simulation.simulation_digest,
         idempotency_key: idempotencyKey,
         state: "UNKNOWN",
+        // The simulated (and, in APPROVAL, approved) position; only an address leaves here.
+        position_address: built.positionAddress,
         signature: null,
         signatures: [],
         transaction_count: transactionCount,
@@ -706,7 +747,7 @@ export class ExecutionEngine {
     return state.receipt;
   }
 
-  #assertNotExpired(command: DlmmCommandV1): void {
+  #assertNotExpired(command: DlmmCommandV2): void {
     const expiry = Date.parse(command.expires_at);
     if (!Number.isFinite(expiry) || expiry <= this.#clock.now().getTime()) {
       throw new GatewayError("COMMAND_EXPIRED", "command has expired");
@@ -715,7 +756,7 @@ export class ExecutionEngine {
 
   #assertPreparedBinding(
     prepared: PreparedCommand,
-    command: DlmmCommandV1,
+    command: DlmmCommandV2,
     digest: string,
   ): void {
     if (
@@ -738,7 +779,7 @@ export class ExecutionEngine {
     }
   }
 
-  #assertFreshSimulation(simulation: SimulationResultV1): void {
+  #assertFreshSimulation(simulation: SimulationResultV2): void {
     const simulatedAt = Date.parse(simulation.simulated_at);
     const age = this.#clock.now().getTime() - simulatedAt;
     if (!Number.isFinite(simulatedAt) || age < 0 || age >= this.#simulationTtlMs) {
@@ -747,8 +788,8 @@ export class ExecutionEngine {
   }
 
   #assertApproval(
-    command: DlmmCommandV1,
-    simulation: SimulationResultV1,
+    command: DlmmCommandV2,
+    simulation: SimulationResultV2,
     authorization: SubmitAuthorization,
   ): void {
     const {
@@ -804,7 +845,7 @@ export class ExecutionEngine {
     }
   }
 
-  #assertLivePromotion(command: DlmmCommandV1): void {
+  #assertLivePromotion(command: DlmmCommandV2): void {
     const evidence = this.#livePromotion;
     const now = this.#clock.now().getTime();
     if (
@@ -828,23 +869,43 @@ export class ExecutionEngine {
     }
   }
 
-  #assertMeasuredSimulation(result: SimulationTransportResult): void {
-    if (
-      !Number.isInteger(result.priceImpactBps) ||
-      !Number.isFinite(result.priceImpactBps) ||
-      result.priceImpactBps < 0 ||
-      result.priceImpactBps > 10_000 ||
-      !Number.isInteger(result.computeUnits) ||
-      result.computeUnits < 0 ||
-      !Number.isInteger(result.lastValidBlockHeight) ||
-      result.lastValidBlockHeight < 0 ||
-      result.blockhash.length === 0
-    ) {
-      throw new GatewayError(
-        "PRICE_IMPACT_UNAVAILABLE",
-        "simulation lacks a measured finite price impact",
-      );
+  #failed(
+    command: DlmmCommandV2,
+    digest: string,
+    market: MarketFacts | undefined,
+    error: { code: string; message: string; retryable?: boolean },
+  ): SimulationResultV2 {
+    return deepFreeze(finalizeSimulation({
+      schema_version: 2,
+      command_id: command.command_id,
+      command_digest: digest,
+      success: false,
+      simulated_at: this.#clock.now().toISOString(),
+      blockhash: null,
+      last_valid_block_height: null,
+      compute_units: 0,
+      network_fee_lamports: "0",
+      priority_fee_lamports: "0",
+      price_impact_bps: market?.priceImpactBps ?? null,
+      min_bin_id: command.min_bin_id,
+      max_bin_id: command.max_bin_id,
+      // A position that will never be opened is not published.
+      position_address: null,
+      active_bin_id: market?.activeBinId ?? null,
+      token_x_decimals: market?.tokenXDecimals ?? null,
+      token_y_decimals: market?.tokenYDecimals ?? null,
+      errors: [{ code: error.code, message: error.message, retryable: error.retryable ?? false }],
+    }));
+  }
+
+  /** Drop a prepared command (and with it any position key) unless it was replaced. */
+  #release(commandId: string, expected?: PreparedCommand): void {
+    const current = this.#prepared.get(commandId);
+    if (current === undefined || (expected !== undefined && current !== expected)) {
+      return;
     }
+    clearTimeout(current.expiry);
+    this.#prepared.delete(commandId);
   }
 
   #normalizeError(error: unknown, fallbackCode: string): {
@@ -882,7 +943,95 @@ export class ExecutionEngine {
   }
 }
 
-export function commandDigest(command: DlmmCommandV1): string {
+function isWhole(value: number, minimum: number, maximum: number): boolean {
+  return Number.isInteger(value) && value >= minimum && value <= maximum;
+}
+
+function isEntry(command: DlmmCommandV2): boolean {
+  return command.operation === "OPEN" || command.operation === "ADD";
+}
+
+function measuredMarket(command: DlmmCommandV2, market: MarketFacts | undefined): MarketFacts {
+  const impact = market?.priceImpactBps;
+  if (
+    market === undefined ||
+    impact === undefined ||
+    (impact === null ? isEntry(command) : !isWhole(impact, 0, 10_000))
+  ) {
+    throw new GatewayError(
+      "PRICE_IMPACT_UNAVAILABLE",
+      "the SDK quote did not measure a finite price impact",
+    );
+  }
+  if (
+    !Number.isSafeInteger(market.activeBinId) ||
+    !isWhole(market.tokenXDecimals, 0, 255) ||
+    !isWhole(market.tokenYDecimals, 0, 255)
+  ) {
+    throw new GatewayError("MARKET_STATE_UNAVAILABLE", "LB pair or mint state is unavailable");
+  }
+  return Object.freeze({ ...market });
+}
+
+function assertPositionBinding(command: DlmmCommandV2, positionAddress: string): void {
+  const bound =
+    command.operation === "OPEN"
+      ? isPublicKey(positionAddress) && positionAddress !== command.wallet_address
+      : positionAddress === command.position_address;
+  if (!bound) {
+    throw new GatewayError(
+      "POSITION_BINDING_MISMATCH",
+      "the built transaction does not act on the command's position",
+    );
+  }
+}
+
+/** The command's own limits checked against what the chain says right now. */
+function marketRejection(command: DlmmCommandV2, market: MarketFacts): Rejection | undefined {
+  if (!isEntry(command)) {
+    // An exit swaps nothing: its quote is reported, never a reason to stay in (D08).
+    return undefined;
+  }
+  const anchor = command.active_bin_id;
+  const tolerance = command.active_bin_tolerance;
+  if (
+    anchor === undefined ||
+    tolerance === undefined ||
+    Math.abs(market.activeBinId - anchor) > tolerance
+  ) {
+    return {
+      code: "ACTIVE_BIN_DRIFT",
+      message: "pool active bin moved beyond the command tolerance",
+    };
+  }
+  if (
+    market.tokenXDecimals !== command.token_x_decimals ||
+    market.tokenYDecimals !== command.token_y_decimals
+  ) {
+    return {
+      code: "TOKEN_DECIMALS_MISMATCH",
+      message: "mint decimals differ from the ones the amounts were computed with",
+    };
+  }
+  if (market.priceImpactBps === null || market.priceImpactBps > command.max_slippage_bps) {
+    return { code: "SLIPPAGE_BREACH", message: "quoted price impact exceeds the command limit" };
+  }
+  return undefined;
+}
+
+function assertCompleteSimulation(result: SimulationTransportResult): void {
+  if (
+    !Number.isInteger(result.computeUnits) ||
+    result.computeUnits < 0 ||
+    !Number.isInteger(result.lastValidBlockHeight) ||
+    result.lastValidBlockHeight < 0 ||
+    result.blockhash.length === 0
+  ) {
+    throw new GatewayError("SIMULATION_INCOMPLETE", "transaction simulation is incomplete");
+  }
+}
+
+export function commandDigest(command: DlmmCommandV2): string {
   const normalized: Record<string, unknown> = {
     ...command,
     expires_at: normalizeTimestamp(command.expires_at),
@@ -895,15 +1044,15 @@ export function commandDigest(command: DlmmCommandV1): string {
   return sha256(normalized);
 }
 
-export function simulationDigest(simulation: SimulationResultV1): string {
-  const unsigned = { ...simulation } as Partial<SimulationResultV1>;
+export function simulationDigest(simulation: SimulationResultV2): string {
+  const unsigned = { ...simulation } as Partial<SimulationResultV2>;
   delete unsigned.simulation_digest;
   return sha256({ ...unsigned, simulated_at: normalizeTimestamp(simulation.simulated_at) });
 }
 
 function finalizeSimulation(
-  simulation: Omit<SimulationResultV1, "simulation_digest">,
-): SimulationResultV1 {
+  simulation: Omit<SimulationResultV2, "simulation_digest">,
+): SimulationResultV2 {
   const unsigned = { ...simulation, simulation_digest: "0".repeat(64) };
   return { ...simulation, simulation_digest: simulationDigest(unsigned) };
 }

@@ -6,12 +6,11 @@ import Fastify, {
 import { Connection } from "@solana/web3.js";
 import { timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { ZodError } from "zod";
 
-import { parseDlmmCommandV1 } from "./contracts.js";
+import { ContractVersionError, parseDlmmCommandV2, parseQuoteRequestV1 } from "./contracts.js";
 import {
   ExecutionEngine,
   FileExecutionStateStore,
@@ -20,18 +19,26 @@ import {
   type LivePromotionEvidence,
   type TradingMode,
 } from "./engine.js";
+import { QuoteService } from "./quotes.js";
 import {
   FileSecretSignerProvider,
   OfficialMeteoraDlmmBoundary,
+  OfficialMeteoraQuoter,
+  SolanaLiveReadiness,
   SolanaRpcTransport,
+  type LiveReadiness,
+  type LiveReadinessProbe,
 } from "./sdk.js";
 
 export interface ExecutorServerConfig {
   engine?: ExecutionEngine;
+  /** Read-only quotes; needs an RPC but never a wallet, so SHADOW can serve them. */
+  quotes?: QuoteService;
   internalToken?: string;
   modeToken?: string;
   configuredMode?: TradingMode;
-  liveDependenciesReady?: boolean;
+  /** Wallet, RPC and price impact measurement, re-checked on every readiness request. */
+  liveReadiness?: LiveReadinessProbe;
 }
 
 export async function buildRuntimeConfig(
@@ -50,17 +57,19 @@ export async function buildRuntimeConfig(
     environ.EXECUTOR_APPROVAL_SECRET,
     environ.EXECUTOR_APPROVAL_SECRET_FILE,
   );
+  const connection = openConnection(environ.SOLANA_RPC_URL);
   const base: ExecutorServerConfig = {
     configuredMode,
-    liveDependenciesReady: false,
     ...(internalToken === undefined ? {} : { internalToken }),
     ...(modeToken === undefined ? {} : { modeToken }),
+    ...(connection === undefined || internalToken === undefined
+      ? {}
+      : { quotes: new QuoteService(new OfficialMeteoraQuoter(connection)) }),
   };
   if (configuredMode === "SHADOW") {
     return base;
   }
 
-  const rpcUrl = environ.SOLANA_RPC_URL;
   const walletPath = environ.WALLET_KEYPAIR_FILE;
   const statePath = environ.EXECUTOR_STATE_FILE;
   const livePromotion =
@@ -68,7 +77,7 @@ export async function buildRuntimeConfig(
       ? await readLivePromotion(environ.LIVE_PROMOTION_FILE)
       : undefined;
   if (
-    rpcUrl === undefined ||
+    connection === undefined ||
     walletPath === undefined ||
     statePath === undefined ||
     internalToken === undefined ||
@@ -79,8 +88,7 @@ export async function buildRuntimeConfig(
     return base;
   }
   try {
-    const connection = new Connection(rpcUrl, "confirmed");
-    const signers = new FileSecretSignerProvider(walletPath, dirname(walletPath));
+    const signers = new FileSecretSignerProvider(walletPath);
     const wallet = await signers.loadWalletSigner();
     if (
       environ.WALLET_PUBLIC_KEY !== undefined &&
@@ -99,9 +107,12 @@ export async function buildRuntimeConfig(
         : { approvalProofVerifier: new HmacApprovalProofVerifier(approvalSecret) }),
       ...(livePromotion === undefined ? {} : { livePromotion }),
     });
-    // The official boundary currently has no trustworthy quote-derived price impact.
-    // Keep the process available for diagnostics, but never advertise money readiness.
-    return { ...base, engine, liveDependenciesReady: false };
+    const liveReadiness = new SolanaLiveReadiness(
+      connection,
+      signers,
+      wallet.publicKey.toBase58(),
+    );
+    return { ...base, engine, liveReadiness };
   } catch {
     return base;
   }
@@ -116,6 +127,30 @@ function tokenMatches(expected: string | undefined, actual: string | undefined):
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
+const unavailable: LiveReadiness = { wallet: false, rpc: false, priceImpact: false };
+
+async function missingForMoney(config: ExecutorServerConfig): Promise<string[]> {
+  if (
+    config.engine === undefined ||
+    config.internalToken === undefined ||
+    config.modeToken === undefined ||
+    config.liveReadiness === undefined
+  ) {
+    return ["configuration"];
+  }
+  let state: LiveReadiness;
+  try {
+    state = await config.liveReadiness.check();
+  } catch {
+    state = unavailable;
+  }
+  return [
+    ...(state.wallet ? [] : ["wallet"]),
+    ...(state.rpc ? [] : ["rpc"]),
+    ...(state.priceImpact ? [] : ["price_impact"]),
+  ];
+}
+
 export function buildServer(
   options: FastifyServerOptions = {},
   config: ExecutorServerConfig = {},
@@ -127,27 +162,45 @@ export function buildServer(
     if (config.configuredMode === "SHADOW") {
       return reply.code(200).send({ status: "ready", mode: "SHADOW" });
     }
-    if (
-      (config.configuredMode === "APPROVAL" || config.configuredMode === "LIVE") &&
-      config.engine !== undefined &&
-      config.liveDependenciesReady === true &&
-      config.internalToken !== undefined &&
-      config.modeToken !== undefined
-    ) {
+    if (config.configuredMode !== "APPROVAL" && config.configuredMode !== "LIVE") {
+      return reply.code(503).send({ status: "not_ready", missing: ["configuration"] });
+    }
+    // Names of what is missing only - never a value, a path or a key.
+    const missing = await missingForMoney(config);
+    if (missing.length === 0) {
       return reply.code(200).send({ status: "ready", mode: config.configuredMode });
     }
-    return reply.code(503).send({ status: "not_ready" });
+    return reply.code(503).send({ status: "not_ready", missing });
+  });
+
+  server.post("/v1/quotes", async (request, reply) => {
+    if (!tokenMatches(config.internalToken, request.headers["x-internal-token"] as string | undefined)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    if (config.quotes === undefined) {
+      return reply.code(503).send({ error: "quotes_unavailable" });
+    }
+    try {
+      return reply.code(200).send(await config.quotes.quote(parseQuoteRequestV1(request.body)));
+    } catch (error) {
+      return sendKnownError(reply, error);
+    }
   });
 
   server.post("/v1/simulations", async (request, reply) => {
     if (!tokenMatches(config.internalToken, request.headers["x-internal-token"] as string | undefined)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
+    let command;
+    try {
+      command = parseDlmmCommandV2(request.body);
+    } catch (error) {
+      return sendKnownError(reply, error);
+    }
     if (config.engine === undefined) {
       return reply.code(503).send({ error: "execution_unavailable" });
     }
     try {
-      const command = parseDlmmCommandV1(request.body);
       return reply.code(200).send(await config.engine.simulate(command));
     } catch (error) {
       return sendKnownError(reply, error);
@@ -158,6 +211,12 @@ export function buildServer(
     if (!tokenMatches(config.internalToken, request.headers["x-internal-token"] as string | undefined)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
+    let command;
+    try {
+      command = parseDlmmCommandV2(request.body);
+    } catch (error) {
+      return sendKnownError(reply, error);
+    }
     if (config.engine === undefined) {
       return reply.code(503).send({ error: "execution_unavailable" });
     }
@@ -166,7 +225,6 @@ export function buildServer(
       return reply.code(400).send({ error: "idempotency_key_required" });
     }
     try {
-      const command = parseDlmmCommandV1(request.body);
       const modeTokenVerified = tokenMatches(
         config.modeToken,
         request.headers["x-mode-token"] as string | undefined,
@@ -218,6 +276,9 @@ function sendKnownError(
   reply: FastifyReply,
   error: unknown,
 ): unknown {
+  if (error instanceof ContractVersionError) {
+    return reply.code(400).send({ error: "unsupported_contract_version" });
+  }
   if (error instanceof ZodError) {
     return reply.code(400).send({ error: "invalid_contract" });
   }
@@ -239,6 +300,17 @@ async function start(): Promise<void> {
 
 function parseMode(value: string | undefined): TradingMode {
   return value === "APPROVAL" || value === "LIVE" ? value : "SHADOW";
+}
+
+function openConnection(url: string | undefined): Connection | undefined {
+  if (url === undefined || url.trim().length === 0) {
+    return undefined;
+  }
+  try {
+    return new Connection(url, "confirmed");
+  } catch {
+    return undefined;
+  }
 }
 
 async function readOptionalSecret(

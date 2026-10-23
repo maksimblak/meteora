@@ -5,8 +5,11 @@ Order of guarantees of an entry (each step fails closed and never re-orders):
 1. ``claim_entry`` - PENDING -> EXECUTING under the kill-switch / daily-stop guards;
 2. *guard* - the durable mode state is re-read; kill switch, daily stop or a mode
    change since the claim blocks the command (closes the claim -> submit seam);
-3. *audit* - position context and a ``CommandSubmitted`` record are made durable;
-   an unaudited command is never sent and the failure raises a critical alert;
+3. *audit* - a ``CommandSubmitted`` record and the position context are made durable;
+   an unaudited command is never sent and the failure raises a critical alert. A
+   gateway OPEN has no position until the executor simulates it (contract V2: the
+   executor creates the position key), so its context is written right after that
+   simulation, under the address the executor named, and before anything is sent;
 4. *submit* - the submitter calls the guard again immediately before the one
    irreversible step (shadow fill or gateway submit, after any simulation), and the
    execution service re-reads the kill switch right before ``gateway.submit``;
@@ -21,7 +24,7 @@ simulation and the gateway, one bounded sequence of attempts per position.
 """
 
 import hashlib
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
@@ -38,13 +41,18 @@ from src.domain.models.trading import TradingMode
 from src.domain.risk.models import SizedPlan
 from src.domain.strategy import PositionActionKind
 from src.execution.contracts import (
+    DlmmCommand,
     DlmmCommandV1,
+    DlmmCommandV2,
     DlmmOperation,
     ExecutionPhase,
     ExecutionState,
+    GatewayReceipt,
     GatewayReceiptV1,
+    GatewayReceiptV2,
     GatewayState,
     LiquidityStrategy,
+    SimulationResultV2,
     canonical_command_digest,
 )
 from src.execution.service import (
@@ -79,6 +87,10 @@ _SPENT_PHASES = frozenset({ExecutionPhase.FAILED, ExecutionPhase.EXPIRED})
 POSITION_ACTION_ATTEMPTS = 5
 POSITION_ACTION_TTL = timedelta(minutes=2)
 REDUCE_BPS = 5_000
+# Bins the pool may move between the snapshot an entry was planned on and the executor's
+# simulation before the planned range is stale and the executor refuses the entry.
+ACTIVE_BIN_TOLERANCE = 3
+_LIQUIDITY_OPERATIONS = frozenset({DlmmOperation.OPEN, DlmmOperation.ADD})
 
 
 def shadow_address(seed: str) -> str:
@@ -103,6 +115,8 @@ def entry_idempotency_key(plan_id: UUID) -> str:
 
 
 def entry_position_address(plan_id: UUID) -> str:
+    """The synthetic position of a SHADOW entry; a gateway position comes from the executor."""
+
     return shadow_address(f"position:{plan_id}")
 
 
@@ -165,40 +179,54 @@ def build_entry_command(
     correlation_id: str,
     ruleset_version: str,
     wallet_address: str,
-    position_address: str,
     max_slippage_bps: int,
     anchor: BinAnchor | None = None,
-) -> DlmmCommandV1:
+    active_bin_tolerance: int = ACTIVE_BIN_TOLERANCE,
+) -> DlmmCommand:
     """Split the sized capital evenly between Y and X at the observed price.
 
-    SHADOW keeps the strategy's relative bins (the shadow broker models them). Any
-    other mode needs a ``BinAnchor``: bins become ``active_bin_id + offset`` and X is
-    expressed in its own base units through both token decimals. Without the anchor
-    the command is refused - an offset is never sent as an absolute bin id.
+    SHADOW: a V1 lifecycle command on the synthetic shadow position with the strategy's
+    relative bins (the shadow broker models them).
+
+    Any other mode: a V2 command *without* a position - the executor creates it and the
+    receipt names it - anchored on a ``BinAnchor``: bins become ``active_bin_id + offset``
+    (the executor refuses the entry when the pool moved more than ``active_bin_tolerance``
+    bins) and X is expressed in its own base units through both mint decimals, rounded
+    down to a whole number of accounting units (X in Y's scale) so the booked fill is
+    exactly what was sent. Without the anchor the command is refused - an offset is
+    never sent as an absolute bin id.
     """
 
     amount_y = size_base_units // 2
-    if mode is TradingMode.SHADOW:
-        min_bin_id, max_bin_id = lower_bin_offset, upper_bin_offset
-        scale = Decimal(1)
-    else:
-        if anchor is None:
-            raise EntryCommandUnavailable("ENTRY_ANCHOR_UNAVAILABLE")
-        if market.price <= 0:
-            raise EntryCommandUnavailable("MARKET_PRICE_UNAVAILABLE")
-        min_bin_id = anchor.active_bin_id + lower_bin_offset
-        max_bin_id = anchor.active_bin_id + upper_bin_offset
-        scale = Decimal(10) ** (anchor.base_decimals - anchor.quote_decimals)
-    amount_x = int(
-        (Decimal(size_base_units - amount_y) / market.price * scale).to_integral_value(
-            rounding=ROUND_FLOOR
-        )
-    )
+    quote_value_x = Decimal(size_base_units - amount_y)
     try:
         correlation = UUID(correlation_id)
     except ValueError:
         correlation = uuid5(NAMESPACE_URL, f"correlation:{correlation_id}")
-    return DlmmCommandV1(
+    if mode is TradingMode.SHADOW:
+        return DlmmCommandV1(
+            command_id=entry_command_id(plan_id),
+            idempotency_key=entry_idempotency_key(plan_id),
+            correlation_id=correlation,
+            ruleset_version=ruleset_version,
+            mode=mode,
+            operation=DlmmOperation.OPEN,
+            pool_address=market.pool.address.root,
+            wallet_address=wallet_address,
+            position_address=entry_position_address(plan_id),
+            expires_at=expires_at,
+            max_slippage_bps=max_slippage_bps,
+            strategy=LiquidityStrategy(strategy_kind),
+            min_bin_id=lower_bin_offset,
+            max_bin_id=upper_bin_offset,
+            amount_x=str(_floor(quote_value_x / market.price)),
+            amount_y=str(amount_y),
+        )
+    if anchor is None:
+        raise EntryCommandUnavailable("ENTRY_ANCHOR_UNAVAILABLE")
+    if market.price <= 0:
+        raise EntryCommandUnavailable("MARKET_PRICE_UNAVAILABLE")
+    return DlmmCommandV2(
         command_id=entry_command_id(plan_id),
         idempotency_key=entry_idempotency_key(plan_id),
         correlation_id=correlation,
@@ -207,26 +235,48 @@ def build_entry_command(
         operation=DlmmOperation.OPEN,
         pool_address=market.pool.address.root,
         wallet_address=wallet_address,
-        position_address=position_address,
         expires_at=expires_at,
         max_slippage_bps=max_slippage_bps,
         strategy=LiquidityStrategy(strategy_kind),
-        min_bin_id=min_bin_id,
-        max_bin_id=max_bin_id,
-        amount_x=str(amount_x),
+        min_bin_id=anchor.active_bin_id + lower_bin_offset,
+        max_bin_id=anchor.active_bin_id + upper_bin_offset,
+        amount_x=str(_token_amount_x(quote_value_x / market.price, anchor)),
         amount_y=str(amount_y),
+        active_bin_id=anchor.active_bin_id,
+        active_bin_tolerance=active_bin_tolerance,
+        token_x_decimals=anchor.base_decimals,
+        token_y_decimals=anchor.quote_decimals,
     )
 
 
-def _anchor_refusal(anchor: BinAnchor | None) -> str | None:
-    if anchor is None:
-        return "ENTRY_ANCHOR_UNAVAILABLE"
-    if anchor.base_decimals != anchor.quote_decimals:
-        # Positions are valued as quantity_x * price + quantity_y: exact only when both
-        # tokens share decimals. A position whose P&L and daily stop would be wrong is
-        # never opened.
-        return "ACCOUNTING_UNITS_UNSUPPORTED"
-    return None
+def _floor(value: Decimal) -> int:
+    return int(value.to_integral_value(rounding=ROUND_FLOOR))
+
+
+def _token_amount_x(accounting_x: Decimal, anchor: BinAnchor) -> int:
+    """X base units for ``accounting_x`` (X in Y's scale), a whole number of accounting units."""
+
+    shift = anchor.base_decimals - anchor.quote_decimals
+    if shift >= 0:
+        return _floor(accounting_x) * _power_of_ten(shift)
+    return _floor(accounting_x / _power_of_ten(-shift))
+
+
+def _power_of_ten(exponent: int) -> int:
+    factor: int = 10**exponent
+    return factor
+
+
+def accounting_amount_x(amount_x: int, token_x_decimals: int, token_y_decimals: int) -> int:
+    """X base units in the ledger's scale (Y's decimals): ``quantity_x * price`` is then Y."""
+
+    shift = token_y_decimals - token_x_decimals
+    if shift >= 0:
+        return amount_x * _power_of_ten(shift)
+    divisor = _power_of_ten(-shift)
+    if amount_x % divisor:
+        raise ValueError("amount_x is not a whole number of accounting units")
+    return amount_x // divisor
 
 
 # --- submitters --------------------------------------------------------------------------
@@ -247,11 +297,17 @@ class SubmitResult:
 
 
 type SubmitGuard = Callable[[], None]
+# Makes the position context durable under the executor-named address; raises to stop.
+type PositionRecorder = Callable[[str], Awaitable[None]]
 
 
 class CommandSubmitter(Protocol):
     async def submit(
-        self, command: DlmmCommandV1, market: PoolSnapshot, guard: SubmitGuard
+        self,
+        command: DlmmCommand,
+        market: PoolSnapshot,
+        guard: SubmitGuard,
+        record_position: PositionRecorder | None = None,
     ) -> SubmitResult: ...
 
 
@@ -263,12 +319,19 @@ class ShadowSubmitter:
         self._costs = costs
 
     async def submit(
-        self, command: DlmmCommandV1, market: PoolSnapshot, guard: SubmitGuard
+        self,
+        command: DlmmCommand,
+        market: PoolSnapshot,
+        guard: SubmitGuard,
+        record_position: PositionRecorder | None = None,
     ) -> SubmitResult:
+        del record_position  # a SHADOW position is synthetic; its context precedes the fill
         try:
             guard()
         except Exception as error:
             return SubmitResult(SubmitStatus.BLOCKED, detail=str(error))
+        if not isinstance(command, DlmmCommandV1):
+            return SubmitResult(SubmitStatus.FAILED, detail="SHADOW_REQUIRES_LIFECYCLE_COMMAND")
         try:
             receipt = self._broker.apply(command, market, self._costs)
         except ValueError as error:
@@ -286,16 +349,16 @@ class CommandResolver:
 
     def __init__(self, store: ExecutionStore) -> None:
         self._store = store
-        self._staged: dict[UUID, DlmmCommandV1] = {}
+        self._staged: dict[UUID, DlmmCommand] = {}
 
-    def stage(self, command: DlmmCommandV1) -> UUID:
+    def stage(self, command: DlmmCommand) -> UUID:
         self._staged[command.command_id] = command
         return command.command_id
 
     def discard(self, command_id: UUID) -> None:
         self._staged.pop(command_id, None)
 
-    async def resolve(self, plan_id: UUID) -> DlmmCommandV1:
+    async def resolve(self, plan_id: UUID) -> DlmmCommand:
         record = await self._store.get(plan_id)
         if record is not None:
             return record.command
@@ -320,6 +383,11 @@ class GatewayFillBook:
 
     The fill is the bound simulation's measured price impact at ``price``; network
     and tip costs use the policy cost model (lamport fees are not quote units).
+
+    The ledger records V1 lifecycle commands. A V2 command is booked as its lifecycle
+    form: on the position its receipt names and with X converted by the simulation's
+    mint decimals into Y's scale, so ``quantity_x * price + quantity_y`` is Y base units
+    for any pair of decimals. ``command_digest`` stays the digest of what was executed.
     """
 
     def __init__(
@@ -342,7 +410,7 @@ class GatewayFillBook:
         receipt = record.receipt
         if receipt is None or receipt.state is not GatewayState.CONFIRMED:
             raise ValueError("only a confirmed gateway command is booked")
-        command = record.command
+        command = lifecycle_command(record)
         existing = self._accounting.receipt_for(command.idempotency_key)
         if existing is not None:
             if existing.command_digest != receipt.command_digest:
@@ -380,7 +448,9 @@ class GatewayFillBook:
             network_base_units=fill.network_fee_base_units,
             jito_base_units=fill.jito_tip_base_units,
         )
-        events = _booking_events(command, receipt, step.position, now)
+        events = _booking_events(
+            command, receipt, step.position, now, record.simulation.price_impact_bps
+        )
         booked = ShadowReceipt(
             command=command,
             command_digest=receipt.command_digest,
@@ -389,7 +459,7 @@ class GatewayFillBook:
             fill_digest=receipt.simulation_digest,
             applied_at=now,
             phase=ExecutionPhase.CONFIRMED,
-            gateway_receipt=receipt,
+            gateway_receipt=_lifecycle_receipt(receipt),
             position=step.position,
             valuation=valuation,
             ledger_entry_ids=(entry.entry_id,),
@@ -409,8 +479,63 @@ class GatewayFillBook:
         )
 
 
+def lifecycle_command(record: ExecutionRecord) -> DlmmCommandV1:
+    """The executed command in the ledger's V1 lifecycle shape (see ``GatewayFillBook``)."""
+
+    command = record.command
+    if isinstance(command, DlmmCommandV1):
+        return command
+    position = record.position_address
+    if position is None or not isinstance(record.receipt, GatewayReceiptV2):
+        raise ValueError("a V2 command is booked only on the position its receipt names")
+    amount_x = command.amount_x
+    if command.operation in _LIQUIDITY_OPERATIONS:
+        simulation = record.simulation
+        if (
+            not isinstance(simulation, SimulationResultV2)
+            or simulation.token_x_decimals is None
+            or simulation.token_y_decimals is None
+            or simulation.token_x_decimals != command.token_x_decimals
+            or simulation.token_y_decimals != command.token_y_decimals
+            or amount_x is None
+        ):
+            raise ValueError("mint decimals of the fill are unknown or differ from the command")
+        amount_x = str(
+            accounting_amount_x(
+                int(amount_x), simulation.token_x_decimals, simulation.token_y_decimals
+            )
+        )
+    return DlmmCommandV1(
+        command_id=command.command_id,
+        idempotency_key=command.idempotency_key,
+        correlation_id=command.correlation_id,
+        ruleset_version=command.ruleset_version,
+        mode=command.mode,
+        operation=command.operation,
+        pool_address=command.pool_address,
+        wallet_address=command.wallet_address,
+        position_address=position,
+        expires_at=command.expires_at,
+        max_slippage_bps=command.max_slippage_bps,
+        strategy=command.strategy,
+        min_bin_id=command.min_bin_id,
+        max_bin_id=command.max_bin_id,
+        amount_x=amount_x,
+        amount_y=command.amount_y,
+        remove_bps=command.remove_bps,
+    )
+
+
+def _lifecycle_receipt(receipt: GatewayReceipt) -> GatewayReceiptV1:
+    return receipt.lifecycle() if isinstance(receipt, GatewayReceiptV2) else receipt
+
+
 def _booking_events(
-    command: DlmmCommandV1, receipt: GatewayReceiptV1, position: ShadowPosition, now: datetime
+    command: DlmmCommandV1,
+    receipt: GatewayReceipt,
+    position: ShadowPosition,
+    now: datetime,
+    price_impact_bps: int | None,
 ) -> tuple[AuditEvent, ...]:
     def event(kind: EventType, aggregate_id: UUID, payload: dict[str, object]) -> AuditEvent:
         return AuditEvent(
@@ -434,6 +559,8 @@ def _booking_events(
                 "idempotency_key": command.idempotency_key,
                 "position_id": position.position_id,
                 "signatures": list(receipt.signatures),
+                # The quoted impact of the swap leg (None: an exit's quote was unavailable).
+                "price_impact_bps": price_impact_bps,
             },
         )
     ]
@@ -457,7 +584,7 @@ def _booking_events(
     return tuple(events)
 
 
-async def execute_command(service: ExecutionService, command: DlmmCommandV1) -> SubmitResult:
+async def execute_command(service: ExecutionService, command: DlmmCommand) -> SubmitResult:
     """Execute once; a block is definitive only while the durable record proves that
     nothing left (no receipt, not SUBMITTING/SUBMITTED/UNKNOWN)."""
 
@@ -475,7 +602,7 @@ async def execute_command(service: ExecutionService, command: DlmmCommandV1) -> 
 
 
 def settled_result(
-    state: ExecutionState | None, command: DlmmCommandV1, *, blocked: str
+    state: ExecutionState | None, command: DlmmCommand, *, blocked: str
 ) -> SubmitResult:
     if state is None:
         return SubmitResult(SubmitStatus.FAILED, detail=blocked)
@@ -486,9 +613,15 @@ def settled_result(
     return SubmitResult(SubmitStatus.FAILED, detail=blocked)
 
 
-def _receipt_result(receipt: GatewayReceiptV1, command: DlmmCommandV1) -> SubmitResult:
+def _receipt_result(receipt: GatewayReceipt, command: DlmmCommand) -> SubmitResult:
     if receipt.state is GatewayState.CONFIRMED:
-        return SubmitResult(SubmitStatus.CONFIRMED, position_id=command.position_address)
+        # A V2 position exists only as the executor named it in the receipt.
+        position = (
+            receipt.position_address
+            if isinstance(receipt, GatewayReceiptV2)
+            else command.position_address
+        )
+        return SubmitResult(SubmitStatus.CONFIRMED, position_id=position)
     if receipt.state is GatewayState.FAILED:
         return SubmitResult(SubmitStatus.FAILED, detail="CHAIN_FAILED")
     return SubmitResult(SubmitStatus.PENDING, detail=receipt.state.value)
@@ -500,6 +633,8 @@ class GatewaySubmitter:
     APPROVAL stops after the simulated preview (an operator approval is the manual
     step of that stage; ``GatewayEntrySettler`` executes it once approved); LIVE
     submits only after the guard re-checks the durable state *after* simulation.
+    ``record_position`` runs right after the simulation, before either: it receives
+    the position the executor created for the OPEN.
     """
 
     def __init__(
@@ -511,7 +646,11 @@ class GatewaySubmitter:
         self._log = get_logger("worker.gateway")
 
     async def submit(
-        self, command: DlmmCommandV1, market: PoolSnapshot, guard: SubmitGuard
+        self,
+        command: DlmmCommand,
+        market: PoolSnapshot,
+        guard: SubmitGuard,
+        record_position: PositionRecorder | None = None,
     ) -> SubmitResult:
         try:
             guard()
@@ -524,6 +663,21 @@ class GatewaySubmitter:
             return SubmitResult(SubmitStatus.FAILED, detail=str(error))
         finally:
             self._resolver.discard(command.command_id)
+        if record_position is not None:
+            simulation = preview.simulation
+            position = (
+                simulation.position_address
+                if isinstance(simulation, SimulationResultV2)
+                else command.position_address
+            )
+            if position is None:
+                return SubmitResult(SubmitStatus.FAILED, detail="POSITION_NOT_ASSIGNED")
+            try:
+                await record_position(position)
+            except Exception as error:
+                return SubmitResult(
+                    SubmitStatus.BLOCKED, detail=getattr(error, "reason", "POSITION_NOT_RECORDED")
+                )
         if preview.phase is ExecutionPhase.AWAITING_APPROVAL:
             return SubmitResult(SubmitStatus.PENDING, detail="AWAITING_APPROVAL")
         try:
@@ -647,10 +801,11 @@ class EntryExecutor:
         anchor: BinAnchor | None = None
         if mode is not TradingMode.SHADOW:
             anchor = self._anchors(market)
-            refusal = _anchor_refusal(anchor)
-            if refusal is not None:
+            if anchor is None:
                 self._cancel(plan_id)
-                return self._finish(mode, EntryResult(EntryStatus.BLOCKED, plan_id, refusal))
+                return self._finish(
+                    mode, EntryResult(EntryStatus.BLOCKED, plan_id, "ENTRY_ANCHOR_UNAVAILABLE")
+                )
         try:
             self._modes.claim_entry(plan_id, self._clock.now())
         except ValueError as error:
@@ -660,7 +815,6 @@ class EntryExecutor:
             )
 
         plan = sized.plan
-        position_address = entry_position_address(plan_id)
         try:
             command = build_entry_command(
                 plan_id=plan_id,
@@ -674,7 +828,6 @@ class EntryExecutor:
                 correlation_id=str(correlation_id),
                 ruleset_version=plan.ruleset_version,
                 wallet_address=self._wallet,
-                position_address=position_address,
                 max_slippage_bps=self._policy.max_slippage_bps,
                 anchor=anchor,
             )
@@ -689,9 +842,14 @@ class EntryExecutor:
         except EntryBlocked as blocked:
             return await self._blocked(mode, plan_id, command, blocked.reason, correlation_id)
 
-        context = _position_context(plan_id, decision_id, sized, market, mode, command)
         try:
-            await self._contexts.put(context)
+            if mode is TradingMode.SHADOW:
+                await self._contexts.put(
+                    _position_context(
+                        plan_id, decision_id, sized, market, mode, command,
+                        position_id=entry_position_address(plan_id),
+                    )
+                )
             await self._audit.append(
                 audit_event(
                     EventType.COMMAND_SUBMITTED,
@@ -721,7 +879,11 @@ class EntryExecutor:
             )
 
         try:
-            result = await submitter.submit(command, market, guard)
+            if mode is TradingMode.SHADOW:
+                result = await submitter.submit(command, market, guard)
+            else:
+                recorder = self._position_recorder(plan_id, decision_id, sized, market, command)
+                result = await submitter.submit(command, market, guard, recorder)
         except Exception as error:
             # The outcome is unknown: keep the plan EXECUTING (capacity stays reserved)
             # so restart recovery reconciles it; never retry the submit here.
@@ -746,16 +908,43 @@ class EntryExecutor:
             EntryResult(EntryStatus.FAILED, plan_id, result.detail, command_id=command.command_id),
         )
 
-    def _confirm(self, plan_id: UUID, position_id: str, command: DlmmCommandV1) -> EntryResult:
+    def _confirm(self, plan_id: UUID, position_id: str, command: DlmmCommand) -> EntryResult:
         return confirm_filled_entry(
             self._modes, self._alerts, plan_id, position_id, command.command_id
         )
+
+    def _position_recorder(
+        self,
+        plan_id: UUID,
+        decision_id: UUID,
+        sized: SizedPlan,
+        market: PoolSnapshot,
+        command: DlmmCommand,
+    ) -> PositionRecorder:
+        """The context of a gateway entry, under the position the executor created."""
+
+        async def record(position_id: str) -> None:
+            context = _position_context(
+                plan_id, decision_id, sized, market, command.mode, command,
+                position_id=position_id,
+            )
+            try:
+                await self._contexts.put(context)
+            except Exception as error:
+                self._log.critical("audit_persistence_failed", **error_fields(error))
+                self._alerts.raise_alert(
+                    "AUDIT_PERSISTENCE_FAILED",
+                    "position context could not be persisted; money execution was blocked",
+                )
+                raise EntryBlocked("AUDIT_PERSISTENCE_FAILED") from error
+
+        return record
 
     async def _blocked(
         self,
         mode: TradingMode,
         plan_id: UUID,
-        command: DlmmCommandV1,
+        command: DlmmCommand,
         reason: str,
         correlation_id: UUID,
     ) -> EntryResult:
@@ -857,7 +1046,9 @@ def _position_context(
     sized: SizedPlan,
     market: PoolSnapshot,
     mode: TradingMode,
-    command: DlmmCommandV1,
+    command: DlmmCommand,
+    *,
+    position_id: str,
 ) -> PositionContext:
     plan = sized.plan
     step = Decimal(1) + Decimal(market.bin_step) / _BPS
@@ -865,7 +1056,7 @@ def _position_context(
     long = market.windows.get("30m")
     fees = long.fees if long is not None and long.fees is not None else Decimal(0)
     return PositionContext(
-        position_id=command.position_address or entry_position_address(plan_id),
+        position_id=position_id,
         plan_id=plan_id,
         decision_id=decision_id,
         pool_address=market.pool.address.root,
@@ -998,14 +1189,25 @@ class GatewayEntrySettler:
                 return None
             outcome = settled_result(state, command, blocked=record.phase.value)
         elif record.phase is ExecutionPhase.CONFIRMED:
-            outcome = SubmitResult(SubmitStatus.CONFIRMED, position_id=command.position_address)
+            # Possibly reconciled elsewhere (the recovery job): the receipt names the position.
+            outcome = SubmitResult(SubmitStatus.CONFIRMED, position_id=record.position_address)
         else:
             return None
         return await self._settle(plan, command, outcome)
 
     async def _settle(
-        self, plan: PendingPlan, command: DlmmCommandV1, outcome: SubmitResult
+        self, plan: PendingPlan, command: DlmmCommand, outcome: SubmitResult
     ) -> EntryResult:
+        if outcome.status is SubmitStatus.CONFIRMED and outcome.position_id is None:
+            # Landed on chain but unnamed: never fail it (the position would be orphaned).
+            self._alerts.raise_alert(
+                "ENTRY_POSITION_UNKNOWN",
+                f"entry of plan {plan.plan_id} is confirmed but its position is not known",
+                dedupe_key=f"position-unknown:{plan.plan_id}",
+            )
+            return EntryResult(
+                EntryStatus.PENDING, plan.plan_id, "POSITION_UNKNOWN", command_id=command.command_id
+            )
         if outcome.status is SubmitStatus.CONFIRMED and outcome.position_id is not None:
             context = await self._contexts.get(outcome.position_id)
             if context is not None:
@@ -1235,7 +1437,7 @@ class GatewayPositionManager:
             return PositionActionResult(
                 position_id, PositionActionStatus.FAILED, attempt, "CONTEXT_MISSING"
             )
-        command = DlmmCommandV1(
+        command = DlmmCommandV2(
             command_id=position_action_command_id(position_id, attempt),
             idempotency_key=position_action_key(position_id, attempt),
             correlation_id=_correlation(context.correlation_id),
@@ -1274,7 +1476,7 @@ class GatewayPositionManager:
     async def _outcome(
         self,
         position: ShadowPosition,
-        command: DlmmCommandV1,
+        command: DlmmCommand,
         outcome: SubmitResult,
         attempt: int,
     ) -> PositionActionResult:
@@ -1304,7 +1506,7 @@ class GatewayPositionManager:
         )
 
     async def _settle(
-        self, position: ShadowPosition, command: DlmmCommandV1, attempt: int
+        self, position: ShadowPosition, command: DlmmCommand, attempt: int
     ) -> PositionActionResult:
         position_id = position.position_id
         market = await self._history.history(

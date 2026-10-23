@@ -14,12 +14,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.execution.contracts import (
-    DlmmCommandV1,
     ExecutionPhase,
-    GatewayReceiptV1,
     OperatorApproval,
-    SimulationResultV1,
     canonical_command_digest,
+    command_from_payload,
+    receipt_from_payload,
+    simulation_from_payload,
 )
 from src.execution.service import ExecutionBlocked, ExecutionRecord
 from src.persistence.models import ExecutionApprovalClaimRecord, ExecutionStateRecord
@@ -40,17 +40,16 @@ def record_payload(record: ExecutionRecord) -> dict[str, Any]:
 
 
 def record_from_payload(value: dict[str, Any]) -> ExecutionRecord:
+    # Each part is read by its own contract version (V1 records written before V2 included).
     return ExecutionRecord(
-        command=DlmmCommandV1.model_validate(value["command"]),
-        simulation=SimulationResultV1.model_validate(value["simulation"]),
+        command=command_from_payload(value["command"]),
+        simulation=simulation_from_payload(value["simulation"]),
         phase=ExecutionPhase(value["phase"]),
         approval=None
         if value["approval"] is None
         else OperatorApproval.model_validate(value["approval"]),
         approval_consumed=bool(value["approval_consumed"]),
-        receipt=None
-        if value["receipt"] is None
-        else GatewayReceiptV1.model_validate(value["receipt"]),
+        receipt=None if value["receipt"] is None else receipt_from_payload(value["receipt"]),
     )
 
 

@@ -3,7 +3,8 @@
 Opt-in: it runs only with ``EXECUTOR_INTEGRATION_URL`` (and the executor's internal
 token in ``EXECUTOR_INTEGRATION_TOKEN``), e.g. an executor started from compose with
 ``TRADING_MODE=APPROVAL`` and that token but without RPC, wallet or state file. Such
-an executor has no execution engine: it is never ready and nothing can be sent.
+an executor has no execution engine and no quoter: it is never ready, nothing can be
+sent and no quote is invented.
 """
 
 import asyncio
@@ -17,28 +18,33 @@ import httpx
 import pytest
 
 from src.domain.models.trading import TradingMode
-from src.execution.contracts import DlmmCommandV1
-from src.execution.http_gateway import HttpExecutionGateway
+from src.execution.contracts import DlmmCommandV1, DlmmCommandV2, QuoteRequestV1
+from src.execution.http_gateway import HttpExecutionGateway, HttpQuoteClient, QuoteUnavailable
 from src.execution.service import GatewayRejected
 
 URL = os.environ.get("EXECUTOR_INTEGRATION_URL")
 pytestmark = pytest.mark.skipif(not URL, reason="EXECUTOR_INTEGRATION_URL is not configured")
-CORPUS = Path(__file__).parents[2] / "contracts" / "execution" / "v1-corpus.json"
+CONTRACTS = Path(__file__).parents[2] / "contracts" / "execution"
+TOKEN = os.environ.get("EXECUTOR_INTEGRATION_TOKEN", "unset")
 
 
-def command() -> DlmmCommandV1:
-    payload = json.loads(CORPUS.read_text(encoding="utf-8"))["valid_commands"][0]
-    return DlmmCommandV1.model_validate(payload).model_copy(
+def corpus(name: str) -> dict[str, list[dict[str, object]]]:
+    loaded: dict[str, list[dict[str, object]]] = json.loads(
+        (CONTRACTS / name).read_text(encoding="utf-8")
+    )
+    return loaded
+
+
+def command() -> DlmmCommandV2:
+    payload = corpus("v2-corpus.json")["valid_commands"][0]
+    return DlmmCommandV2.model_validate(payload).model_copy(
         update={"expires_at": datetime.now(UTC) + timedelta(minutes=5)}
     )
 
 
 async def with_gateway[T](work: Callable[[HttpExecutionGateway], Awaitable[T]]) -> T:
     async with httpx.AsyncClient(base_url=str(URL), timeout=10) as client:
-        gateway = HttpExecutionGateway(
-            client, internal_token=os.environ.get("EXECUTOR_INTEGRATION_TOKEN", "unset")
-        )
-        return await work(gateway)
+        return await work(HttpExecutionGateway(client, internal_token=TOKEN))
 
 
 def test_an_executor_without_a_wallet_is_never_ready_for_a_money_mode() -> None:
@@ -63,3 +69,32 @@ def test_an_executor_without_a_wallet_refuses_and_records_nothing() -> None:
     assert simulation_code == submit_code == "EXECUTION_UNAVAILABLE"
     assert recorded is None
 
+
+def test_the_executor_refuses_the_retired_v1_command_explicitly() -> None:
+    legacy = DlmmCommandV1.model_validate(corpus("v1-corpus.json")["valid_commands"][0])
+    payload = legacy.model_dump(mode="json", exclude_none=True)
+
+    async def send() -> httpx.Response:
+        async with httpx.AsyncClient(base_url=str(URL), timeout=10) as client:
+            return await client.post(
+                "/v1/simulations", json=payload, headers={"x-internal-token": TOKEN}
+            )
+
+    response = asyncio.run(send())
+
+    assert (response.status_code, response.json()) == (
+        400,
+        {"error": "unsupported_contract_version"},
+    )
+
+
+def test_an_executor_without_an_rpc_serves_no_quote() -> None:
+    request = QuoteRequestV1.model_validate(corpus("quote-v1-corpus.json")["valid_requests"][0])
+
+    async def quote() -> str:
+        async with httpx.AsyncClient(base_url=str(URL), timeout=10) as client:
+            with pytest.raises(QuoteUnavailable) as raised:
+                await HttpQuoteClient(client, internal_token=TOKEN).quote(request)
+            return raised.value.code
+
+    assert asyncio.run(quote()) == "QUOTES_UNAVAILABLE"

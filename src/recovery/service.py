@@ -219,8 +219,10 @@ class RecoveryService:
             self._modes.fail_entry(plan.plan_id)
             return EntryRecovery(plan.plan_id, RecoveryAction.FAILED_ENTRY, "NEVER_SUBMITTED")
         phase = record.phase
-        if phase is ExecutionPhase.CONFIRMED and record.command.position_address is not None:
-            self._modes.confirm_entry(plan.plan_id, record.command.position_address)
+        # A V2 entry's position exists only as the executor named it in the receipt.
+        position = record.position_address
+        if phase is ExecutionPhase.CONFIRMED and position is not None:
+            self._modes.confirm_entry(plan.plan_id, position)
             return EntryRecovery(plan.plan_id, RecoveryAction.CONFIRMED_ENTRY, "CHAIN_CONFIRMED")
         if phase in {ExecutionPhase.FAILED, ExecutionPhase.EXPIRED}:
             self._modes.fail_entry(plan.plan_id)

@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { parseDlmmCommandV1, type DlmmCommandV1 } from "../src/contracts.js";
+import { parseDlmmCommandV2, type DlmmCommandV2 } from "../src/contracts.js";
 import {
   ExecutionEngine,
   FileExecutionStateStore,
@@ -14,6 +14,7 @@ import {
   type LivePromotionEvidence,
   type BuiltCommand,
   type Clock,
+  type MarketFacts,
   type RpcTransport,
   type SdkBoundary,
 } from "../src/engine.js";
@@ -41,9 +42,11 @@ const livePromotion: LivePromotionEvidence = {
   expiresAt: "2026-10-19T12:00:00.000Z",
 };
 
-const command = (mode: "SHADOW" | "APPROVAL" | "LIVE" = "LIVE"): DlmmCommandV1 =>
-  parseDlmmCommandV1({
-    schema_version: 1,
+const POSITION = "SysvarRent111111111111111111111111111111111";
+
+const command = (mode: "SHADOW" | "APPROVAL" | "LIVE" = "LIVE"): DlmmCommandV2 =>
+  parseDlmmCommandV2({
+    schema_version: 2,
     command_id: "10000000-0000-4000-8000-000000000001",
     idempotency_key: "plan-101-open-v1",
     correlation_id: "20000000-0000-4000-8000-000000000001",
@@ -52,7 +55,6 @@ const command = (mode: "SHADOW" | "APPROVAL" | "LIVE" = "LIVE"): DlmmCommandV1 =
     operation: "OPEN",
     pool_address: "11111111111111111111111111111111",
     wallet_address: "11111111111111111111111111111111",
-    position_address: "11111111111111111111111111111111",
     expires_at: "2026-10-18T12:10:00.000Z",
     max_slippage_bps: 50,
     strategy: "BID_ASK",
@@ -60,28 +62,71 @@ const command = (mode: "SHADOW" | "APPROVAL" | "LIVE" = "LIVE"): DlmmCommandV1 =
     max_bin_id: 7,
     amount_x: "1000",
     amount_y: "2000",
+    active_bin_id: 2,
+    active_bin_tolerance: 3,
+    token_x_decimals: 6,
+    token_y_decimals: 9,
   });
+
+const exitCommand = (): DlmmCommandV2 =>
+  parseDlmmCommandV2({
+    schema_version: 2,
+    command_id: "10000000-0000-4000-8000-000000000009",
+    idempotency_key: "position-action-close-v1",
+    correlation_id: "20000000-0000-4000-8000-000000000001",
+    ruleset_version: "rules-2026-10-18",
+    mode: "LIVE",
+    operation: "CLOSE",
+    pool_address: "11111111111111111111111111111111",
+    wallet_address: "11111111111111111111111111111111",
+    position_address: POSITION,
+    expires_at: "2026-10-18T12:10:00.000Z",
+    max_slippage_bps: 50,
+    min_bin_id: -4,
+    max_bin_id: 7,
+    remove_bps: 10_000,
+  });
+
+const facts: MarketFacts = {
+  priceImpactBps: 10,
+  activeBinId: 2,
+  tokenXDecimals: 6,
+  tokenYDecimals: 9,
+};
 
 class FakeSdk implements SdkBoundary {
   public buildCalls = 0;
 
-  async build(value: DlmmCommandV1): Promise<BuiltCommand> {
+  constructor(
+    public market: MarketFacts = facts,
+    public position: string | undefined = undefined,
+  ) {}
+
+  async build(value: DlmmCommandV2): Promise<BuiltCommand> {
     this.buildCalls += 1;
-    return { command: value, opaqueTransactions: [new Uint8Array([1, 2, 3])] };
+    return {
+      command: value,
+      opaqueTransactions: [new Uint8Array([1, 2, 3])],
+      positionAddress: this.position ?? value.position_address ?? POSITION,
+      market: this.market,
+    };
   }
 }
 
 class TwoTransactionSdk extends FakeSdk {
-  override async build(value: DlmmCommandV1): Promise<BuiltCommand> {
+  override async build(value: DlmmCommandV2): Promise<BuiltCommand> {
     this.buildCalls += 1;
     return {
       command: value,
       opaqueTransactions: [new Uint8Array([1]), new Uint8Array([2])],
+      positionAddress: POSITION,
+      market: facts,
     };
   }
 }
 
 class FakeRpc implements RpcTransport {
+  public simulateCalls = 0;
   public submitCalls = 0;
   public statusCalls = 0;
 
@@ -89,16 +134,15 @@ class FakeRpc implements RpcTransport {
     computeUnits: number;
     networkFeeLamports: bigint;
     priorityFeeLamports: bigint;
-    priceImpactBps: number;
     blockhash: string;
     lastValidBlockHeight: number;
     logs: string[];
   }> {
+    this.simulateCalls += 1;
     return {
       computeUnits: 900,
       networkFeeLamports: 5000n,
       priorityFeeLamports: 0n,
-      priceImpactBps: 10,
       blockhash: "safe-blockhash",
       lastValidBlockHeight: 123,
       logs: [],
@@ -186,7 +230,7 @@ describe("execution engine", () => {
     const result = await engine.simulate(command());
 
     expect(result).toMatchObject({
-      schema_version: 1,
+      schema_version: 2,
       success: true,
       network_fee_lamports: "5000",
       price_impact_bps: 10,
@@ -351,7 +395,7 @@ describe("execution engine", () => {
     });
     const original = command();
     await engine.simulate(original);
-    const changed = parseDlmmCommandV1({ ...original, amount_x: "1001" });
+    const changed = parseDlmmCommandV2({ ...original, amount_x: "1001" });
 
     await expect(
       engine.submit(changed, changed.idempotency_key, { modeTokenVerified: true }),
@@ -460,7 +504,7 @@ describe("execution engine", () => {
       approvalProofVerifier: new HmacApprovalProofVerifier(approvalSecret),
     });
     const first = command("APPROVAL");
-    const second = parseDlmmCommandV1({
+    const second = parseDlmmCommandV2({
       ...first,
       command_id: "10000000-0000-4000-8000-000000000002",
       idempotency_key: "plan-102-open-v1",
@@ -570,5 +614,171 @@ describe("execution engine", () => {
     expect(reconciled.signatures).toEqual(["signature-1"]);
     expect(rpc.submitCalls).toBe(1);
     expect(rpc.statusCalls).toBe(1);
+  });
+});
+
+describe("execution engine market binding (V2)", () => {
+  it("returns the executor-assigned position and observed market facts", async () => {
+    const assigned = "SysvarC1ock11111111111111111111111111111111";
+    const engine = new ExecutionEngine({
+      sdk: new FakeSdk(facts, assigned),
+      rpc: new FakeRpc(),
+      clock,
+      submissionEnabled: true,
+      allowedMode: "LIVE",
+      livePromotion,
+    });
+    const value = command();
+
+    const simulation = await engine.simulate(value);
+    const receipt = await engine.submit(value, value.idempotency_key, { modeTokenVerified: true });
+
+    expect(simulation).toMatchObject({
+      schema_version: 2,
+      success: true,
+      price_impact_bps: 10,
+      position_address: assigned,
+      active_bin_id: 2,
+      token_x_decimals: 6,
+      token_y_decimals: 9,
+    });
+    expect(receipt).toMatchObject({
+      schema_version: 2,
+      state: "SUBMITTED",
+      position_address: assigned,
+    });
+  });
+
+  it("accepts the anchor tolerance and rejects a pool that moved beyond it", async () => {
+    const rpc = new FakeRpc();
+    const within = new ExecutionEngine({
+      sdk: new FakeSdk({ ...facts, activeBinId: 2 + 3 }),
+      rpc,
+      clock,
+    });
+    const beyond = new ExecutionEngine({
+      sdk: new FakeSdk({ ...facts, activeBinId: 2 - 4 }),
+      rpc,
+      clock,
+    });
+
+    const accepted = await within.simulate(command());
+    const rejected = await beyond.simulate(command());
+
+    expect(accepted.success).toBe(true);
+    expect(rejected).toMatchObject({
+      success: false,
+      active_bin_id: -2,
+      position_address: null,
+      errors: [{ code: "ACTIVE_BIN_DRIFT", retryable: false }],
+    });
+    expect(rpc.simulateCalls).toBe(1);
+  });
+
+  it("rejects mint decimals that differ from the ones the amounts were computed with", async () => {
+    const engine = new ExecutionEngine({
+      sdk: new FakeSdk({ ...facts, tokenXDecimals: 9 }),
+      rpc: new FakeRpc(),
+      clock,
+    });
+
+    const result = await engine.simulate(command());
+
+    expect(result).toMatchObject({
+      success: false,
+      token_x_decimals: 9,
+      errors: [{ code: "TOKEN_DECIMALS_MISMATCH" }],
+    });
+  });
+
+  it("fails a quote above the policy limit before simulating any transaction", async () => {
+    const rpc = new FakeRpc();
+    const engine = new ExecutionEngine({
+      sdk: new FakeSdk({ ...facts, priceImpactBps: 51 }),
+      rpc,
+      clock,
+      submissionEnabled: true,
+      allowedMode: "LIVE",
+      livePromotion,
+    });
+    const value = command();
+
+    const result = await engine.simulate(value);
+
+    expect(result).toMatchObject({
+      success: false,
+      price_impact_bps: 51,
+      errors: [{ code: "SLIPPAGE_BREACH" }],
+    });
+    expect(rpc.simulateCalls).toBe(0);
+    await expect(
+      engine.submit(value, value.idempotency_key, { modeTokenVerified: true }),
+    ).rejects.toMatchObject({ code: "FRESH_SIMULATION_REQUIRED" });
+    expect(rpc.submitCalls).toBe(0);
+  });
+
+  it("fails closed when the SDK quote did not measure a finite price impact", async () => {
+    const engine = new ExecutionEngine({
+      sdk: new FakeSdk({ ...facts, priceImpactBps: Number.NaN }),
+      rpc: new FakeRpc(),
+      clock,
+    });
+
+    const result = await engine.simulate(command());
+
+    expect(result).toMatchObject({
+      success: false,
+      price_impact_bps: null,
+      errors: [{ code: "PRICE_IMPACT_UNAVAILABLE" }],
+    });
+  });
+
+  it("never lets an exit act on a position other than the command's", async () => {
+    const engine = new ExecutionEngine({
+      sdk: new FakeSdk(facts, "SysvarC1ock11111111111111111111111111111111"),
+      rpc: new FakeRpc(),
+      clock,
+    });
+
+    const result = await engine.simulate(exitCommand());
+
+    expect(result).toMatchObject({
+      success: false,
+      errors: [{ code: "POSITION_BINDING_MISMATCH" }],
+    });
+  });
+});
+
+describe("exits are not gated by the price impact of a swap they never make (D08)", () => {
+  it("lets an exit through a thin pool and reports its quoted impact", async () => {
+    const rpc = new FakeRpc();
+    const engine = new ExecutionEngine({
+      sdk: new FakeSdk({ ...facts, priceImpactBps: 9_000 }),
+      rpc,
+      clock,
+      submissionEnabled: true,
+      allowedMode: "LIVE",
+      livePromotion,
+    });
+    const value = exitCommand();
+
+    const simulation = await engine.simulate(value);
+    const receipt = await engine.submit(value, value.idempotency_key, { modeTokenVerified: true });
+
+    expect(simulation).toMatchObject({ success: true, price_impact_bps: 9_000, errors: [] });
+    expect(receipt).toMatchObject({ state: "SUBMITTED", position_address: POSITION });
+    expect(rpc.submitCalls).toBe(1);
+  });
+
+  it("lets an exit through when its swap cannot be quoted", async () => {
+    const engine = new ExecutionEngine({
+      sdk: new FakeSdk({ ...facts, priceImpactBps: null }),
+      rpc: new FakeRpc(),
+      clock,
+    });
+
+    const simulation = await engine.simulate(exitCommand());
+
+    expect(simulation).toMatchObject({ success: true, price_impact_bps: null });
   });
 });

@@ -15,12 +15,12 @@ from src.domain.screening import CandidateStatus, RejectionCode
 from src.execution.contracts import (
     ChainReceiptV1,
     ChainState,
-    DlmmCommandV1,
-    GatewayReceiptV1,
+    DlmmCommand,
+    GatewayReceiptV2,
     GatewayState,
     OperatorApproval,
-    SimulationResultV1,
-    bind_simulation_result,
+    SimulationResultV2,
+    bind_simulation_result_v2,
     canonical_command_digest,
 )
 from src.execution.service import ExecutionService
@@ -230,16 +230,22 @@ async def _evaluate_at_now(harness: Harness) -> Any:
 # --- APPROVAL / LIVE gateway path -------------------------------------------------------
 
 
+# The position the (fake) executor creates for the OPEN; Python never derives it.
+EXECUTOR_POSITION = "SysvarRent111111111111111111111111111111111"
+
+
 class FakeGateway:
+    """Contract V2: the executor names the new position in its simulation and receipt."""
+
     def __init__(self, on_simulate: Any = None) -> None:
         self.submits = 0
         self.on_simulate = on_simulate
-        self.last: SimulationResultV1 | None = None
+        self.last: SimulationResultV2 | None = None
 
-    async def simulate(self, command: DlmmCommandV1) -> SimulationResultV1:
+    async def simulate(self, command: DlmmCommand) -> SimulationResultV2:
         if self.on_simulate is not None:
             self.on_simulate()
-        self.last = bind_simulation_result(
+        self.last = bind_simulation_result_v2(
             command_id=command.command_id,
             command_digest=canonical_command_digest(command),
             success=True,
@@ -252,21 +258,26 @@ class FakeGateway:
             price_impact_bps=5,
             min_bin_id=command.min_bin_id,
             max_bin_id=command.max_bin_id,
+            position_address=EXECUTOR_POSITION,
+            active_bin_id=command.active_bin_id,
+            token_x_decimals=command.token_x_decimals,
+            token_y_decimals=command.token_y_decimals,
             errors=(),
         )
         return self.last
 
     async def submit(
-        self, command: DlmmCommandV1, idempotency_key: str, approval: OperatorApproval | None
-    ) -> GatewayReceiptV1:
+        self, command: DlmmCommand, idempotency_key: str, approval: OperatorApproval | None
+    ) -> GatewayReceiptV2:
         self.submits += 1
         assert self.last is not None
-        return GatewayReceiptV1(
+        return GatewayReceiptV2(
             command_id=command.command_id,
             command_digest=self.last.command_digest,
             simulation_digest=self.last.simulation_digest,
             idempotency_key=idempotency_key,
             state=GatewayState.CONFIRMED,
+            position_address=EXECUTOR_POSITION,
             signature="sig-1",
             signatures=("sig-1",),
             transaction_count=1,
@@ -313,11 +324,10 @@ def _live_submitter(gateway: FakeGateway, harness: Harness) -> GatewaySubmitter:
     return GatewaySubmitter(service, resolver, book)
 
 
-def _live_command(harness: Harness) -> tuple[DlmmCommandV1, Any]:
+def _live_command(harness: Harness) -> tuple[DlmmCommand, Any]:
     harness.ingest(spike_history())
     plan_id = UUID(int=7)
     market = snapshot(NOW, short="400", long="1200")
-    from src.worker.execution import shadow_address
 
     command = build_entry_command(
         plan_id=plan_id,
@@ -331,7 +341,6 @@ def _live_command(harness: Harness) -> tuple[DlmmCommandV1, Any]:
         correlation_id="00000000-0000-4000-8000-000000000001",
         ruleset_version="rules-1",
         wallet_address=WALLET,
-        position_address=shadow_address(f"position:{plan_id}"),
         max_slippage_bps=100,
         anchor=BinAnchor(active_bin_id=8_000, base_decimals=6, quote_decimals=6),
     )
@@ -362,5 +371,6 @@ def test_live_submit_happens_only_after_simulation_and_guard() -> None:
     result = asyncio.run(_live_submitter(gateway, harness).submit(command, market, lambda: None))
 
     assert result.status is SubmitStatus.CONFIRMED
-    assert result.position_id == command.position_address
+    assert command.position_address is None
+    assert result.position_id == EXECUTOR_POSITION
     assert gateway.submits == 1

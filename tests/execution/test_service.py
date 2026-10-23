@@ -14,15 +14,18 @@ from src.execution.contracts import (
     ChainReceiptV1,
     ChainState,
     DlmmCommandV1,
+    DlmmCommandV2,
     DlmmOperation,
     ExecutionPhase,
     GatewayReceiptV1,
+    GatewayReceiptV2,
     GatewayState,
     LivePromotionEvidence,
     OperatorApproval,
     SimulationErrorV1,
     SimulationResultV1,
     bind_simulation_result,
+    bind_simulation_result_v2,
     canonical_command_digest,
 )
 from src.execution.service import (
@@ -32,6 +35,7 @@ from src.execution.service import (
     ExecutionService,
     HmacApprovalVerifier,
     InMemoryExecutionStore,
+    SimulationRejected,
     SqliteExecutionStore,
     StaticPlanResolver,
     sign_operator_approval,
@@ -327,9 +331,11 @@ async def _assert_simulation_failure_reaches_a_terminal_phase_without_submit() -
         kill_switch=CLEAR,
     )
 
-    with pytest.raises(ExecutionBlocked, match="simulation failed"):
+    # The reason is the executor's own error code, not a generic text.
+    with pytest.raises(SimulationRejected) as raised:
         await service.prepare(PLAN_ID)
 
+    assert (raised.value.code, str(raised.value)) == ("SIMULATION_FAILED", "SIMULATION_FAILED")
     record = await store.get(COMMAND_ID)
     assert record is not None
     assert record.phase is ExecutionPhase.FAILED
@@ -878,3 +884,221 @@ def test_active_kill_switch_lets_only_an_orderly_exit_through(
         return gateway.submit_calls
 
     assert asyncio.run(scenario()) == (1 if submitted else 0)
+
+
+# --- contract V2: executor-assigned positions and the LB-pair anchor --------------------------
+
+EXECUTOR_POSITION = "SysvarRent111111111111111111111111111111111"
+
+
+def command_v2(mode: TradingMode = TradingMode.LIVE) -> DlmmCommandV2:
+    return DlmmCommandV2.model_validate(
+        {
+            "command_id": str(COMMAND_ID),
+            "idempotency_key": "entry:plan-201",
+            "correlation_id": "20000000-0000-4000-8000-000000000001",
+            "ruleset_version": "rules-2026-10-18",
+            "mode": mode.value,
+            "operation": "OPEN",
+            "pool_address": "11111111111111111111111111111111",
+            "wallet_address": "11111111111111111111111111111111",
+            "expires_at": NOW + timedelta(minutes=10),
+            "max_slippage_bps": 50,
+            "strategy": "SPOT",
+            "min_bin_id": 7996,
+            "max_bin_id": 8004,
+            "amount_x": "1000",
+            "amount_y": "2000",
+            "active_bin_id": 8000,
+            "active_bin_tolerance": 2,
+            "token_x_decimals": 6,
+            "token_y_decimals": 9,
+        }
+    )
+
+
+class ExecutorV2Gateway(RecordingGateway):
+    """The V2 executor: it assigns the position and reports the chain's market facts."""
+
+    def __init__(
+        self,
+        *,
+        active_bin_id: int = 8001,
+        decimals: tuple[int, int] = (6, 9),
+        receipt_position: str = EXECUTOR_POSITION,
+        legacy_simulation: bool = False,
+    ) -> None:
+        super().__init__()
+        self.active_bin_id = active_bin_id
+        self.decimals = decimals
+        self.receipt_position = receipt_position
+        self.legacy_simulation = legacy_simulation
+
+    async def simulate(self, value: DlmmCommandV1) -> SimulationResultV1:  # type: ignore[override]
+        self.simulate_calls += 1
+        if self.legacy_simulation:
+            return await RecordingGateway.simulate(self, value)
+        self.last_simulation = bind_simulation_result_v2(  # type: ignore[assignment]
+            command_id=value.command_id,
+            command_digest=canonical_command_digest(value),
+            success=True,
+            simulated_at=self.simulated_at,
+            blockhash="safe-blockhash",
+            last_valid_block_height=123,
+            compute_units=900,
+            network_fee_lamports="5000",
+            priority_fee_lamports="0",
+            price_impact_bps=10,
+            min_bin_id=value.min_bin_id,
+            max_bin_id=value.max_bin_id,
+            position_address=EXECUTOR_POSITION,
+            active_bin_id=self.active_bin_id,
+            token_x_decimals=self.decimals[0],
+            token_y_decimals=self.decimals[1],
+            errors=(),
+        )
+        return self.last_simulation  # type: ignore[return-value]
+
+    async def submit(  # type: ignore[override]
+        self, value: DlmmCommandV2, idempotency_key: str, approval: OperatorApproval | None
+    ) -> GatewayReceiptV2:
+        del approval
+        self.submit_calls += 1
+        assert self.last_simulation is not None
+        return GatewayReceiptV2(
+            command_id=value.command_id,
+            command_digest=self.last_simulation.command_digest,
+            simulation_digest=self.last_simulation.simulation_digest,
+            idempotency_key=idempotency_key,
+            state=GatewayState.CONFIRMED,
+            position_address=self.receipt_position,
+            signature="signature-1",
+            signatures=("signature-1",),
+            transaction_count=1,
+            submitted_at=NOW,
+            attempt_count=1,
+        )
+
+
+def v2_service(
+    gateway: RecordingGateway,
+    store: InMemoryExecutionStore | SqliteExecutionStore,
+    clock: FrozenClock | None = None,
+    mode: TradingMode = TradingMode.LIVE,
+) -> ExecutionService:
+    return ExecutionService(
+        gateway=gateway,
+        store=store,
+        plans=StaticPlanResolver({PLAN_ID: command_v2(mode)}),
+        clock=clock or FrozenClock(NOW),
+        allowed_mode=mode,
+        live_promotion=live_promotion(),
+        approval_verifier=HmacApprovalVerifier(APPROVAL_SECRET),
+        kill_switch=CLEAR,
+    )
+
+
+def test_the_position_of_an_open_comes_only_from_the_executor_receipt() -> None:
+    store = InMemoryExecutionStore()
+
+    async def scenario() -> tuple[str | None, str | None, str | None]:
+        service = v2_service(ExecutorV2Gateway(), store)
+        await service.prepare(PLAN_ID)
+        record = await store.get(COMMAND_ID)
+        assert record is not None
+        before = record.position_address
+        receipt = await service.execute(COMMAND_ID)
+        after = await store.get(COMMAND_ID)
+        assert after is not None and isinstance(receipt, GatewayReceiptV2)
+        return before, after.position_address, after.command.position_address
+
+    before, after, command_position = asyncio.run(scenario())
+
+    assert (before, after, command_position) == (None, EXECUTOR_POSITION, None)
+
+
+def test_a_receipt_for_another_position_than_the_simulated_one_is_never_trusted() -> None:
+    store = InMemoryExecutionStore()
+    other = "SysvarC1ock11111111111111111111111111111111"
+
+    async def scenario() -> ExecutionPhase:
+        service = v2_service(ExecutorV2Gateway(receipt_position=other), store)
+        await service.prepare(PLAN_ID)
+        with pytest.raises(ExecutionOutcomeUnknown):
+            await service.execute(COMMAND_ID)
+        record = await store.get(COMMAND_ID)
+        assert record is not None and record.receipt is None
+        return record.phase
+
+    assert asyncio.run(scenario()) is ExecutionPhase.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "gateway",
+    [
+        ExecutorV2Gateway(active_bin_id=8003),
+        ExecutorV2Gateway(decimals=(9, 9)),
+        ExecutorV2Gateway(legacy_simulation=True),
+    ],
+    ids=["active-bin-beyond-tolerance", "other-mint-decimals", "v1-simulation-for-v2-command"],
+)
+def test_a_simulation_that_contradicts_the_v2_command_is_refused(
+    gateway: ExecutorV2Gateway,
+) -> None:
+    store = InMemoryExecutionStore()
+
+    async def scenario() -> ExecutionPhase | None:
+        service = v2_service(gateway, store)
+        with pytest.raises(ExecutionBlocked):
+            await service.prepare(PLAN_ID)
+        with pytest.raises(ExecutionBlocked):
+            await service.execute(COMMAND_ID)
+        record = await store.get(COMMAND_ID)
+        return None if record is None else record.phase
+
+    phase = asyncio.run(scenario())
+
+    assert phase in {None, ExecutionPhase.FAILED}
+    assert gateway.submit_calls == 0
+
+
+def test_an_executor_assigned_open_is_never_simulated_a_second_time() -> None:
+    clock = FrozenClock(NOW)
+    gateway = ExecutorV2Gateway()
+    store = InMemoryExecutionStore()
+
+    async def scenario() -> ExecutionPhase:
+        service = v2_service(gateway, store, clock, TradingMode.APPROVAL)
+        first = await service.prepare(PLAN_ID)
+        assert first.phase is ExecutionPhase.AWAITING_APPROVAL
+        clock.advance(timedelta(minutes=3))
+        with pytest.raises(ExecutionBlocked):
+            await service.prepare(PLAN_ID)
+        record = await store.get(COMMAND_ID)
+        assert record is not None
+        return record.phase
+
+    assert asyncio.run(scenario()) is ExecutionPhase.EXPIRED
+    assert gateway.simulate_calls == 1
+
+
+def test_a_v2_record_survives_a_restart_of_the_durable_store(tmp_path: Path) -> None:
+    path = tmp_path / "execution.sqlite3"
+
+    async def scenario() -> tuple[object, object]:
+        first = SqliteExecutionStore(path)
+        service = v2_service(ExecutorV2Gateway(), first)
+        await service.prepare(PLAN_ID)
+        await service.execute(COMMAND_ID)
+        first.close()
+        reopened = SqliteExecutionStore(path)
+        record = await reopened.get(COMMAND_ID)
+        reopened.close()
+        assert record is not None
+        return record.command, record.receipt
+
+    stored_command, stored_receipt = asyncio.run(scenario())
+
+    assert stored_command == command_v2()
+    assert isinstance(stored_receipt, GatewayReceiptV2)
+    assert stored_receipt.position_address == EXECUTOR_POSITION

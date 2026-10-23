@@ -1,0 +1,219 @@
+{
+  "valid_requests": [
+    {
+      "schema_version": 1,
+      "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+      "direction": "Y_TO_X",
+      "in_amount": "1000000000"
+    },
+    {
+      "schema_version": 1,
+      "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+      "direction": "X_TO_Y",
+      "in_amount": "250000000"
+    }
+  ],
+  "invalid_requests": [
+    {
+      "case": "unknown quote version",
+      "payload": {
+        "schema_version": 2,
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "direction": "Y_TO_X",
+        "in_amount": "1000000000"
+      }
+    },
+    {
+      "case": "zero reference size",
+      "payload": {
+        "schema_version": 1,
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "direction": "Y_TO_X",
+        "in_amount": "0"
+      }
+    },
+    {
+      "case": "float reference size",
+      "payload": {
+        "schema_version": 1,
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "direction": "Y_TO_X",
+        "in_amount": 1.5
+      }
+    },
+    {
+      "case": "unknown direction",
+      "payload": {
+        "schema_version": 1,
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "direction": "BOTH",
+        "in_amount": "1000000000"
+      }
+    },
+    {
+      "case": "invalid pool address",
+      "payload": {
+        "schema_version": 1,
+        "pool_address": "not-a-public-key",
+        "direction": "Y_TO_X",
+        "in_amount": "1000000000"
+      }
+    },
+    {
+      "case": "wallet material is not part of a quote",
+      "payload": {
+        "schema_version": 1,
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "direction": "Y_TO_X",
+        "in_amount": "1000000000",
+        "wallet_address": "SysvarC1ock11111111111111111111111111111111"
+      }
+    }
+  ],
+  "valid_results": [
+    {
+      "schema_version": 1,
+      "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+      "direction": "Y_TO_X",
+      "in_amount": "1000000000",
+      "quoted_at": "2030-01-02T03:00:00Z",
+      "success": true,
+      "consumed_in_amount": "1000000000",
+      "out_amount": "498000000",
+      "fee_amount": "2000000",
+      "price_impact_bps": 37,
+      "active_bin_id": 8001,
+      "token_x_decimals": 6,
+      "token_y_decimals": 9,
+      "error": null
+    },
+    {
+      "schema_version": 1,
+      "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+      "direction": "X_TO_Y",
+      "in_amount": "250000000",
+      "quoted_at": "2030-01-02T03:00:00+00:00",
+      "success": false,
+      "consumed_in_amount": null,
+      "out_amount": null,
+      "fee_amount": null,
+      "price_impact_bps": null,
+      "active_bin_id": 8001,
+      "token_x_decimals": 6,
+      "token_y_decimals": 9,
+      "error": {
+        "code": "INSUFFICIENT_LIQUIDITY",
+        "message": "the pool cannot fill the reference size",
+        "retryable": false
+      }
+    }
+  ],
+  "invalid_results": [
+    {
+      "case": "unknown quote result version",
+      "payload": {
+        "schema_version": 2,
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+      }
+    },
+    {
+      "case": "success without price impact",
+      "payload": {
+        "schema_version": 1,
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "direction": "Y_TO_X",
+        "in_amount": "1000000000",
+        "quoted_at": "2030-01-02T03:00:00Z",
+        "success": true,
+        "consumed_in_amount": "1000000000",
+        "out_amount": "498000000",
+        "fee_amount": "2000000",
+        "price_impact_bps": null,
+        "active_bin_id": 8001,
+        "token_x_decimals": 6,
+        "token_y_decimals": 9,
+        "error": null
+      }
+    },
+    {
+      "case": "failure without an error",
+      "payload": {
+        "schema_version": 1,
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "direction": "X_TO_Y",
+        "in_amount": "250000000",
+        "quoted_at": "2030-01-02T03:00:00Z",
+        "success": false,
+        "consumed_in_amount": null,
+        "out_amount": null,
+        "fee_amount": null,
+        "price_impact_bps": null,
+        "active_bin_id": null,
+        "token_x_decimals": null,
+        "token_y_decimals": null,
+        "error": null
+      }
+    },
+    {
+      "case": "success that also reports an error",
+      "payload": {
+        "schema_version": 1,
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "direction": "Y_TO_X",
+        "in_amount": "1000000000",
+        "quoted_at": "2030-01-02T03:00:00Z",
+        "success": true,
+        "consumed_in_amount": "1000000000",
+        "out_amount": "498000000",
+        "fee_amount": "2000000",
+        "price_impact_bps": 37,
+        "active_bin_id": 8001,
+        "token_x_decimals": 6,
+        "token_y_decimals": 9,
+        "error": {
+          "code": "INSUFFICIENT_LIQUIDITY",
+          "message": "the pool cannot fill the reference size",
+          "retryable": false
+        }
+      }
+    },
+    {
+      "case": "price impact above 100 percent",
+      "payload": {
+        "schema_version": 1,
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "direction": "Y_TO_X",
+        "in_amount": "1000000000",
+        "quoted_at": "2030-01-02T03:00:00Z",
+        "success": true,
+        "consumed_in_amount": "1000000000",
+        "out_amount": "498000000",
+        "fee_amount": "2000000",
+        "price_impact_bps": 10001,
+        "active_bin_id": 8001,
+        "token_x_decimals": 6,
+        "token_y_decimals": 9,
+        "error": null
+      }
+    },
+    {
+      "case": "float expected output",
+      "payload": {
+        "schema_version": 1,
+        "pool_address": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "direction": "Y_TO_X",
+        "in_amount": "1000000000",
+        "quoted_at": "2030-01-02T03:00:00Z",
+        "success": true,
+        "consumed_in_amount": "1000000000",
+        "out_amount": 498000000.5,
+        "fee_amount": "2000000",
+        "price_impact_bps": 37,
+        "active_bin_id": 8001,
+        "token_x_decimals": 6,
+        "token_y_decimals": 9,
+        "error": null
+      }
+    }
+  ]
+}

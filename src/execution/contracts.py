@@ -1,12 +1,26 @@
-"""Versioned, SDK-independent contracts shared with the TypeScript executor."""
+"""Versioned, SDK-independent contracts shared with the TypeScript executor.
+
+The executor wire speaks contract **V2** only (``DlmmCommandV2``, ``SimulationResultV2``,
+``GatewayReceiptV2``): the executor creates the key of a new position itself, so an OPEN
+carries no position address and the receipt returns it; an entry carries the LB-pair
+anchor the executor checks on chain; a simulation returns the observed market facts.
+
+**V1** is retired from the wire and rejected there. It stays the *lifecycle shape* the
+SHADOW broker and the T04 ledger record (a position address on every command) and the
+shape of records stored before V2; ``command_from_payload`` and friends read a stored
+record by its own version and refuse any other. ``ChainReceiptV1`` is unchanged.
+
+``QuoteRequestV1`` / ``QuoteResultV1`` are the separate read-only quote contract.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
 from pydantic import (
@@ -22,7 +36,11 @@ from src.domain.models.primitives import PublicKey
 from src.domain.models.trading import TradingMode
 
 BaseUnitString = Annotated[str, StringConstraints(pattern=r"^(0|[1-9][0-9]*)$")]
+PositiveBaseUnitString = Annotated[str, StringConstraints(pattern=r"^[1-9][0-9]*$")]
 DigestString = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
+# SPL mint decimals are a u8.
+MintDecimals = Annotated[int, Field(ge=0, le=255)]
+EXECUTOR_CONTRACT_VERSION: Final = 2
 
 
 class DlmmOperation(StrEnum):
@@ -41,7 +59,27 @@ class ContractModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", use_enum_values=False)
 
 
+def _public_key(value: str | None) -> str | None:
+    if value is not None:
+        PublicKey.model_validate(value)
+    return value
+
+
+def _non_blank(value: str) -> str:
+    if not value.strip():
+        raise ValueError("identifier must not be blank")
+    return value
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return value.astimezone(UTC)
+
+
 class DlmmCommandV1(ContractModel):
+    """Lifecycle command: SHADOW fills, the T04 ledger and records stored before V2."""
+
     schema_version: Literal[1] = 1
     command_id: UUID
     idempotency_key: Annotated[str, StringConstraints(min_length=1, max_length=128)]
@@ -103,6 +141,80 @@ class DlmmCommandV1(ContractModel):
         return self
 
 
+_LIQUIDITY_OPERATIONS = frozenset({DlmmOperation.OPEN, DlmmOperation.ADD})
+
+
+class DlmmCommandV2(ContractModel):
+    """Executor wire command.
+
+    OPEN carries no ``position_address``: the executor creates the position's key and
+    the receipt names the address. OPEN and ADD carry the anchor the bin range and the
+    amounts were derived from (``active_bin_id`` +- ``active_bin_tolerance``, mint
+    decimals); the executor refuses the command when the chain disagrees.
+    """
+
+    schema_version: Literal[2] = 2
+    command_id: UUID
+    idempotency_key: Annotated[str, StringConstraints(min_length=1, max_length=128)]
+    correlation_id: UUID
+    ruleset_version: Annotated[str, StringConstraints(min_length=1, max_length=128)]
+    mode: TradingMode
+    operation: DlmmOperation
+    pool_address: str
+    wallet_address: str
+    position_address: str | None = None
+    expires_at: datetime
+    max_slippage_bps: int = Field(ge=0, le=10_000)
+    strategy: LiquidityStrategy | None = None
+    min_bin_id: int
+    max_bin_id: int
+    amount_x: BaseUnitString | None = None
+    amount_y: BaseUnitString | None = None
+    remove_bps: int | None = Field(default=None, ge=1, le=10_000)
+    active_bin_id: int | None = None
+    active_bin_tolerance: int | None = Field(default=None, ge=0, le=1_000)
+    token_x_decimals: MintDecimals | None = None
+    token_y_decimals: MintDecimals | None = None
+
+    _keys = field_validator("pool_address", "wallet_address", "position_address")(
+        _public_key
+    )
+    _identifiers = field_validator("idempotency_key", "ruleset_version")(_non_blank)
+    _expiry = field_validator("expires_at")(_utc)
+
+    @model_validator(mode="after")
+    def validate_operation_fields(self) -> DlmmCommandV2:
+        if self.min_bin_id > self.max_bin_id:
+            raise ValueError("min_bin_id must not exceed max_bin_id")
+        if self.operation is DlmmOperation.OPEN and self.position_address is not None:
+            raise ValueError("the executor creates the position of an OPEN")
+        if self.operation is not DlmmOperation.OPEN and self.position_address is None:
+            raise ValueError("position_address is required")
+        anchor = (
+            self.active_bin_id,
+            self.active_bin_tolerance,
+            self.token_x_decimals,
+            self.token_y_decimals,
+        )
+        if self.operation in _LIQUIDITY_OPERATIONS:
+            if self.strategy is None or self.amount_x is None or self.amount_y is None:
+                raise ValueError("liquidity commands require strategy and both amounts")
+            if any(value is None for value in anchor):
+                raise ValueError("liquidity commands require the active bin anchor and decimals")
+            if self.remove_bps is not None:
+                raise ValueError("liquidity commands must not set remove_bps")
+            return self
+        if self.remove_bps is None:
+            raise ValueError("removal commands require remove_bps")
+        if self.strategy is not None or self.amount_x is not None or self.amount_y is not None:
+            raise ValueError("removal commands must not set strategy or amounts")
+        if any(value is not None for value in anchor):
+            raise ValueError("removal commands must not carry an entry anchor")
+        if self.operation is DlmmOperation.CLOSE and self.remove_bps != 10_000:
+            raise ValueError("close requires remove_bps=10000")
+        return self
+
+
 class SimulationErrorV1(ContractModel):
     code: Annotated[str, StringConstraints(min_length=1, max_length=128)]
     message: Annotated[str, StringConstraints(min_length=1, max_length=512)]
@@ -137,6 +249,52 @@ class SimulationResultV1(ContractModel):
     def validate_outcome(self) -> SimulationResultV1:
         if self.success and self.price_impact_bps is None:
             raise ValueError("successful simulations require measured price impact")
+        if not self.success and not self.errors:
+            raise ValueError("failed simulations require an error")
+        return self
+
+
+class SimulationResultV2(ContractModel):
+    """Executor simulation: costs, the SDK-quoted price impact of the swap leg, the
+    position the command acts on (for an OPEN the one the executor created) and what
+    the chain says right now: the LB pair's active bin and the mint decimals.
+
+    ``price_impact_bps`` may be ``None`` on a successful exit: an exit swaps nothing,
+    its quote is informational and a thin pool must never keep a position open. An
+    entry without a measured impact is refused by the executor and by the service."""
+
+    schema_version: Literal[2] = 2
+    command_id: UUID
+    command_digest: DigestString
+    simulation_digest: DigestString
+    success: bool
+    simulated_at: datetime
+    blockhash: str | None
+    last_valid_block_height: int | None = Field(ge=0)
+    compute_units: int = Field(ge=0)
+    network_fee_lamports: BaseUnitString
+    priority_fee_lamports: BaseUnitString
+    price_impact_bps: int | None = Field(ge=0, le=10_000)
+    min_bin_id: int
+    max_bin_id: int
+    position_address: str | None
+    active_bin_id: int | None
+    token_x_decimals: MintDecimals | None
+    token_y_decimals: MintDecimals | None
+    errors: tuple[SimulationErrorV1, ...]
+
+    _key = field_validator("position_address")(_public_key)
+    _timestamp = field_validator("simulated_at")(_utc)
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> SimulationResultV2:
+        if self.success and None in (
+            self.position_address,
+            self.active_bin_id,
+            self.token_x_decimals,
+            self.token_y_decimals,
+        ):
+            raise ValueError("successful simulations require the position and market facts")
         if not self.success and not self.errors:
             raise ValueError("failed simulations require an error")
         return self
@@ -192,6 +350,55 @@ class GatewayReceiptV1(ContractModel):
         if len(self.signatures) > self.transaction_count:
             raise ValueError("signature count exceeds transaction count")
         return self
+
+
+class GatewayReceiptV2(ContractModel):
+    """Executor receipt; ``position_address`` is the only source of a new position's address.
+
+    Deliberately not a subclass of ``GatewayReceiptV1``: a V2 receipt must never pass
+    where the V1 lifecycle shape is expected.
+    """
+
+    schema_version: Literal[2] = 2
+    command_id: UUID
+    command_digest: DigestString
+    simulation_digest: DigestString
+    idempotency_key: Annotated[str, StringConstraints(min_length=1, max_length=128)]
+    state: GatewayState
+    position_address: str
+    signature: Annotated[str, StringConstraints(min_length=1)] | None = None
+    signatures: tuple[Annotated[str, StringConstraints(min_length=1)], ...]
+    transaction_count: int = Field(gt=0)
+    submitted_at: datetime
+    attempt_count: int = Field(ge=0)
+    error: SimulationErrorV1 | None = None
+
+    _key = field_validator("position_address")(_public_key)
+    _identifier = field_validator("idempotency_key")(_non_blank)
+    _timestamp = field_validator("submitted_at")(_utc)
+
+    @model_validator(mode="after")
+    def validate_signatures(self) -> GatewayReceiptV2:
+        if any(not signature.strip() for signature in self.signatures):
+            raise ValueError("signatures must not be blank")
+        primary = self.signatures[-1] if self.signatures else None
+        if self.signature != primary:
+            raise ValueError("signature must be the final submitted signature")
+        if (
+            self.state in {GatewayState.SUBMITTED, GatewayState.CONFIRMED}
+            and len(self.signatures) != self.transaction_count
+        ):
+            raise ValueError("submitted receipts require every transaction signature")
+        if len(self.signatures) > self.transaction_count:
+            raise ValueError("signature count exceeds transaction count")
+        return self
+
+    def lifecycle(self) -> GatewayReceiptV1:
+        """The same receipt in the V1 lifecycle shape the T04 ledger records."""
+
+        return GatewayReceiptV1.model_validate(
+            self.model_dump(exclude={"schema_version", "position_address"})
+        )
 
 
 class ChainState(StrEnum):
@@ -303,9 +510,96 @@ class ExecutionPhase(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+# A record of either version; the executor wire itself accepts V2 only.
+type DlmmCommand = DlmmCommandV1 | DlmmCommandV2
+type SimulationResult = SimulationResultV1 | SimulationResultV2
+type GatewayReceipt = GatewayReceiptV1 | GatewayReceiptV2
+
+_COMMAND = Annotated[DlmmCommandV1 | DlmmCommandV2, Field(discriminator="schema_version")]
+_SIMULATION = Annotated[
+    SimulationResultV1 | SimulationResultV2, Field(discriminator="schema_version")
+]
+_RECEIPT = Annotated[GatewayReceiptV1 | GatewayReceiptV2, Field(discriminator="schema_version")]
+
+
+def command_from_payload(payload: Mapping[str, Any]) -> DlmmCommand:
+    """A stored command by its own ``schema_version``; any other version is refused."""
+
+    if payload.get("schema_version") == 1:
+        return DlmmCommandV1.model_validate(payload)
+    return DlmmCommandV2.model_validate(payload)
+
+
+def simulation_from_payload(payload: Mapping[str, Any]) -> SimulationResult:
+    if payload.get("schema_version") == 1:
+        return SimulationResultV1.model_validate(payload)
+    return SimulationResultV2.model_validate(payload)
+
+
+def receipt_from_payload(payload: Mapping[str, Any]) -> GatewayReceipt:
+    if payload.get("schema_version") == 1:
+        return GatewayReceiptV1.model_validate(payload)
+    return GatewayReceiptV2.model_validate(payload)
+
+
+class QuoteDirection(StrEnum):
+    X_TO_Y = "X_TO_Y"
+    Y_TO_X = "Y_TO_X"
+
+
+class QuoteRequestV1(ContractModel):
+    """Read-only quote of a reference size (``in_amount`` base units of the input token)."""
+
+    schema_version: Literal[1] = 1
+    pool_address: str
+    direction: QuoteDirection
+    in_amount: PositiveBaseUnitString
+
+    _pool = field_validator("pool_address")(_public_key)
+
+
+class QuoteResultV1(ContractModel):
+    """Price impact and expected output by the official SDK quote, or why there is none."""
+
+    schema_version: Literal[1] = 1
+    pool_address: str
+    direction: QuoteDirection
+    in_amount: PositiveBaseUnitString
+    quoted_at: datetime
+    success: bool
+    consumed_in_amount: BaseUnitString | None
+    out_amount: BaseUnitString | None
+    fee_amount: BaseUnitString | None
+    price_impact_bps: int | None = Field(ge=0, le=10_000)
+    active_bin_id: int | None
+    token_x_decimals: MintDecimals | None
+    token_y_decimals: MintDecimals | None
+    error: SimulationErrorV1 | None
+
+    _pool = field_validator("pool_address")(_public_key)
+    _timestamp = field_validator("quoted_at")(_utc)
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> QuoteResultV1:
+        measured = (
+            self.consumed_in_amount,
+            self.out_amount,
+            self.fee_amount,
+            self.price_impact_bps,
+            self.active_bin_id,
+            self.token_x_decimals,
+            self.token_y_decimals,
+        )
+        if self.success and (self.error is not None or None in measured):
+            raise ValueError("a successful quote carries every measured value and no error")
+        if not self.success and self.error is None:
+            raise ValueError("a failed quote needs an error")
+        return self
+
+
 class ExecutionPreview(ContractModel):
-    command: DlmmCommandV1
-    simulation: SimulationResultV1
+    command: _COMMAND
+    simulation: _SIMULATION
     phase: ExecutionPhase
     approval_required: bool
     irreversible_after_submit: Literal[True] = True
@@ -315,10 +609,10 @@ class ExecutionState(ContractModel):
     command_id: UUID
     phase: ExecutionPhase
     approval_id: UUID | None = None
-    receipt: GatewayReceiptV1 | None = None
+    receipt: _RECEIPT | None = None
 
 
-def canonical_command_digest(command: DlmmCommandV1) -> str:
+def canonical_command_digest(command: DlmmCommand) -> str:
     """Return the language-neutral digest binding preview/build/submit."""
 
     payload = command.model_dump(mode="json", exclude_none=True)
@@ -326,7 +620,7 @@ def canonical_command_digest(command: DlmmCommandV1) -> str:
     return _sha256(payload)
 
 
-def canonical_simulation_digest(simulation: SimulationResultV1) -> str:
+def canonical_simulation_digest(simulation: SimulationResult) -> str:
     """Hash a normalized simulation while excluding its self digest."""
 
     payload = simulation.model_dump(mode="json")
@@ -336,9 +630,20 @@ def canonical_simulation_digest(simulation: SimulationResultV1) -> str:
 
 
 def bind_simulation_result(**payload: object) -> SimulationResultV1:
-    """Construct a simulation with its canonical digest populated."""
+    """Construct a V1 (lifecycle) simulation with its canonical digest populated."""
 
     provisional = SimulationResultV1.model_validate(
+        {**payload, "simulation_digest": "0" * 64}
+    )
+    return provisional.model_copy(
+        update={"simulation_digest": canonical_simulation_digest(provisional)}
+    )
+
+
+def bind_simulation_result_v2(**payload: object) -> SimulationResultV2:
+    """Construct a V2 simulation with its canonical digest populated."""
+
+    provisional = SimulationResultV2.model_validate(
         {**payload, "simulation_digest": "0" * 64}
     )
     return provisional.model_copy(
