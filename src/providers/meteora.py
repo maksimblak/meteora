@@ -79,6 +79,8 @@ class MeteoraDataApiProvider:
                 field="price",
             )
             bin_step = _integer(_required(payload, "bin_step", "binStep"), field="bin_step")
+            base_fee_rate = _base_fee_rate(payload)
+            market_cap = _base_market_cap(payload, pool)
             freshness = (
                 Freshness.STALE if observed_at - source_at > self._stale_after else Freshness.FRESH
             )
@@ -98,9 +100,40 @@ class MeteoraDataApiProvider:
                 data_quality=quality,
                 missing_fields=tuple(sorted(missing_fields)),
                 provider="meteora_data_api",
+                base_fee_rate=base_fee_rate,
+                base_token_market_cap=market_cap,
             )
         except ValidationError as error:
             raise ProviderPayloadError("Meteora returned an invalid snapshot") from error
+
+
+def _base_fee_rate(payload: Mapping[str, Any]) -> Decimal | None:
+    """Base fee as a fraction; the API reports it in percent (``0.04`` means 0.04%)."""
+
+    config = payload.get("pool_config")
+    raw = _mapping(config).get("base_fee_pct") if config is not None else None
+    if raw is None:
+        raw = payload.get("base_fee_pct", payload.get("base_fee_percentage"))
+    if raw is None:
+        return None
+    percent = _decimal(raw, field="base_fee_pct")
+    if not Decimal(0) <= percent <= Decimal(100):
+        raise ProviderPayloadError("base_fee_pct must be a percentage in [0, 100]")
+    return percent / Decimal(100)
+
+
+def _base_market_cap(payload: Mapping[str, Any], pool: PoolRef) -> Decimal | None:
+    """Market cap of the pool's base token, matched by mint and never guessed by side."""
+
+    for side in ("token_x", "token_y"):
+        token = payload.get(side)
+        if token is None:
+            continue
+        details = _mapping(token)
+        if details.get("address") == pool.base_mint.root and details.get("market_cap") is not None:
+            return _decimal(details["market_cap"], field=f"{side}.market_cap")
+    raw = payload.get("base_market_cap", payload.get("market_cap"))
+    return None if raw is None else _decimal(raw, field="market_cap")
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:

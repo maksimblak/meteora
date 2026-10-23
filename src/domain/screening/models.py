@@ -54,6 +54,29 @@ class RejectionCode(StrEnum):
     PRICE_IMPACT_HIGH = "PRICE_IMPACT_HIGH"
     VOLUME_SIGNAL_BELOW_THRESHOLD = "VOLUME_SIGNAL_BELOW_THRESHOLD"
     SCORE_BELOW_THRESHOLD = "SCORE_BELOW_THRESHOLD"
+    # guide-v1 (spec 6.6)
+    MARKET_CAP_BELOW_THRESHOLD = "MARKET_CAP_BELOW_THRESHOLD"
+    TOKEN_TOO_YOUNG = "TOKEN_TOO_YOUNG"  # noqa: S105 - stable domain code
+    VOLUME_PER_MINUTE_BELOW_THRESHOLD = "VOLUME_PER_MINUTE_BELOW_THRESHOLD"
+    VOLUME_TO_LIQUIDITY_BELOW_THRESHOLD = "VOLUME_TO_LIQUIDITY_BELOW_THRESHOLD"
+    ARTIFICIAL_VOLUME_SUSPECTED = "ARTIFICIAL_VOLUME_SUSPECTED"
+    TOTAL_FEES_BELOW_THRESHOLD = "TOTAL_FEES_BELOW_THRESHOLD"
+    GUIDE_SIGNAL_UNKNOWN = "GUIDE_SIGNAL_UNKNOWN"
+
+
+class DecisionFlag(StrEnum):
+    """Non-blocking facts the operator must see; unlike reasons they never change status."""
+
+    # D03: GMGN-style total fees have no Data API/RPC source; the conditional threshold is
+    # skipped and the approval preview asks for a manual check instead.
+    TOTAL_FEES_UNAVAILABLE = "TOTAL_FEES_UNAVAILABLE"
+
+
+class VolumeRegime(StrEnum):
+    BELOW = "BELOW"
+    WORKING = "WORKING"
+    OVERVOLUME = "OVERVOLUME"
+    UNKNOWN = "UNKNOWN"
 
 
 class DecisionContext(BaseModel):
@@ -115,6 +138,59 @@ class ScoreWeights(BaseModel):
         return self
 
 
+class GuideScreeningRules(BaseModel):
+    """Starting thresholds of the LexDollar guide (spec 6.6, G16) — a shadow hypothesis.
+
+    Top-10 holder share uses ``ScreeningPolicy.maximum_holder_concentration``. Fee
+    organicity compares collected fees with ``volume * base fee``: honest DLMM swaps pay
+    at least the base fee and the LP share is about 90%, so a ratio far below one means
+    the reported volume did not pay for itself.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    minimum_market_cap: Decimal = Decimal("500000")
+    preferred_market_cap: Decimal = Decimal("1000000")
+    minimum_token_age: timedelta = timedelta(hours=2)
+    minimum_volume_per_minute: Decimal = Decimal("14000")
+    overvolume_volume_per_minute: Decimal = Decimal("100000")
+    minimum_volume_to_liquidity: Decimal = Decimal("0.5")
+    minimum_fee_efficiency: Decimal = Decimal("0.5")
+    minimum_total_fees_sol: Decimal = Decimal("30")
+
+    _reject_float = field_validator(
+        "minimum_market_cap",
+        "preferred_market_cap",
+        "minimum_volume_per_minute",
+        "overvolume_volume_per_minute",
+        "minimum_volume_to_liquidity",
+        "minimum_fee_efficiency",
+        "minimum_total_fees_sol",
+        mode="before",
+    )(_exact_decimal)
+
+    @model_validator(mode="after")
+    def validate_guide(self) -> "GuideScreeningRules":
+        if any(
+            value < 0
+            for value in (
+                self.minimum_market_cap,
+                self.minimum_volume_per_minute,
+                self.minimum_volume_to_liquidity,
+                self.minimum_fee_efficiency,
+                self.minimum_total_fees_sol,
+            )
+        ):
+            raise ValueError("guide thresholds cannot be negative")
+        if self.minimum_token_age < timedelta(0):
+            raise ValueError("minimum_token_age cannot be negative")
+        if self.preferred_market_cap < self.minimum_market_cap:
+            raise ValueError("preferred_market_cap is below minimum_market_cap")
+        if self.overvolume_volume_per_minute < self.minimum_volume_per_minute:
+            raise ValueError("overvolume threshold is below the working volume threshold")
+        return self
+
+
 class ScreeningPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
@@ -138,6 +214,7 @@ class ScreeningPolicy(BaseModel):
     minimum_unique_participants: int = 5
     maximum_transactions_per_participant: Decimal = Decimal("20")
     weights: ScoreWeights = ScoreWeights()
+    guide: GuideScreeningRules | None = None
 
     _reject_float = field_validator(
         "minimum_tvl",
@@ -201,6 +278,18 @@ class ScreeningPolicy(BaseModel):
         return self
 
 
+class GuideAssessment(BaseModel):
+    """What the guide-v1 thresholds found: terminal reasons, unknown signals and evidence."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    reasons: tuple[RejectionCode, ...]
+    missing_signals: tuple[str, ...]
+    evidence: tuple[EvidenceItem, ...]
+    volume_regime: VolumeRegime
+    flags: tuple[DecisionFlag, ...] = ()
+
+
 class VolumeIntegrityAssessment(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
@@ -227,6 +316,7 @@ class CandidateDecision(BaseModel):
     ruleset_version: str
     config_version: str
     correlation_id: str
+    flags: tuple[DecisionFlag, ...] = ()
 
     _reject_float = field_validator("score", "estimated_price_impact", mode="before")(
         _exact_decimal

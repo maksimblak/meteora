@@ -6,6 +6,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+from src.domain.screening.models import EvidenceItem
 from src.market.models import RiskSignal
 
 
@@ -24,6 +25,83 @@ class Direction(StrEnum):
     NEUTRAL = "NEUTRAL"
     BULLISH = "BULLISH"
     BEARISH = "BEARISH"
+
+
+class StrategySelectionReason(StrEnum):
+    """Why a plan uses its strategy; stored on the plan record next to its evidence."""
+
+    LEGACY_NEUTRAL_SPOT = "LEGACY_NEUTRAL_SPOT"
+    LEGACY_DIRECTIONAL_BID_ASK = "LEGACY_DIRECTIONAL_BID_ASK"
+    BID_ASK_FROM_LOCAL_HIGH = "BID_ASK_FROM_LOCAL_HIGH"
+    SPOT_ATH_BREAKOUT = "SPOT_ATH_BREAKOUT"
+    SPOT_OVERVOLUME = "SPOT_OVERVOLUME"
+
+
+class GuideStrategyRules(BaseModel):
+    """LexDollar strategy choice (spec 6.6, G15) — a shadow hypothesis, not a promise.
+
+    Default is Bid-Ask from the local high: liquidity from the high down to
+    ``bid_ask_target_depth`` below the current price, inside one DLMM position
+    (``maximum_position_bins``, the SDK's 70-bin default width). Spot is allowed only on a
+    pool all-time-high breakout with working, organic volume, or on overvolume with a hard
+    holding limit and an exit on the first volume drop.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    bid_ask_minimum_depth: Decimal = Decimal("0.70")
+    bid_ask_target_depth: Decimal = Decimal("0.75")
+    bid_ask_maximum_depth: Decimal = Decimal("0.80")
+    maximum_position_bins: int = 70
+    spot_minimum_volume_per_minute: Decimal = Decimal("14000")
+    spot_minimum_fee_efficiency: Decimal = Decimal("0.5")
+    overvolume_volume_per_minute: Decimal = Decimal("100000")
+    ath_breakout_margin: Decimal = Decimal("0")
+    spot_holding_horizon: timedelta = timedelta(hours=1)
+    overvolume_maximum_holding_period: timedelta = timedelta(minutes=30)
+    overvolume_volume_decay_ratio: Decimal = Decimal("1")
+
+    _reject_float = field_validator(
+        "bid_ask_minimum_depth",
+        "bid_ask_target_depth",
+        "bid_ask_maximum_depth",
+        "spot_minimum_volume_per_minute",
+        "spot_minimum_fee_efficiency",
+        "overvolume_volume_per_minute",
+        "ath_breakout_margin",
+        "overvolume_volume_decay_ratio",
+        mode="before",
+    )(_exact_decimal)
+
+    @model_validator(mode="after")
+    def validate_guide(self) -> "GuideStrategyRules":
+        if not (
+            Decimal(0)
+            < self.bid_ask_minimum_depth
+            <= self.bid_ask_target_depth
+            <= self.bid_ask_maximum_depth
+            < Decimal(1)
+        ):
+            raise ValueError("bid-ask depths must satisfy 0 < minimum <= target <= maximum < 1")
+        if self.maximum_position_bins < 3:
+            raise ValueError("maximum_position_bins must allow a range around the active bin")
+        if any(
+            value < 0
+            for value in (
+                self.spot_minimum_volume_per_minute,
+                self.spot_minimum_fee_efficiency,
+                self.overvolume_volume_per_minute,
+                self.ath_breakout_margin,
+            )
+        ):
+            raise ValueError("spot thresholds cannot be negative")
+        if self.spot_holding_horizon <= timedelta(0) or (
+            self.overvolume_maximum_holding_period <= timedelta(0)
+        ):
+            raise ValueError("spot holding periods must be positive")
+        if not Decimal(0) < self.overvolume_volume_decay_ratio <= Decimal(1):
+            raise ValueError("overvolume_volume_decay_ratio must be in (0, 1]")
+        return self
 
 
 class StrategyPolicy(BaseModel):
@@ -45,6 +123,7 @@ class StrategyPolicy(BaseModel):
     expected_cost_rate: Decimal = Decimal("0.002")
     volume_decay_ratio: Decimal = Decimal("0.50")
     price_shock_fraction: Decimal = Decimal("0.10")
+    guide: GuideStrategyRules | None = None
 
     _reject_float = field_validator(
         "volatility_multiplier",
@@ -140,6 +219,8 @@ class StrategyPlan(BaseModel):
     ruleset_version: str
     config_version: str
     correlation_id: str
+    selection_reason: StrategySelectionReason | None = None
+    selection_evidence: tuple[EvidenceItem, ...] = ()
 
     _reject_float = field_validator(
         "range_exit_probability",

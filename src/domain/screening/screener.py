@@ -1,5 +1,6 @@
 """Hard filters run before a transparent weighted score."""
 
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from src.domain.features import SignalReadiness, VolumeSpikeFeatures
@@ -8,12 +9,15 @@ from src.domain.screening.models import (
     CandidateDecision,
     CandidateStatus,
     DecisionContext,
+    DecisionFlag,
     EvidenceItem,
+    GuideAssessment,
     IntegrityStatus,
     RejectionCode,
     ScoreComponent,
     ScreeningPolicy,
     VolumeIntegrityAssessment,
+    VolumeRegime,
 )
 from src.market.models import (
     AuthorityStatus,
@@ -85,6 +89,137 @@ def assess_volume_integrity(
     )
 
 
+def assess_guide_thresholds(
+    pool: PoolSnapshot,
+    token: TokenRiskSnapshot,
+    features: VolumeSpikeFeatures,
+    policy: ScreeningPolicy,
+) -> GuideAssessment:
+    """Apply the guide-v1 table (spec 6.6); a signal no source reported is UNKNOWN."""
+
+    rules = policy.guide
+    if rules is None:
+        raise ValueError("policy has no guide thresholds")
+    reasons: list[RejectionCode] = []
+    missing: list[str] = []
+    evidence: list[EvidenceItem] = []
+
+    cap = pool.base_token_market_cap
+    if cap is None:
+        missing.append("market_cap")
+    elif cap < rules.minimum_market_cap:
+        reasons.append(RejectionCode.MARKET_CAP_BELOW_THRESHOLD)
+    evidence.append(_item("market_cap", cap, rules.minimum_market_cap))
+    evidence.append(
+        EvidenceItem(
+            name="market_cap_preferred",
+            value="unknown" if cap is None else str(cap >= rules.preferred_market_cap).lower(),
+            threshold=str(rules.preferred_market_cap),
+        )
+    )
+
+    age, exact = _token_age(pool, token, features.decision_at)
+    if age < rules.minimum_token_age:
+        if exact:
+            reasons.append(RejectionCode.TOKEN_TOO_YOUNG)
+        else:
+            missing.append("token_age")
+    evidence.append(
+        EvidenceItem(
+            name="token_age_seconds",
+            value=str(int(age.total_seconds())),
+            threshold=str(int(rules.minimum_token_age.total_seconds())),
+        )
+    )
+    evidence.append(
+        _item("top10_holder_share", token.holder_concentration, policy.maximum_holder_concentration)
+    )
+
+    per_minute = features.volume_per_minute
+    if per_minute is None:
+        missing.append("volume_per_minute")
+        regime = VolumeRegime.UNKNOWN
+    elif per_minute < rules.minimum_volume_per_minute:
+        reasons.append(RejectionCode.VOLUME_PER_MINUTE_BELOW_THRESHOLD)
+        regime = VolumeRegime.BELOW
+    elif per_minute >= rules.overvolume_volume_per_minute:
+        regime = VolumeRegime.OVERVOLUME
+    else:
+        regime = VolumeRegime.WORKING
+    evidence.append(_item("volume_per_minute", per_minute, rules.minimum_volume_per_minute))
+    evidence.append(
+        EvidenceItem(
+            name="volume_regime",
+            value=regime.value,
+            threshold=(
+                f"working>={rules.minimum_volume_per_minute}; "
+                f"overvolume>={rules.overvolume_volume_per_minute}"
+            ),
+        )
+    )
+
+    turnover = features.volume_to_liquidity
+    if turnover is None:
+        missing.append("volume_to_liquidity")
+    elif turnover < rules.minimum_volume_to_liquidity:
+        reasons.append(RejectionCode.VOLUME_TO_LIQUIDITY_BELOW_THRESHOLD)
+    evidence.append(_item("volume_to_liquidity", turnover, rules.minimum_volume_to_liquidity))
+
+    efficiency = features.fee_efficiency
+    if efficiency is None:
+        missing.append("fee_efficiency")
+    elif efficiency < rules.minimum_fee_efficiency:
+        reasons.append(RejectionCode.ARTIFICIAL_VOLUME_SUSPECTED)
+    evidence.append(_item("fee_efficiency", efficiency, rules.minimum_fee_efficiency))
+
+    # D03: a conditional threshold. Applied when an enhanced provider reports it; when no
+    # source does, the decision is flagged for a manual check instead of failing closed.
+    total_fees = token.total_fees_sol
+    flags: list[DecisionFlag] = []
+    if total_fees is None:
+        flags.append(DecisionFlag.TOTAL_FEES_UNAVAILABLE)
+    elif total_fees < rules.minimum_total_fees_sol:
+        reasons.append(RejectionCode.TOTAL_FEES_BELOW_THRESHOLD)
+    evidence.append(
+        EvidenceItem(
+            name="total_fees_sol",
+            value="UNAVAILABLE" if total_fees is None else str(total_fees),
+            threshold=str(rules.minimum_total_fees_sol),
+        )
+    )
+
+    if missing:
+        reasons.append(RejectionCode.GUIDE_SIGNAL_UNKNOWN)
+    return GuideAssessment(
+        reasons=tuple(reasons),
+        missing_signals=tuple(sorted(missing)),
+        evidence=tuple(evidence),
+        volume_regime=regime,
+        flags=tuple(flags),
+    )
+
+
+def _token_age(
+    pool: PoolSnapshot, token: TokenRiskSnapshot, decision_at: datetime
+) -> tuple[timedelta, bool]:
+    """Lower bound on token age and whether it is exact.
+
+    A pool cannot predate its base mint, so pool age bounds token age from below; the
+    oldest mint activity from RPC is exact only when the signature history was exhausted.
+    """
+
+    bounds = [decision_at - pool.created_at]
+    if token.earliest_activity_at is not None:
+        bounds.append(decision_at - token.earliest_activity_at)
+    return max(bounds), token.activity_history_complete
+
+
+def _item(name: str, value: Decimal | None, threshold: Decimal) -> EvidenceItem:
+    return EvidenceItem(
+        name=name, value="UNKNOWN" if value is None else str(value), threshold=str(threshold)
+    )
+
+
 class PoolScreener:
     def evaluate(
         self,
@@ -117,11 +252,19 @@ class PoolScreener:
         missing.update(token.missing_signals)
         missing.update(integrity.missing_signals)
         evidence = _evidence(pool, token, features, integrity, estimated_price_impact, policy)
+        flags: tuple[DecisionFlag, ...] = ()
+        if policy.guide is not None:
+            guide = assess_guide_thresholds(pool, token, features, policy)
+            reasons.extend(guide.reasons)
+            missing.update(guide.missing_signals)
+            evidence = (*evidence, *guide.evidence)
+            flags = guide.flags
 
         warming = features.readiness is SignalReadiness.WARMING_UP
         unknown_codes = {
             RejectionCode.TOKEN_RISK_UNKNOWN,
             RejectionCode.VOLUME_INTEGRITY_UNKNOWN,
+            RejectionCode.GUIDE_SIGNAL_UNKNOWN,
         }
         non_terminal_codes = unknown_codes | {RejectionCode.HISTORY_WARMING_UP}
         explicit_danger = any(reason not in non_terminal_codes for reason in reasons)
@@ -164,6 +307,7 @@ class PoolScreener:
             ruleset_version=context.ruleset_version,
             config_version=context.config_version,
             correlation_id=context.correlation_id,
+            flags=flags,
         )
 
     @staticmethod

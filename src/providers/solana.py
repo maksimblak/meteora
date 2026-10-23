@@ -1,7 +1,9 @@
-"""Solana JSON-RPC adapter for mint authorities and wallet balances."""
+"""Solana JSON-RPC adapter for mint authorities, holder concentration, mint age and wallets."""
 
-from collections.abc import Mapping
-from datetime import datetime
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from src.core.clock import Clock, SystemClock
@@ -18,10 +20,42 @@ from src.market.models import (
 )
 from src.providers.contracts import (
     EnhancedTokenIntelligenceProvider,
+    ProviderError,
     ProviderPayloadError,
     ProviderUnavailableError,
     RpcJsonClient,
 )
+
+# Programs whose accounts hold liquidity or launch inventory, not a holder's free float:
+# a token account whose authority is owned by one of them is a pool vault or curve.
+KNOWN_LIQUIDITY_PROGRAMS: frozenset[str] = frozenset(
+    {
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",  # Meteora DLMM
+        "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",  # Meteora DAMM v1
+        "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",  # Meteora DAMM v2
+        "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN",  # Meteora Dynamic Bonding Curve
+        "24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHDS2SG3LYwBpyTi",  # Meteora Vault
+        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4
+        "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",  # Raydium CPMM
+        "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  # Raydium CLMM
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  # Orca Whirlpool
+        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # pump.fun bonding curve
+        "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",  # PumpSwap AMM
+    }
+)
+# Program-derived authorities that are not owned by their program (system-owned PDAs).
+KNOWN_PROGRAM_AUTHORITIES: frozenset[str] = frozenset(
+    {"5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"}  # Raydium AMM v4 authority
+)
+_TOP_HOLDERS = 10
+_SIGNATURE_PAGE = 1_000
+_MAX_CACHED_MINTS = 4_096
+
+
+@dataclass(frozen=True, slots=True)
+class _Activity:
+    earliest_at: datetime
+    complete: bool
 
 
 class SolanaRpcProvider:
@@ -31,10 +65,21 @@ class SolanaRpcProvider:
         *,
         clock: Clock | None = None,
         enhanced_provider: EnhancedTokenIntelligenceProvider | None = None,
+        analyze_holders: bool = True,
+        activity_pages: int = 1,
+        liquidity_programs: Collection[str] = KNOWN_LIQUIDITY_PROGRAMS,
+        program_authorities: Collection[str] = KNOWN_PROGRAM_AUTHORITIES,
     ) -> None:
+        if activity_pages < 0:
+            raise ValueError("activity_pages cannot be negative")
         self._client = client
         self._clock = clock or SystemClock()
         self._enhanced = enhanced_provider
+        self._analyze_holders = analyze_holders
+        self._activity_pages = activity_pages
+        self._liquidity_programs = frozenset(liquidity_programs)
+        self._program_authorities = frozenset(program_authorities)
+        self._complete_activity: dict[str, _Activity] = {}
 
     @property
     def health(self) -> ProviderHealth:
@@ -73,6 +118,18 @@ class SolanaRpcProvider:
         if enhanced.source_at > now:
             raise ProviderPayloadError("enhanced token source time is in the future")
         missing.extend(enhanced.missing_signals)
+        # The more concentrated reading wins: a risk filter must never under-report it.
+        readings = [
+            value
+            for value in (await self._top_holder_share(mint), enhanced.holder_concentration)
+            if value is not None
+        ]
+        holder_concentration = max(readings) if readings else None
+        if holder_concentration is None:
+            missing.append("holder_concentration")
+        else:
+            missing = [name for name in missing if name != "holder_concentration"]
+        activity = await self._activity(mint, now)
         deduplicated_missing = tuple(sorted(set(missing)))
         quality = DataQuality.PARTIAL if deduplicated_missing else DataQuality.COMPLETE
         return TokenRiskSnapshot(
@@ -81,7 +138,10 @@ class SolanaRpcProvider:
             freeze_authority=freeze_authority,
             blacklisted=enhanced.blacklisted,
             verified=enhanced.verified,
-            holder_concentration=enhanced.holder_concentration,
+            holder_concentration=holder_concentration,
+            earliest_activity_at=None if activity is None else activity.earliest_at,
+            activity_history_complete=activity is not None and activity.complete,
+            total_fees_sol=enhanced.total_fees_sol,
             wash_trading=enhanced.wash_trading,
             observed_at=now,
             source_at=enhanced.source_at,
@@ -177,12 +237,193 @@ class SolanaRpcProvider:
                 ),
             )
 
+    async def _top_holder_share(self, mint: PublicKey) -> Decimal | None:
+        """Top-10 wallet share of supply, excluding pool vaults and known programs.
+
+        ``getTokenLargestAccounts`` shows at most one page of token accounts; when that page
+        is full and fewer than ten free-float holders remain after exclusions, the true
+        top-10 may include unseen accounts, so the signal stays unknown.
+        """
+
+        if not self._analyze_holders:
+            return None
+        try:
+            supply = _supply(await self._call("getTokenSupply", [mint.root]))
+            largest = _largest_accounts(await self._call("getTokenLargestAccounts", [mint.root]))
+            if supply <= 0 or not largest:
+                return None
+            authorities = _authorities(
+                await self._call(
+                    "getMultipleAccounts",
+                    [[address for address, _ in largest], {"encoding": "jsonParsed"}],
+                ),
+                len(largest),
+            )
+            unique = sorted(set(authorities))
+            owners = _owner_programs(
+                await self._call(
+                    "getMultipleAccounts",
+                    [unique, {"encoding": "base64", "dataSlice": {"offset": 0, "length": 0}}],
+                ),
+                unique,
+            )
+        except ProviderError:
+            return None
+        holdings: dict[str, int] = {}
+        for (_, amount), authority in zip(largest, authorities, strict=True):
+            program, executable = owners[authority]
+            if (
+                executable
+                or authority in self._program_authorities
+                or authority in self._liquidity_programs
+                or program in self._liquidity_programs
+            ):
+                continue
+            holdings[authority] = holdings.get(authority, 0) + amount
+        page_is_full = len(largest) >= 20
+        if page_is_full and len(holdings) < _TOP_HOLDERS:
+            return None
+        top = sorted(holdings.values(), reverse=True)[:_TOP_HOLDERS]
+        return min(Decimal(sum(top)) / Decimal(supply), Decimal(1))
+
+    async def _activity(self, mint: PublicKey, now: datetime) -> _Activity | None:
+        """Oldest mint activity: an exact creation time once the history ends, else a bound."""
+
+        cached = self._complete_activity.get(mint.root)
+        if cached is not None:
+            return cached
+        if self._activity_pages == 0:
+            return None
+        earliest: datetime | None = None
+        before: str | None = None
+        complete = False
+        try:
+            for _ in range(self._activity_pages):
+                options: dict[str, Any] = {"limit": _SIGNATURE_PAGE, "commitment": "confirmed"}
+                if before is not None:
+                    options["before"] = before
+                page = _signature_page(
+                    await self._call("getSignaturesForAddress", [mint.root, options])
+                )
+                for entry in page:
+                    block_time = entry.get("blockTime")
+                    if block_time is None:
+                        continue
+                    seen = _block_time(block_time)
+                    earliest = seen if earliest is None else min(earliest, seen)
+                if len(page) < _SIGNATURE_PAGE:
+                    complete = True
+                    break
+                signature = page[-1].get("signature")
+                if not isinstance(signature, str):
+                    break
+                before = signature
+        except ProviderError:
+            return None
+        if earliest is None:
+            return None
+        activity = _Activity(earliest_at=min(earliest, now), complete=complete)
+        if complete:
+            if len(self._complete_activity) >= _MAX_CACHED_MINTS:
+                self._complete_activity.pop(next(iter(self._complete_activity)))
+            self._complete_activity[mint.root] = activity
+        return activity
+
+    async def _call(self, method: str, params: list[Any]) -> Mapping[str, Any]:
+        return _response(
+            await self._client.post_json(
+                {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+            )
+        )
+
 
 def _response(value: Any) -> Mapping[str, Any]:
     response = _mapping(value, "response")
     if "error" in response:
         raise ProviderUnavailableError("Solana RPC returned an error")
     return response
+
+
+def _rpc_value(response: Mapping[str, Any]) -> Any:
+    return _required(_mapping(_required(response, "result"), "result"), "value")
+
+
+def _rpc_list(value: Any, field: str) -> Sequence[Any]:
+    if not isinstance(value, list):
+        raise ProviderPayloadError(f"Solana {field} must be a list")
+    return value
+
+
+def _account_key(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ProviderPayloadError(f"Solana {field} must be a public key")
+    try:
+        return PublicKey(value).root
+    except ValueError as error:
+        raise ProviderPayloadError(f"Solana {field} is not a public key") from error
+
+
+def _supply(response: Mapping[str, Any]) -> int:
+    value = _mapping(_rpc_value(response), "token supply")
+    return _non_negative_int(_required(value, "amount"), "token supply")
+
+
+def _largest_accounts(response: Mapping[str, Any]) -> list[tuple[str, int]]:
+    accounts: list[tuple[str, int]] = []
+    for raw in _rpc_list(_rpc_value(response), "largest accounts"):
+        entry = _mapping(raw, "largest account")
+        accounts.append(
+            (
+                _account_key(_required(entry, "address"), "token account"),
+                _non_negative_int(_required(entry, "amount"), "token account amount"),
+            )
+        )
+    return accounts
+
+
+def _authorities(response: Mapping[str, Any], expected: int) -> list[str]:
+    values = _rpc_list(_rpc_value(response), "token accounts")
+    if len(values) != expected:
+        raise ProviderPayloadError("Solana returned a different number of token accounts")
+    authorities: list[str] = []
+    for raw in values:
+        account = _mapping(raw, "token account")
+        data = _mapping(_required(account, "data"), "data")
+        info = _mapping(_required(_mapping(_required(data, "parsed"), "parsed"), "info"), "info")
+        authorities.append(_account_key(_required(info, "owner"), "token account owner"))
+    return authorities
+
+
+def _owner_programs(
+    response: Mapping[str, Any], authorities: Sequence[str]
+) -> dict[str, tuple[str | None, bool]]:
+    values = _rpc_list(_rpc_value(response), "authority accounts")
+    if len(values) != len(authorities):
+        raise ProviderPayloadError("Solana returned a different number of authority accounts")
+    owners: dict[str, tuple[str | None, bool]] = {}
+    for authority, raw in zip(authorities, values, strict=True):
+        if raw is None:  # an unfunded wallet has no account at all
+            owners[authority] = (None, False)
+            continue
+        account = _mapping(raw, "authority account")
+        executable = account.get("executable", False)
+        if not isinstance(executable, bool):
+            raise ProviderPayloadError("Solana executable flag must be a boolean")
+        owners[authority] = (_account_key(_required(account, "owner"), "account owner"), executable)
+    return owners
+
+
+def _signature_page(response: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    return [
+        _mapping(entry, "signature")
+        for entry in _rpc_list(_required(response, "result"), "signatures")
+    ]
+
+
+def _block_time(value: Any) -> datetime:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ProviderPayloadError("Solana blockTime must be a non-negative integer")
+    return datetime.fromtimestamp(value, tz=UTC)
 
 
 def _unavailable_token_risk(mint: PublicKey, now: datetime) -> TokenRiskSnapshot:

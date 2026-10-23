@@ -21,6 +21,42 @@ class SignalReadiness(StrEnum):
     READY = "READY"
 
 
+WINDOW_MINUTES: dict[str, int] = {"5m": 5, "30m": 30, "1h": 60, "4h": 240, "24h": 1_440}
+
+
+class GuideFeatureRules(BaseModel):
+    """Inputs of the LexDollar guide rules (spec 6.6); all are point-in-time.
+
+    ``volume_window`` feeds volume per minute; volume-to-liquidity is that rate over five
+    minutes, as the guide reads it, whatever the window. ``organicity_window`` compares
+    collected fees with the pool's base fee. A local high looks back
+    ``local_high_lookback``. The pool ATH is known only when the stored history starts
+    within ``ath_coverage_tolerance`` of pool creation and no two consecutive snapshots are
+    further apart than ``maximum_observation_gap`` (the 5-minute universe cadence plus
+    scheduling slack).
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    volume_window: str = "5m"
+    organicity_window: str = "1h"
+    local_high_lookback: timedelta = timedelta(hours=1)
+    ath_coverage_tolerance: timedelta = timedelta(minutes=15)
+    maximum_observation_gap: timedelta = timedelta(minutes=5, seconds=30)
+
+    @model_validator(mode="after")
+    def validate_guide(self) -> "GuideFeatureRules":
+        if self.volume_window not in WINDOW_MINUTES or self.organicity_window not in WINDOW_MINUTES:
+            raise ValueError("unsupported guide window")
+        if self.local_high_lookback <= timedelta(0):
+            raise ValueError("local_high_lookback must be positive")
+        if self.ath_coverage_tolerance < timedelta(0):
+            raise ValueError("ath_coverage_tolerance cannot be negative")
+        if self.maximum_observation_gap <= timedelta(0):
+            raise ValueError("maximum_observation_gap must be positive")
+        return self
+
+
 class VolumeFeatureRules(BaseModel):
     """Versioned hypotheses; defaults are for shadow validation, not profit claims."""
 
@@ -35,6 +71,7 @@ class VolumeFeatureRules(BaseModel):
     maximum_history_points: int = 288
     maximum_source_age: timedelta = timedelta(minutes=10)
     zero_dispersion_score: Decimal = Decimal("10")
+    guide: GuideFeatureRules | None = None
 
     _reject_float = field_validator("zero_dispersion_score", mode="before")(_exact_decimal)
 
@@ -42,9 +79,9 @@ class VolumeFeatureRules(BaseModel):
     def validate_rules(self) -> "VolumeFeatureRules":
         if not self.ruleset_version or not self.config_version:
             raise ValueError("ruleset and config versions are required")
-        if self.short_window not in {"5m", "30m", "1h", "4h", "24h"}:
+        if self.short_window not in WINDOW_MINUTES:
             raise ValueError("unsupported short_window")
-        if self.long_window not in {"5m", "30m", "1h", "4h", "24h"}:
+        if self.long_window not in WINDOW_MINUTES:
             raise ValueError("unsupported long_window")
         if self.baseline_points < 1:
             raise ValueError("baseline_points must be positive")
@@ -92,6 +129,22 @@ class VolumeSpikeFeatures(BaseModel):
     missing_signals: tuple[str, ...]
     ruleset_version: str
     config_version: str
+    # guide-v1 inputs; ``None`` when the ruleset does not compute them or a source is
+    # missing. They never enter ``missing_signals``: screening owns the guide UNKNOWN rule.
+    volume_per_minute: Decimal | None = None
+    volume_to_liquidity: Decimal | None = None
+    fee_efficiency: Decimal | None = None
+    local_high_price: Decimal | None = None
+    all_time_high_price: Decimal | None = None
+
+    _reject_float = field_validator(
+        "volume_per_minute",
+        "volume_to_liquidity",
+        "fee_efficiency",
+        "local_high_price",
+        "all_time_high_price",
+        mode="before",
+    )(_exact_decimal)
 
     @model_validator(mode="after")
     def validate_point_in_time(self) -> "VolumeSpikeFeatures":

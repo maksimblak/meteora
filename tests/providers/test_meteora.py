@@ -91,6 +91,85 @@ def test_meteora_adapter_paginates_and_normalizes_exact_windows() -> None:
     asyncio.run(exercise())
 
 
+def _guide_payload(**extra: Any) -> dict[str, Any]:
+    return {
+        "source_at": "2026-10-18T09:59:45Z",
+        "created_at": "2026-10-18T06:00:00Z",
+        "tvl": "87000",
+        "depth": "40000",
+        "price": "0.0021",
+        "bin_step": 100,
+        "windows": {
+            name: {"volume": "1000", "fees": "10"} for name in ("5m", "30m", "1h", "4h", "24h")
+        },
+        **extra,
+    }
+
+
+def test_meteora_adapter_reads_base_fee_and_base_token_market_cap() -> None:
+    """The live Data API nests both: ``pool_config.base_fee_pct`` and ``token_x.market_cap``."""
+
+    async def exercise() -> None:
+        pool = PoolRef(
+            address=PublicKey(POOL),
+            base_mint=PublicKey(MINT_A),
+            quote_mint=PublicKey(MINT_B),
+        )
+        nested = _guide_payload(
+            pool_config={"bin_step": 100, "base_fee_pct": "1"},
+            token_x={"address": MINT_A, "market_cap": "2100000"},
+            token_y={"address": MINT_B, "market_cap": "61448457325"},
+        )
+        swapped = _guide_payload(
+            base_fee_percentage="0.25",
+            token_x={"address": MINT_B, "market_cap": "61448457325"},
+            token_y={"address": MINT_A, "market_cap": "750000"},
+        )
+        bare = _guide_payload()
+        provider_for = {
+            name: MeteoraDataApiProvider(
+                StubJsonClient({(f"/pools/{POOL}", ()): payload}), clock=FrozenClock(NOW)
+            )
+            for name, payload in (("nested", nested), ("swapped", swapped), ("bare", bare))
+        }
+
+        nested_snapshot = await provider_for["nested"].get_pool_snapshot(pool, NOW)
+        swapped_snapshot = await provider_for["swapped"].get_pool_snapshot(pool, NOW)
+        bare_snapshot = await provider_for["bare"].get_pool_snapshot(pool, NOW)
+
+        assert nested_snapshot.base_fee_rate == Decimal("0.01")
+        assert nested_snapshot.base_token_market_cap == Decimal("2100000")
+        assert swapped_snapshot.base_fee_rate == Decimal("0.0025")
+        assert swapped_snapshot.base_token_market_cap == Decimal("750000")
+        assert bare_snapshot.base_fee_rate is None
+        assert bare_snapshot.base_token_market_cap is None
+        assert bare_snapshot.data_quality is DataQuality.COMPLETE
+
+    asyncio.run(exercise())
+
+
+def test_meteora_adapter_rejects_impossible_guide_fields() -> None:
+    async def exercise() -> None:
+        pool = PoolRef(
+            address=PublicKey(POOL),
+            base_mint=PublicKey(MINT_A),
+            quote_mint=PublicKey(MINT_B),
+        )
+        for payload in (
+            _guide_payload(base_fee_pct="-1"),
+            _guide_payload(base_fee_pct="101"),
+            _guide_payload(market_cap="-5"),
+            _guide_payload(base_fee_pct=0.25),
+        ):
+            provider = MeteoraDataApiProvider(
+                StubJsonClient({(f"/pools/{POOL}", ()): payload}), clock=FrozenClock(NOW)
+            )
+            with pytest.raises(ProviderPayloadError):
+                await provider.get_pool_snapshot(pool, NOW)
+
+    asyncio.run(exercise())
+
+
 def test_meteora_adapter_exposes_stale_partial_and_rejects_invalid_payload() -> None:
     async def exercise() -> None:
         pool = PoolRef(

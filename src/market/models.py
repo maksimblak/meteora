@@ -149,14 +149,24 @@ class PoolSnapshot(BaseModel):
     data_quality: DataQuality
     missing_fields: tuple[str, ...] = ()
     provider: str = "unknown"
+    # Optional guide signals (spec 6.6). ``None`` means the source did not report them;
+    # they are not part of ``missing_fields`` so rulesets that do not use them are unaffected.
+    base_fee_rate: Decimal | None = None
+    base_token_market_cap: Decimal | None = None
 
-    _reject_binary_float = field_validator("tvl", "depth", "price", mode="before")(_exact_decimal)
+    _reject_binary_float = field_validator(
+        "tvl", "depth", "price", "base_fee_rate", "base_token_market_cap", mode="before"
+    )(_exact_decimal)
     _normalize_utc = field_validator("created_at", "observed_at", "source_at", "ingested_at")(_utc)
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> "PoolSnapshot":
         if self.tvl < 0 or (self.depth is not None and self.depth < 0) or self.price < 0:
             raise ValueError("snapshot monetary values must not be negative")
+        if self.base_fee_rate is not None and not Decimal(0) <= self.base_fee_rate <= Decimal(1):
+            raise ValueError("base_fee_rate must be a fraction in [0, 1]")
+        if self.base_token_market_cap is not None and self.base_token_market_cap < 0:
+            raise ValueError("base_token_market_cap must not be negative")
         if self.bin_step <= 0:
             raise ValueError("bin_step must be positive")
         unknown_windows = set(self.windows).difference(WINDOW_NAMES)
@@ -197,9 +207,22 @@ class TokenRiskSnapshot(BaseModel):
     missing_signals: tuple[str, ...] = ()
     provider: str = "solana_rpc"
     wash_trading: RiskSignal = RiskSignal.UNKNOWN
+    # Optional guide signals (spec 6.6), ``None`` when no source reported them. The oldest
+    # mint activity seen is an exact creation time only when ``activity_history_complete``;
+    # otherwise it is a lower bound on the token's age.
+    earliest_activity_at: datetime | None = None
+    activity_history_complete: bool = False
+    total_fees_sol: Decimal | None = None
 
-    _reject_binary_float = field_validator("holder_concentration", mode="before")(_exact_decimal)
+    _reject_binary_float = field_validator("holder_concentration", "total_fees_sol", mode="before")(
+        _exact_decimal
+    )
     _normalize_utc = field_validator("observed_at", "source_at", "ingested_at")(_utc)
+
+    @field_validator("earliest_activity_at")
+    @classmethod
+    def _normalize_activity(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _utc(value)
 
     @model_validator(mode="after")
     def validate_risk(self) -> "TokenRiskSnapshot":
@@ -207,6 +230,12 @@ class TokenRiskSnapshot(BaseModel):
             Decimal(0) <= self.holder_concentration <= Decimal(1)
         ):
             raise ValueError("holder_concentration must be between zero and one")
+        if self.total_fees_sol is not None and self.total_fees_sol < 0:
+            raise ValueError("total_fees_sol must not be negative")
+        if self.activity_history_complete and self.earliest_activity_at is None:
+            raise ValueError("complete activity history requires earliest_activity_at")
+        if self.earliest_activity_at is not None and self.earliest_activity_at > self.observed_at:
+            raise ValueError("earliest_activity_at cannot be after observed_at")
         unknown_signals: set[str] = set()
         if self.mint_authority is AuthorityStatus.UNKNOWN:
             unknown_signals.add("mint_authority")
@@ -238,12 +267,15 @@ class EnhancedTokenSignals(BaseModel):
     verified: RiskSignal = RiskSignal.UNKNOWN
     wash_trading: RiskSignal = RiskSignal.UNKNOWN
     holder_concentration: Decimal | None = None
+    total_fees_sol: Decimal | None = None
     missing_signals: tuple[str, ...] = ()
     provider: str
     source_at: datetime
     freshness: Freshness
 
-    _reject_binary_float = field_validator("holder_concentration", mode="before")(_exact_decimal)
+    _reject_binary_float = field_validator("holder_concentration", "total_fees_sol", mode="before")(
+        _exact_decimal
+    )
     _normalize_utc = field_validator("source_at")(_utc)
 
 

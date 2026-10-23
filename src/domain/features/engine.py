@@ -1,12 +1,20 @@
 """Robust volume-spike features computed from historical snapshots only."""
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from src.domain.features.models import SignalReadiness, VolumeFeatureRules, VolumeSpikeFeatures
+from src.domain.features.models import (
+    WINDOW_MINUTES,
+    GuideFeatureRules,
+    SignalReadiness,
+    VolumeFeatureRules,
+    VolumeSpikeFeatures,
+)
 from src.market.models import DataQuality, Freshness, PoolSnapshot, WindowMetrics
 
+_TURNOVER_MINUTES = 5
 MAD_SCALE = Decimal("1.4826")
 IQR_SCALE = Decimal("1.349")
 
@@ -81,6 +89,7 @@ class VolumeFeatureEngine:
             and all(item.data_quality is DataQuality.COMPLETE for item in ordered)
             else DataQuality.PARTIAL
         )
+        guide = _guide_features(ordered, rules.guide, decision_at)
         return VolumeSpikeFeatures(
             decision_at=decision_at,
             observed_at=latest.observed_at,
@@ -110,7 +119,73 @@ class VolumeFeatureEngine:
             missing_signals=tuple(sorted(missing)),
             ruleset_version=rules.ruleset_version,
             config_version=rules.config_version,
+            volume_per_minute=guide.volume_per_minute,
+            volume_to_liquidity=guide.volume_to_liquidity,
+            fee_efficiency=guide.fee_efficiency,
+            local_high_price=guide.local_high_price,
+            all_time_high_price=guide.all_time_high_price,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _GuideValues:
+    volume_per_minute: Decimal | None = None
+    volume_to_liquidity: Decimal | None = None
+    fee_efficiency: Decimal | None = None
+    local_high_price: Decimal | None = None
+    all_time_high_price: Decimal | None = None
+
+
+def _guide_features(
+    ordered: Sequence[PoolSnapshot],
+    rules: GuideFeatureRules | None,
+    decision_at: datetime,
+) -> _GuideValues:
+    """guide-v1 inputs from point-in-time windows; every quantity stays ``None`` if unknown."""
+
+    if rules is None:
+        return _GuideValues()
+    latest = ordered[-1]
+    volume = latest.windows.get(rules.volume_window)
+    per_minute = volume.volume / Decimal(WINDOW_MINUTES[rules.volume_window]) if volume else None
+    # The guide threshold is 5-minute volume to liquidity; rescale so a longer window
+    # (a 30m average) cannot make the 0.5 bar several times easier to clear.
+    to_liquidity = (
+        per_minute * Decimal(_TURNOVER_MINUTES) / latest.tvl
+        if per_minute is not None and latest.tvl > 0
+        else None
+    )
+    organic = latest.windows.get(rules.organicity_window)
+    fee_efficiency = None
+    if (
+        organic is not None
+        and organic.fees is not None
+        and organic.volume > 0
+        and latest.base_fee_rate is not None
+        and latest.base_fee_rate > 0
+    ):
+        fee_efficiency = organic.fees / (organic.volume * latest.base_fee_rate)
+    window_start = decision_at - rules.local_high_lookback
+    local_high = max(item.price for item in ordered if item.observed_at >= window_start)
+    prior = ordered[:-1]
+    # An ATH is proven only by a history observed from pool creation without holes: a
+    # peak inside an unobserved gap would make any later "breakout" a lower high.
+    covers_pool_life = (
+        bool(prior)
+        and prior[0].observed_at - latest.created_at <= rules.ath_coverage_tolerance
+        and all(
+            current.observed_at - previous.observed_at <= rules.maximum_observation_gap
+            for previous, current in zip(ordered, ordered[1:], strict=False)
+        )
+    )
+    all_time_high = max(item.price for item in prior) if covers_pool_life else None
+    return _GuideValues(
+        volume_per_minute=per_minute,
+        volume_to_liquidity=to_liquidity,
+        fee_efficiency=fee_efficiency,
+        local_high_price=local_high,
+        all_time_high_price=all_time_high,
+    )
 
 
 def _reject_conflicting_observations(history: Sequence[PoolSnapshot]) -> None:
