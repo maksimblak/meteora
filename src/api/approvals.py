@@ -9,6 +9,12 @@ Order of an approval: re-authentication -> checklist -> pending phase -> readine
 preview digests -> audit record -> ``approve``. The audit record precedes the state
 change, so an approval the audit trail does not know about cannot exist (R29i.1).
 A repeated submit of the same ``approval_id`` returns the original state.
+
+The executor swaps no tokens (D08): an entry's quoted price impact must be measured and
+within the command's slippage limit, while an exit's quote is shown and audited but
+never blocks it - an exit is needed most in a thin or falling pool. For the same reason
+a daily stop, or a kill switch under ``ORDERLY_EXIT``, and the demotion to SHADOW it
+causes do not block the exit of an APPROVAL position (spec 7.3).
 """
 
 import asyncio
@@ -39,13 +45,20 @@ from src.api.schemas import (
 from src.api.security import OperatorAuth, OperatorPrincipal
 from src.domain.models.events import AuditEvent, EventType
 from src.domain.models.trading import TradingMode
-from src.execution.contracts import ExecutionPhase, OperatorApproval
+from src.execution.contracts import (
+    DlmmCommand,
+    DlmmOperation,
+    ExecutionPhase,
+    OperatorApproval,
+    SimulationResult,
+)
 from src.execution.service import (
     ExecutionBlocked,
     ExecutionRecord,
     ExecutionService,
     sign_operator_approval,
 )
+from src.modes.models import KillSwitchPolicy
 from src.observability.logging import error_fields, get_logger
 from src.persistence.contracts import DecisionRecord, PlanRecord
 from src.worker.execution import entry_idempotency_key, position_action_key
@@ -64,6 +77,9 @@ _RECENT_PHASES = (
     ExecutionPhase.FAILED,
     ExecutionPhase.EXPIRED,
 )
+# Operations that put tokens into a pool: only their quoted price impact is a limit (D08).
+_ENTRY_OPERATIONS = frozenset({DlmmOperation.OPEN, DlmmOperation.ADD})
+_EXIT_OPERATIONS = frozenset({DlmmOperation.REMOVE, DlmmOperation.CLOSE})
 # Simulation fields shown elsewhere in the preview (digests, identity) or as errors.
 _HIDDEN_SIMULATION_FIELDS = frozenset(
     {"schema_version", "command_id", "command_digest", "simulation_digest", "errors"}
@@ -272,6 +288,8 @@ class ApprovalDesk:
                 "approval_id": str(request.approval_id),
                 "command_digest": simulation.command_digest,
                 "simulation_digest": simulation.simulation_digest,
+                # What the operator saw; for an exit it is informational and may be None.
+                "price_impact_bps": simulation.price_impact_bps,
                 "approved_at": now.isoformat(),
                 "expires_at": expires_at.isoformat(),
                 "operator": principal.confirmation_id,
@@ -320,15 +338,27 @@ class ApprovalDesk:
         state = await self._ctx.mode_state()
         command, simulation = record.command, record.simulation
         blockers = list(self.unavailable())
+        daily_stop = state.daily_stop_active_on(self._ctx.today())
+        leaving = _leaves_approval_position(command)
+        # Spec 7.3: a stop halts entries, not the way out of an APPROVAL position. Under an
+        # active kill switch the configured policy decides, the same one the worker and
+        # ``ExecutionService`` apply; both stops demote the deployment to SHADOW.
+        emergency_exit = leaving and (
+            self._ctx.policy.kill_switch_policy is KillSwitchPolicy.ORDERLY_EXIT
+            if state.kill_switch_active
+            else daily_stop
+        )
         if record.phase is not ExecutionPhase.AWAITING_APPROVAL:
             blockers.append("NOT_AWAITING_APPROVAL")
         if command.mode is not TradingMode.APPROVAL:
             blockers.append("COMMAND_NOT_APPROVAL_MODE")
-        if state.mode is not TradingMode.APPROVAL:
+        if state.mode is not TradingMode.APPROVAL and not (
+            emergency_exit and state.mode is TradingMode.SHADOW
+        ):
             blockers.append("MODE_NOT_APPROVAL")
-        if state.kill_switch_active:
+        if state.kill_switch_active and not emergency_exit:
             blockers.append("KILL_SWITCH_ACTIVE")
-        if state.daily_stop_active_on(self._ctx.today()):
+        if daily_stop and not leaving:
             blockers.append("DAILY_STOP_ACTIVE")
         if command.expires_at <= now:
             blockers.append("COMMAND_EXPIRED")
@@ -336,10 +366,11 @@ class ApprovalDesk:
             blockers.append("SIMULATION_STALE")
         if not simulation.success or simulation.errors:
             blockers.append("SIMULATION_FAILED")
-        if simulation.price_impact_bps is None:
-            blockers.append("PRICE_IMPACT_UNMEASURED")
-        elif simulation.price_impact_bps > command.max_slippage_bps:
-            blockers.append("PRICE_IMPACT_ABOVE_LIMIT")
+        if command.operation in _ENTRY_OPERATIONS:
+            if simulation.price_impact_bps is None:
+                blockers.append("PRICE_IMPACT_UNMEASURED")
+            elif simulation.price_impact_bps > command.max_slippage_bps:
+                blockers.append("PRICE_IMPACT_ABOVE_LIMIT")
         return blockers
 
     def _approval_expiry(self, record: ExecutionRecord, now: datetime) -> datetime:
@@ -421,6 +452,13 @@ class ApprovalDesk:
             self._log.error("approval_refusal_audit_failed", **error_fields(error))
 
 
+def _leaves_approval_position(command: DlmmCommand) -> bool:
+    """A REMOVE/CLOSE queued for a position opened in APPROVAL (the command's own mode,
+    not the deployment's mode after a demotion)."""
+
+    return command.operation in _EXIT_OPERATIONS and command.mode is TradingMode.APPROVAL
+
+
 def _entry_plan_id(key: str) -> UUID | None:
     prefix, _, rest = key.partition(":")
     if prefix != "entry":
@@ -479,16 +517,7 @@ def _plan_diff(record: ExecutionRecord, plan: PlanRecord | None) -> list[PlanDif
             simulated=None,
             matches=None,
         ),
-        PlanDiffRow(
-            field="price_impact_bps",
-            planned=f"≤ {command.max_slippage_bps}",
-            command=str(command.max_slippage_bps),
-            simulated=None
-            if simulation.price_impact_bps is None
-            else str(simulation.price_impact_bps),
-            matches=simulation.price_impact_bps is not None
-            and simulation.price_impact_bps <= command.max_slippage_bps,
-        ),
+        _impact_row(command, simulation),
         PlanDiffRow(
             field="expires_at",
             planned=None if strategy is None else strategy.expires_at.isoformat(),
@@ -507,6 +536,28 @@ def _plan_diff(record: ExecutionRecord, plan: PlanRecord | None) -> list[PlanDif
         ),
     ]
     return rows
+
+
+def _impact_row(command: DlmmCommand, simulation: SimulationResult) -> PlanDiffRow:
+    """An entry's quoted impact against its slippage limit; an exit's quote is shown only."""
+
+    impact = simulation.price_impact_bps
+    simulated = None if impact is None else str(impact)
+    if command.operation not in _ENTRY_OPERATIONS:
+        return PlanDiffRow(
+            field="price_impact_bps",
+            planned="справочно: выход без обмена токенов",
+            command=None,
+            simulated=simulated,
+            matches=None,
+        )
+    return PlanDiffRow(
+        field="price_impact_bps",
+        planned=f"≤ {command.max_slippage_bps}",
+        command=str(command.max_slippage_bps),
+        simulated=simulated,
+        matches=impact is not None and impact <= command.max_slippage_bps,
+    )
 
 
 def _anchor_rows(record: ExecutionRecord) -> list[PlanDiffRow]:
