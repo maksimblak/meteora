@@ -36,6 +36,7 @@ class AppConfig(BaseModel):
     executor_mode_token: SecretStr | None = None
     executor_approval_secret: SecretStr | None = None
     gmgn_api_key: SecretStr | None = None
+    gmgn_bridge_token: SecretStr | None = None
     telegram_bot_token: SecretStr | None = None
 
     _ENV_FIELDS: ClassVar[dict[str, str]] = {

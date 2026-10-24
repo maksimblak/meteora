@@ -126,9 +126,14 @@ def test_the_position_snapshot_cadence_defaults_to_30_seconds(tmp_path: Path) ->
     assert runtime.swap == SwapSettings()
 
 
-def test_only_the_gmgn_api_key_turns_on_the_developer_watch(tmp_path: Path) -> None:
+def test_every_gmgn_source_watches_the_developer_and_none_without_one(tmp_path: Path) -> None:
+    """T21 (G25): the browser bridge reads the developer's status as the OpenAPI does, so
+    DEV_SOLD does not depend on which source serves GMGN."""
+
     keyed = built(environ(tmp_path, GMGN_API_KEY="key-1"))
-    browser = built(environ(tmp_path, GMGN_URL="http://gmgn:8080"))
+    browser = built(environ(tmp_path, GMGN_URL="http://host.docker.internal:8765"))
+    plain = built(environ(tmp_path))
 
     assert keyed.developer is not None and keyed.developer is keyed.gmgn
-    assert browser.gmgn is not None and browser.developer is None
+    assert browser.gmgn is not None and browser.developer is browser.gmgn
+    assert plain.gmgn is None and plain.developer is None

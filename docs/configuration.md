@@ -127,9 +127,9 @@ Compose-сервис `executor` (профиль `live`) получает из `d
 
 Продажа идёт во всех режимах: SHADOW моделирует её по котировке и комиссии пула, APPROVAL — каждая часть отдельной карточкой подтверждения, LIVE — автоматически. Kill switch и дневной стоп её не блокируют. Executor отказывает продаже сверх того, что вернули подтверждённые выходы позиции (`SWAP_EXCEEDS_EXIT_RETURNS`).
 
-## GMGN (G18, G20)
+## GMGN (G18, G20, G25)
 
-Источник метрик GMGN кандидатов (insiders, bundling, phishing, top-10, доля девелопера, total fees; только у OpenAPI — ещё объём токена за 5 мин и час, как в Trending, цена и капитализация токена, ATH, снайперы, статус девелопера и wash trading) выбирает worker: есть ключ — официальный GMGN OpenAPI (основной путь, G20); нет ключа, но задан `GMGN_URL` — запасной браузерный сервис `gmgn`; ни того ни другого — GMGN не спрашивается, решения с флагом `GMGN_UNAVAILABLE`. Ключ получает только worker, не api.
+Источник метрик GMGN кандидатов (insiders, bundling, phishing, top-10, доля девелопера, total fees; у OpenAPI и посредника — ещё объём токена за 5 мин и час, как в Trending, цена и капитализация токена, ATH, снайперы, статус девелопера и wash trading) выбирает worker: есть ключ — официальный GMGN OpenAPI (основной путь, G20); нет ключа, но задан `GMGN_URL` — посредник в окне Chromium на вашем ПК (G25, `http://host.docker.internal:8765`) или headless-сервис `gmgn` (`http://gmgn:8080`); ни того ни другого — GMGN не спрашивается, решения с флагом `GMGN_UNAVAILABLE`. Ключ и токен посредника получает только worker, не api.
 
 | Переменная | По умолчанию | compose | Что делает |
 |---|---|---|---|
@@ -137,14 +137,26 @@ Compose-сервис `executor` (профиль `live`) получает из `d
 | `GMGN_API_URL` | `https://openapi.gmgn.ai` | да | адрес OpenAPI |
 | `GMGN_API_PLAN` | `free` | да | тариф `free` / `plus` / `pro`; клиент держит 80% лимита тарифа (на кандидата два запроса: `token/info`, `token/security`) |
 | `GMGN_API_CACHE_SECONDS` | 300 | да | кэш ответа на токен (не дольше `GMGN_STALE_AFTER_SECONDS`): «текущий» объём токена может отставать на столько же; ранг кандидатов берёт объём GMGN только из кэша, без новых запросов; монитор позиции смотрит девелопера (`DEV_SOLD`) не чаще |
-| `GMGN_URL` | пусто | да | запасной путь без ключа: с `--profile gmgn` — `http://gmgn:8080`; при заданном ключе игнорируется |
+| `GMGN_URL` | пусто | да | путь без ключа: посредник — `http://host.docker.internal:8765`, headless-сервис с `--profile gmgn` — `http://gmgn:8080`; при заданном ключе игнорируется |
 | `GMGN_REQUIRED_FOR_LIVE` | пусто = `true` | да (worker и api) | `true`: без свежих данных GMGN вход в LIVE закрыт. `false` — единственный способ открыть LIVE без GMGN, ставится осознанно |
 | `GMGN_TIMEOUT_SECONDS` | OpenAPI 10, сервис 20 | да | таймаут одного ответа |
 | `GMGN_STALE_AFTER_SECONDS` | 900 | да | старше — данные считаются устаревшими |
 
 OpenAPI работает только с IPv4 (по IPv6 GMGN отвечает 401/403 — клиент сам ходит через IPv4). Отказ ключа (`AUTH_*`, `HTTP_401/403`, `PLAN_UPGRADE_REQUIRED`) — 15 минут без запросов, лимит (`RATE_LIMITED`) — пауза до сброса, не дольше 15 минут; во всех случаях решение получает `GMGN_UNAVAILABLE` с причиной, кандидат не «чистый». Проверка ключа вручную: `docker compose exec worker uv run python -m src.gmgn.smoke --mint <адрес токена>`.
 
-Сервис `gmgn` (профиль `gmgn`, выключен по умолчанию; запасной путь):
+**Посредник GMGN** (G25; не в Docker — на вашем ПК, `scripts/gmgn-bridge.ps1` или `scripts/gmgn-bridge.sh`; скрипт берёт эти имена из окружения, иначе из `.env`, значения не печатает; запуск и разбор отказов — `docs/runbook.md`, §3.1):
+
+| Переменная | По умолчанию | Что делает |
+|---|---|---|
+| `GMGN_BRIDGE_TOKEN` / `_FILE` | — (обязателен) | тот же токен, что у worker; `_FILE` — только из окружения процесса (в `.env` он называл бы путь внутри контейнера) |
+| `GMGN_BRIDGE_HOST` | `127.0.0.1` | адреса, на которых слушает посредник, через запятую: только loopback и частные адреса (мост Docker); `0.0.0.0` и публичные не принимаются. Docker Desktop доходит до loopback хоста как `host.docker.internal`; на Ubuntu с Docker Engine скрипт добавляет адрес `docker0` |
+| `GMGN_BRIDGE_PORT` | 8765 | порт |
+| `GMGN_BRIDGE_PROFILE_DIR` | `%LOCALAPPDATA%\MeteoraVolumeBot\gmgn-bridge-profile` (Ubuntu: `~/.local/share/meteora-volume-bot/gmgn-bridge-profile`) | профиль браузера с вашей сессией GMGN; внутри репозитория не принимается |
+| `GMGN_BRIDGE_REQUESTS_PER_MINUTE` | 20 | потолок запросов к gmgn.ai в минуту (на токен около 5: пачка `mutil_window_token_info` на ждущие токены, `token_stat`, `token_holder_stat`, `token_fee_info`, свечи капы `1d`; Trending — не чаще раза в 2 минуты) |
+
+Общие с headless-сервисом настройки посредник тоже читает: `GMGN_CACHE_TTL_SECONDS` (кэш ответа на токен), `GMGN_BREAKER_COOLDOWN_SECONDS` (пауза после проверки Cloudflare, капчи, блока или 429 — сразу, без трёх отказов подряд; после серии других отказов — как у сервиса), `GMGN_PAGE_TIMEOUT_SECONDS`, `GMGN_RESPONSE_WAIT_SECONDS`, `GMGN_BASE_URL`. Вкладка одна, запросы к gmgn.ai идут по одному. Ответ — `gmgn-signals.v2` (v1 и рыночные поля); worker принимает и v1, и v2.
+
+Сервис `gmgn` (профиль `gmgn`, выключен по умолчанию; headless):
 
 | Переменная | По умолчанию | compose |
 |---|---|---|
@@ -154,7 +166,7 @@ OpenAPI работает только с IPv4 (по IPv6 GMGN отвечает 4
 | `GMGN_BREAKER_COOLDOWN_SECONDS` | 900 | да |
 | `GMGN_BASE_URL` (только https), `GMGN_HOST`, `GMGN_PORT`, `GMGN_SETTLE_SECONDS` (8), `GMGN_MAX_PENDING` (16), `GMGN_RESPONSE_WAIT_SECONDS` (10), `GMGN_BACKOFF_SECONDS` (60), `GMGN_BACKOFF_MAX_SECONDS` (1800), `GMGN_BREAKER_THRESHOLD` (3) | в скобках | нет |
 
-**Ограничение сборки.** Браузерный сервис построен, но gmgn.ai через Cloudflare отдаёт headless-браузеру 403, и сервис отвечает `UNAVAILABLE` (причина `ACCESS_BLOCKED` или `API_BLOCKED`). Обхода нет и не будет: никаких капч, stealth и подмены отпечатков (§6.7). Поэтому без `GMGN_API_KEY` бот работает с флагом `GMGN_UNAVAILABLE`: в APPROVAL карточка подтверждения пишет «GMGN недоступен — проверь вручную», а автоматический LIVE закрыт, пока `GMGN_REQUIRED_FOR_LIVE` не выставлен в `false`. Единица `total_fee` из OpenAPI (SOL) выведена сборкой по совпадению с браузерным путём на одном токене — документация GMGN её не называет.
+**Ограничения.** Headless-сервис построен, но gmgn.ai через Cloudflare отдаёт headless-браузеру 403, и сервис отвечает `UNAVAILABLE` (причина `ACCESS_BLOCKED` или `API_BLOCKED`). Посредник работает только в видимом окне, пока оно открыто и ПК не спит; так пользоваться GMGN — против его правил. Обхода защит нет и не будет: никаких решателей капч, плагинов маскировки, подмены отпечатков и выноса cookie (§6.7). Без ключа и без посредника бот работает с флагом `GMGN_UNAVAILABLE`: в APPROVAL карточка подтверждения пишет «GMGN недоступен — проверь вручную», а автоматический LIVE закрыт, пока `GMGN_REQUIRED_FOR_LIVE` не выставлен в `false`. Единица `total_fee` (SOL) выведена сборкой по совпадению со страницей токена — документация GMGN её не называет.
 
 ## Пороги `guide-v1` и `RULESET_OVERRIDES_FILE`
 

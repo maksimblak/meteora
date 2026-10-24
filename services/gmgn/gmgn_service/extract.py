@@ -116,9 +116,9 @@ def extract_signals(responses: Iterable[CapturedResponse], *, chain: str, mint: 
             item = _token_item(data, mint)
             if item is None:
                 continue
-            fees = _amount(item.get("total_fee"))
+            fees = amount(item.get("total_fee"))
             dev = item.get("dev")
-            top10 = _share(dev.get("top_10_holder_rate")) if isinstance(dev, Mapping) else None
+            top10 = fraction(dev.get("top_10_holder_rate")) if isinstance(dev, Mapping) else None
             if fees is not None or top10 is not None:
                 sources.add(TOKEN_INFO)
             if fees is not None:
@@ -167,7 +167,9 @@ def _success_data(body: Any) -> Any:
 def _stat_signals(data: Mapping[str, Any]) -> dict[str, Decimal]:
     found: dict[str, Decimal] = {}
     for name, fields in _STAT_FIELDS.items():
-        values = [value for value in (_share(data.get(key)) for key in fields) if value is not None]
+        values = [
+            value for value in (fraction(data.get(key)) for key in fields) if value is not None
+        ]
         if values:
             found[name] = max(values)
     return found
@@ -181,7 +183,7 @@ def _token_item(data: Any, mint: str) -> Mapping[str, Any] | None:
     return None
 
 
-def _number(value: object) -> Decimal | None:
+def exact_number(value: object) -> Decimal | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, Decimal):
@@ -198,15 +200,15 @@ def _number(value: object) -> Decimal | None:
     return number if number.is_finite() else None
 
 
-def _share(value: object) -> Decimal | None:
-    number = _number(value)
+def fraction(value: object) -> Decimal | None:
+    number = exact_number(value)
     if number is None or not Decimal(0) <= number <= Decimal(1):
         return None
     return number
 
 
-def _amount(value: object) -> Decimal | None:
-    number = _number(value)
+def amount(value: object) -> Decimal | None:
+    number = exact_number(value)
     if number is None or number < 0:
         return None
     return number

@@ -73,8 +73,59 @@ def test_example_environment_names_the_gmgn_settings_without_values() -> None:
     lines = Path(".env.example").read_text(encoding="utf-8").splitlines()
     names = {line.split("=", 1)[0]: line.split("=", 1)[1] for line in lines if "=" in line}
 
-    for name in ("GMGN_URL", "GMGN_REQUIRED_FOR_LIVE", "GMGN_TIMEOUT_SECONDS"):
-        assert names[name] == ""
+    for name in (
+        "GMGN_URL",
+        "GMGN_REQUIRED_FOR_LIVE",
+        "GMGN_TIMEOUT_SECONDS",
+        "GMGN_BRIDGE_TOKEN",
+        "GMGN_BRIDGE_TOKEN_FILE",
+        "GMGN_BRIDGE_HOST",
+        "GMGN_BRIDGE_PORT",
+        "GMGN_BRIDGE_PROFILE_DIR",
+        "GMGN_BRIDGE_REQUESTS_PER_MINUTE",
+    ):
+        assert names[name] == "", name
+
+
+def test_the_worker_reaches_the_bridge_on_the_host_with_the_shared_token() -> None:
+    """G25: the bridge runs on the host, not in compose; the worker alone gets its token."""
+
+    services = compose()
+    worker = services["worker"]
+    environment = worker["environment"]
+
+    assert isinstance(environment, dict)
+    for name in ("GMGN_BRIDGE_TOKEN", "GMGN_BRIDGE_TOKEN_FILE"):
+        assert environment[name] == "${" + name + ":-}"
+    # Docker Desktop knows host.docker.internal; Docker Engine on Linux needs the mapping.
+    assert "host.docker.internal:host-gateway" in worker["extra_hosts"]
+    for name, service in services.items():
+        if name == "worker":
+            continue
+        variables = service.get("environment") or {}
+        assert "GMGN_BRIDGE_TOKEN" not in variables, name
+
+
+needs_scripts = pytest.mark.skipif(
+    not Path("scripts/gmgn-bridge.ps1").is_file(),
+    reason="the operator scripts are not part of the check image",
+)
+
+
+@needs_scripts
+@pytest.mark.parametrize("script", ["scripts/gmgn-bridge.ps1", "scripts/gmgn-bridge.sh"])
+def test_one_command_starts_the_bridge_without_printing_the_token(script: str) -> None:
+    text = Path(script).read_text(encoding="utf-8")
+
+    assert "gmgn_service.bridge" in text
+    assert "--frozen" in text and "services" in text
+    assert "GMGN_BRIDGE_TOKEN" in text
+    # The token is read into the process environment only; it is never echoed.
+    printing = ("write-host", "write-output", "echo ", "printf")
+    for line in text.splitlines():
+        lowered = line.lower()
+        if any(word in lowered for word in printing):
+            assert "token" not in lowered, line
 
 
 @needs_service_sources

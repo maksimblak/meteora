@@ -458,10 +458,33 @@ _GMGN_REASONS = {
     "HTTP_401": "GMGN отклонил ключ (401) — проверьте GMGN_API_KEY",
     "HTTP_403": "GMGN отказал в доступе (403): ключ, IP или IPv6",
     "SERVICE_TIMEOUT": "сервис gmgn не ответил вовремя",
-    "SERVICE_UNAVAILABLE": "сервис gmgn недоступен",
+    "SERVICE_UNAVAILABLE": (
+        "посредник GMGN (или сервис gmgn) недоступен: окно посредника закрыто, ПК спит "
+        "или GMGN_URL неверен"
+    ),
     "SERVICE_PAYLOAD_INVALID": "ответ сервиса gmgn в незнакомом формате",
     "SERVICE_SCHEMA_UNKNOWN": "сервис gmgn другой версии",
     "SERVICE_MINT_MISMATCH": "сервис gmgn ответил про другой токен",
+    # T21 (G25): the browser bridge on the host and the headless page service.
+    "SERVICE_UNAUTHORIZED": (
+        "посредник GMGN отклонил запрос: GMGN_BRIDGE_TOKEN у worker и посредника разный"
+    ),
+    "LOGIN_REQUIRED": (
+        "GMGN просит вход — войти можно только вручную в окне посредника, по вашему выбору"
+    ),
+    "CHALLENGE": "проверка Cloudflare в окне посредника не прошла — пауза, без обхода",
+    "CHALLENGE_TIMEOUT": "проверка Cloudflare не прошла вовремя — пауза, без обхода",
+    "CAPTCHA": "GMGN показал капчу — пауза; капчу бот не решает",
+    "ACCESS_BLOCKED": "GMGN или Cloudflare заблокировал доступ — пауза",
+    "API_BLOCKED": "GMGN отказал странице в данных (401/403)",
+    "NETWORK_ERROR": "сетевая ошибка при запросе к GMGN",
+    "PAGE_TIMEOUT": "страница GMGN не загрузилась вовремя",
+    "NO_SIGNALS": "GMGN не отдал ни одной метрики токена",
+    "FETCH_PENDING": "посредник ещё читает токен — ответ будет в следующем цикле",
+    "QUEUE_FULL": "очередь посредника переполнена — токен спросят позже",
+    "BROWSER_CLOSED": "окно посредника GMGN закрыто — запустите посредника снова",
+    "BROWSER_ERROR": "сбой браузера посредника GMGN",
+    "BROWSER_UNAVAILABLE": "браузер посредника GMGN не запущен",
 }
 _GMGN_FAMILIES = (
     ("AUTH_", "GMGN отклонил запрос авторизации (ключ, время или IP)"),
@@ -470,7 +493,9 @@ _GMGN_FAMILIES = (
 _GMGN_STATES = {
     "FRESH": "данные GMGN свежие",
     "STALE": "данные GMGN устарели",
-    "NOT_CONFIGURED": "источник GMGN не настроен: ни GMGN_API_KEY, ни сервиса gmgn",
+    "NOT_CONFIGURED": (
+        "источник GMGN не настроен: ни GMGN_API_KEY, ни GMGN_URL (посредник или сервис gmgn)"
+    ),
 }
 _GMGN_GENERIC = "GMGN недоступен"
 

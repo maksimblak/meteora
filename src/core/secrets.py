@@ -33,6 +33,8 @@ SECRETS: tuple[SecretSetting, ...] = (
     SecretSetting("EXECUTOR_MODE_TOKEN", "executor_mode_token", ("worker",)),
     SecretSetting("EXECUTOR_APPROVAL_SECRET", "executor_approval_secret", ("api", "worker")),
     SecretSetting("GMGN_API_KEY", "gmgn_api_key", ("worker",)),
+    # The shared token of the GMGN browser bridge on the host (G25): worker and bridge only.
+    SecretSetting("GMGN_BRIDGE_TOKEN", "gmgn_bridge_token", ("worker",)),
     SecretSetting("TELEGRAM_BOT_TOKEN", "telegram_bot_token", ()),
     SecretSetting("WALLET_KEYPAIR_FILE", "wallet_keypair_file", ("executor",), file_variant=False),
 )

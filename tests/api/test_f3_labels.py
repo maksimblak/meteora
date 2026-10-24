@@ -154,6 +154,24 @@ GMGN_STATUSES = (
     "UNAVAILABLE:API_MINT_MISMATCH",
     "UNAVAILABLE:API_ERROR",
     "UNAVAILABLE:CIRCUIT_OPEN",
+    # T21 (G25): the browser bridge, the headless page service and the worker's client.
+    "UNAVAILABLE:LOGIN_REQUIRED",
+    "UNAVAILABLE:CHALLENGE",
+    "UNAVAILABLE:CHALLENGE_TIMEOUT",
+    "UNAVAILABLE:CAPTCHA",
+    "UNAVAILABLE:ACCESS_BLOCKED",
+    "UNAVAILABLE:API_BLOCKED",
+    "UNAVAILABLE:NETWORK_ERROR",
+    "UNAVAILABLE:PAGE_TIMEOUT",
+    "UNAVAILABLE:NO_SIGNALS",
+    "UNAVAILABLE:FETCH_PENDING",
+    "UNAVAILABLE:QUEUE_FULL",
+    "UNAVAILABLE:BROWSER_CLOSED",
+    "UNAVAILABLE:BROWSER_ERROR",
+    "UNAVAILABLE:BROWSER_UNAVAILABLE",
+    "UNAVAILABLE:SERVICE_UNAUTHORIZED",
+    "UNAVAILABLE:SERVICE_UNAVAILABLE",
+    "UNAVAILABLE:SERVICE_TIMEOUT",
 )
 
 
@@ -282,6 +300,18 @@ def test_every_depth_detail_is_explained_next_to_its_evidence_row(detail: str) -
                                           threshold=detail)], ())
     assert row.note is not None
     russian(row.note, detail)
+
+
+@pytest.mark.parametrize(
+    "status", GMGN_STATUSES[GMGN_STATUSES.index("UNAVAILABLE:LOGIN_REQUIRED") :]
+)
+def test_every_gmgn_bridge_reason_has_its_own_line_not_the_generic_one(status: str) -> None:
+    reason = status.partition(":")[2]
+
+    note = labels.gmgn_status_label(status)
+
+    russian(note, status)
+    assert f"({reason})" not in note, note
 
 
 @pytest.mark.parametrize("status", GMGN_STATUSES)

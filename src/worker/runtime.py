@@ -12,13 +12,13 @@ any new action) -> lease-guarded scheduler. Jobs, by priority:
 3. ``universe_sync``   - paginated discovery, open-position pools first;
 4. ``outbox_relay`` / 5. ``retention`` - publication and telemetry clean-up.
 
-GMGN (G18, G20): with ``GMGN_API_KEY`` the candidate pipeline's token risk carries the
+GMGN (G18, G20, G25): with ``GMGN_API_KEY`` the candidate pipeline's token risk carries the
 reading of the official GMGN OpenAPI (``GmgnOpenApiProvider``); without a key but with
-``GMGN_URL``, that of the internal browser service ``gmgn`` (``GmgnProvider``). Positions
-keep the plain token-risk provider; with the key (only) the position job also watches the
-developer through the same OpenAPI source every 5 minutes (``DEV_SOLD``, T19). Without
-either nothing is asked and nothing changes, except that the loaded guide-v1 rules keep
-LIVE closed until ``GMGN_REQUIRED_FOR_LIVE=false``.
+``GMGN_URL``, that of the browser bridge on the host or the headless service ``gmgn``
+(``GmgnProvider``). Positions keep the plain token-risk provider; the position job also
+watches the developer through the same GMGN source every 5 minutes (``DEV_SOLD``, T19).
+Without either nothing is asked and nothing changes, except that the loaded guide-v1 rules
+keep LIVE closed until ``GMGN_REQUIRED_FOR_LIVE=false``.
 
 Open positions (T19, spec 6.8): the position job rereads each position's pool from the
 Data API every ``WORKER_POSITION_SNAPSHOT_SECONDS`` (30) through the universe adapter, so
@@ -66,6 +66,7 @@ from src.execution.service import (
 )
 from src.execution.settings import ExecutorSettings, SwapSettings
 from src.gmgn import GmgnOpenApiProvider, GmgnProvider, OpenApiSettings
+from src.gmgn.client import bridge_token
 from src.gmgn.enrichment import EnhancedSignalSource, EnrichedOnChainProvider
 from src.gmgn.openapi import openapi_client
 from src.market.contracts import MarketDataProvider, OnChainProvider, VolumeHistorySource
@@ -204,7 +205,7 @@ class GatewayReadiness(Protocol):
 @runtime_checkable
 class CachedTokenSignals(Protocol):
     """An enhanced source that can say what it already holds, without a request
-    (``GmgnOpenApiProvider.cached_signals``)."""
+    (``cached_signals`` of ``GmgnOpenApiProvider`` and of ``GmgnProvider``)."""
 
     def cached_signals(self, mint: PublicKey) -> EnhancedTokenSignals | None: ...
 
@@ -655,7 +656,7 @@ class WorkerRuntime:
             await self.retention.purge(self.clock.now())
 
     def _held_token_volume(self) -> TokenVolumeLookup | None:
-        """GMGN's hourly volume of a token from readings the OpenAPI source already holds
+        """GMGN's hourly volume of a token from readings the GMGN source already holds
         (``cached_signals``: no request), for ranking (F5); ``None`` without such a source."""
 
         source = self.gmgn
@@ -906,8 +907,9 @@ def build_runtime(
         warmup=warmup,
         gmgn=gmgn,
         pool_snapshots=pool_snapshots,
-        # The developer watch needs the key (spec 6.8): the browser service is not polled.
-        developer=gmgn if isinstance(gmgn, GmgnOpenApiProvider) else None,
+        # The developer watch (DEV_SOLD, spec 6.8) asks whichever GMGN source is configured:
+        # the browser bridge reads the creator's status as the OpenAPI does (G25).
+        developer=gmgn,
         swap=swap,
     )
     return runtime, clients
@@ -976,9 +978,12 @@ def build_gmgn(
 
     ``GMGN_API_KEY`` (or ``GMGN_API_KEY_FILE``): the official GMGN OpenAPI
     (``GMGN_API_URL``, ``GMGN_API_PLAN``, ``GMGN_API_CACHE_SECONDS``). Without a key,
-    ``GMGN_URL`` (e.g. ``http://gmgn:8080``): the internal browser service, compose profile
-    ``gmgn``. Without either nothing is asked. ``GMGN_TIMEOUT_SECONDS`` bounds one answer
-    (OpenAPI 10 s, service 20 s by default), ``GMGN_STALE_AFTER_SECONDS`` the age of fresh data.
+    ``GMGN_URL``: the browser bridge on the host (G25, e.g.
+    ``http://host.docker.internal:8765``, asked with ``GMGN_BRIDGE_TOKEN`` or
+    ``GMGN_BRIDGE_TOKEN_FILE``) or the headless service of compose profile ``gmgn``
+    (``http://gmgn:8080``). Without either nothing is asked. ``GMGN_TIMEOUT_SECONDS`` bounds
+    one answer (OpenAPI 10 s, service 20 s by default), ``GMGN_STALE_AFTER_SECONDS`` the age
+    of fresh data.
     """
 
     url = (environ.get(GMGN_URL_ENV) or "").strip()
@@ -1005,11 +1010,16 @@ def build_gmgn(
     if not url:
         return None, None
     timeout = _seconds(environ, GMGN_TIMEOUT_ENV, 20)
+    token = bridge_token(environ)
     client = httpx.AsyncClient(base_url=url, transport=transport)
     provider = GmgnProvider(
-        client, clock=clock, timeout=timeout.total_seconds(), stale_after=stale_after
+        client,
+        clock=clock,
+        timeout=timeout.total_seconds(),
+        stale_after=stale_after,
+        token=token,
     )
-    get_logger("worker.runtime").info("gmgn_source", source="browser")
+    get_logger("worker.runtime").info("gmgn_source", source="browser", token=token is not None)
     return provider, client
 
 

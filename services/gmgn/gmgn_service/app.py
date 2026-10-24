@@ -15,11 +15,15 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from gmgn_service.config import ServiceSettings
-from gmgn_service.contract import SignalsV1
+from gmgn_service.contract import Signals
 from gmgn_service.service import SignalService
 
 SUPPORTED_CHAINS = frozenset({"sol"})
 _MINT = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+
+def valid_mint(mint: str) -> bool:
+    return _MINT.fullmatch(mint) is not None
 
 
 def create_app(
@@ -48,11 +52,11 @@ def create_app(
     app = FastAPI(title="gmgn-signals", lifespan=lifespan, docs_url=None, redoc_url=None)
 
     @app.get("/v1/tokens/{chain}/{mint}/signals", response_model=None)
-    async def signals(chain: str, mint: str, request: Request) -> SignalsV1 | JSONResponse:
+    async def signals(chain: str, mint: str, request: Request) -> Signals | JSONResponse:
         if chain not in SUPPORTED_CHAINS:
-            return _error(404, "CHAIN_UNSUPPORTED", f"chain {chain!r} is not supported")
-        if not _MINT.fullmatch(mint):
-            return _error(422, "MINT_INVALID", "mint must be a base58 public key")
+            return error_response(404, "CHAIN_UNSUPPORTED", f"chain {chain!r} is not supported")
+        if not valid_mint(mint):
+            return error_response(422, "MINT_INVALID", "mint must be a base58 public key")
         current: SignalService = request.app.state.service
         return await current.signals(chain, mint)
 
@@ -71,5 +75,5 @@ def create_app(
     return app
 
 
-def _error(status: int, code: str, message: str) -> JSONResponse:
+def error_response(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse({"error": {"code": code, "message": message}}, status_code=status)

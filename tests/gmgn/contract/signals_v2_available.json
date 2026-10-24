@@ -1,0 +1,37 @@
+{
+  "schema_version": "gmgn-signals.v2",
+  "chain": "sol",
+  "mint": "Dx7D4Xg338GoUUjqPb4DXVYc43Ko1e9gjAKiJ7acpump",
+  "status": "AVAILABLE",
+  "reason": null,
+  "source_at": "2026-10-24T16:50:00Z",
+  "freshness": "FRESH",
+  "signals": {
+    "top10_holder_share": "0.0443",
+    "insiders_share": "0.7968",
+    "bundling_share": "0.0325",
+    "phishing_share": "0.7968",
+    "developer_share": "0.0325267424",
+    "total_fees_sol": "0.9718177443108398",
+    "volume_5m_usd": "7419.35651281",
+    "volume_1h_usd": "137356.48892064",
+    "price_usd": "0.00016726742",
+    "market_cap_usd": "166495.96670650423973744",
+    "ath_price_usd": "0.0008064953499703052620352908572",
+    "ath_market_cap_usd": "802775.7165",
+    "sniper_count": 20,
+    "sniper_share": "0.0325267932",
+    "developer_status": "SOLD",
+    "created_at": "2026-10-24T15:56:15Z",
+    "wash_trading": false
+  },
+  "missing": [],
+  "sources": [
+    "mutil_window_token_info",
+    "token_fee_info",
+    "token_holder_stat",
+    "token_mcap_candles",
+    "token_stat",
+    "trending_multichain"
+  ]
+}

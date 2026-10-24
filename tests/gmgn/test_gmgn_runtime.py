@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+import pytest
 from prometheus_client import CollectorRegistry
 
 from src.core.clock import FrozenClock
@@ -23,7 +24,13 @@ from src.market.models import (
 )
 from src.observability.metrics import WorkerMetrics
 from src.providers.fixtures import FixtureOnChainProvider
-from src.worker.runtime import WorkerRuntime, WorkerSettings, build_runtime
+from src.worker.runtime import (
+    CachedTokenSignals,
+    WorkerRuntime,
+    WorkerSettings,
+    build_gmgn,
+    build_runtime,
+)
 from tests.worker.harness import NOW, POOL, harness_policy, memory_repositories, safe_token
 from tests.worker.harness import spike_history as harness_spike
 
@@ -160,3 +167,65 @@ def test_the_runtime_wires_the_service_only_when_gmgn_url_is_set(tmp_path: Path)
     # The loaded rules carry GMGN whether or not the service runs (LIVE fails closed).
     guide = wired.policy.screening.guide
     assert guide is not None and guide.gmgn is not None and guide.gmgn.required_for_live
+
+
+BRIDGE_TOKEN = "t21-runtime-bridge-token-0123456789"  # noqa: S105 - a test value
+
+
+def test_the_bridge_is_asked_with_its_token_ranks_and_watches_like_openapi(
+    tmp_path: Path,
+) -> None:
+    """G25: the browser bridge on the host gets the shared token; its good readings rank
+    tokens (F5) and it watches open positions' developers (DEV_SOLD), as the OpenAPI does."""
+
+    requests: list[httpx.Request] = []
+
+    def bridge(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(401, json={"error": {"code": "UNAUTHORIZED"}})
+
+    environ = {
+        "APP_ENV": "development",
+        "LOCAL_SQLITE_PATH": str(tmp_path / "worker.sqlite3"),
+        "GMGN_URL": "http://host.docker.internal:8765",
+        "GMGN_BRIDGE_TOKEN": BRIDGE_TOKEN,
+    }
+    runtime, clients = build_runtime(
+        AppConfig.load(environ=environ),
+        environ,
+        clock=FrozenClock(NOW),
+        gmgn_transport=httpx.MockTransport(bridge),
+    )
+
+    async def run() -> EnhancedTokenSignals:
+        try:
+            assert runtime.gmgn is not None
+            return await runtime.gmgn.get_token_signals(POOL.base_mint)
+        finally:
+            for client in clients:
+                await client.aclose()
+            runtime.close()
+
+    reading = asyncio.run(run())
+
+    (request,) = requests
+    assert (request.url.host, request.url.port) == ("host.docker.internal", 8765)
+    assert request.headers["Authorization"] == f"Bearer {BRIDGE_TOKEN}"
+    assert reading.detail == "SERVICE_UNAUTHORIZED"
+    assert isinstance(runtime.gmgn, CachedTokenSignals)
+    assert runtime.developer is runtime.gmgn
+
+
+def test_a_bridge_token_set_twice_stops_the_start(tmp_path: Path) -> None:
+    secret = tmp_path / "bridge-token"
+    secret.write_text(BRIDGE_TOKEN, encoding="utf-8")
+    environ = {
+        "APP_ENV": "development",
+        "LOCAL_SQLITE_PATH": str(tmp_path / "worker.sqlite3"),
+        "GMGN_URL": "http://host.docker.internal:8765",
+        "GMGN_BRIDGE_TOKEN": BRIDGE_TOKEN,
+        "GMGN_BRIDGE_TOKEN_FILE": str(secret),
+    }
+
+    with pytest.raises(ValueError, match="not both"):
+        build_gmgn(environ, clock=FrozenClock(NOW))

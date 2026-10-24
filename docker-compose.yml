@@ -123,17 +123,22 @@ services:
       EXECUTOR_URL: ${EXECUTOR_URL:-}
       EXECUTOR_INTERNAL_TOKEN: ${EXECUTOR_INTERNAL_TOKEN:-}
       EXECUTOR_INTERNAL_TOKEN_FILE: ${EXECUTOR_INTERNAL_TOKEN_FILE:-}
-      # GMGN metrics of candidates (G18, G20). With GMGN_API_KEY (or GMGN_API_KEY_FILE, a path
-      # inside this container) the worker reads the official GMGN OpenAPI (IPv4 only); the key
-      # goes to this service alone. Without a key, the ``gmgn`` service below: with
-      # ``--profile gmgn`` set GMGN_URL=http://gmgn:8080. Neither = not asked, decisions as
-      # before. LIVE stays closed without fresh GMGN data until GMGN_REQUIRED_FOR_LIVE=false.
+      # GMGN metrics of candidates (G18, G20, G25). With GMGN_API_KEY (or GMGN_API_KEY_FILE, a
+      # path inside this container) the worker reads the official GMGN OpenAPI (IPv4 only); the
+      # key goes to this service alone. Without a key: the browser bridge on the host
+      # (scripts/gmgn-bridge.ps1|.sh) at GMGN_URL=http://host.docker.internal:8765 with the
+      # shared GMGN_BRIDGE_TOKEN (or its *_FILE inside this container), or the headless
+      # ``gmgn`` service below (``--profile gmgn``, GMGN_URL=http://gmgn:8080). Neither = not
+      # asked, decisions as before. LIVE stays closed without fresh GMGN data until
+      # GMGN_REQUIRED_FOR_LIVE=false.
       GMGN_API_KEY: ${GMGN_API_KEY:-}
       GMGN_API_KEY_FILE: ${GMGN_API_KEY_FILE:-}
       GMGN_API_URL: ${GMGN_API_URL:-}
       GMGN_API_PLAN: ${GMGN_API_PLAN:-}
       GMGN_API_CACHE_SECONDS: ${GMGN_API_CACHE_SECONDS:-}
       GMGN_URL: ${GMGN_URL:-}
+      GMGN_BRIDGE_TOKEN: ${GMGN_BRIDGE_TOKEN:-}
+      GMGN_BRIDGE_TOKEN_FILE: ${GMGN_BRIDGE_TOKEN_FILE:-}
       GMGN_TIMEOUT_SECONDS: ${GMGN_TIMEOUT_SECONDS:-}
       GMGN_STALE_AFTER_SECONDS: ${GMGN_STALE_AFTER_SECONDS:-}
       # Open positions reread their pool from the Data API this often (empty = 30 s).
@@ -145,6 +150,10 @@ services:
       SWAP_AFTER_EXIT_MAX_SPLITS: ${SWAP_AFTER_EXIT_MAX_SPLITS:-}
       SWAP_AFTER_EXIT_ATTEMPTS: ${SWAP_AFTER_EXIT_ATTEMPTS:-}
       SWAP_SETTLEMENT_TIMEOUT_SECONDS: ${SWAP_SETTLEMENT_TIMEOUT_SECONDS:-}
+    # The GMGN browser bridge listens on the host: Docker Desktop resolves this name by
+    # itself, Docker Engine on Linux needs the mapping (the bridge binds the docker0 address).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     expose:
       - "9100"
     depends_on:

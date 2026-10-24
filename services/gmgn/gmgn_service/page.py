@@ -130,7 +130,7 @@ class BrowserPageFetcher:
             return
         first_metrics: float | None = None
         while True:
-            visit.title, text, frames = await _document(page)
+            visit.title, text, frames = await document_state(page)
             visit.state = classify_page(visit.title, text, frames)
             if visit.state is PageState.BLOCKED:
                 visit.reason = "ACCESS_BLOCKED"
@@ -194,7 +194,7 @@ class BrowserPageFetcher:
             return self._browser
 
 
-async def _document(page: Page) -> tuple[str, str, list[str]]:
+async def document_state(page: Page) -> tuple[str, str, list[str]]:
     """Title, visible text and frame URLs; empty while the page is navigating."""
 
     try:
