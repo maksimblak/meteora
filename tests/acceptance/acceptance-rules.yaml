@@ -1,0 +1,18 @@
+# guide-v1 thresholds relaxed for the acceptance smoke only (RULESET_OVERRIDES_FILE).
+# A short baseline lets recorded pools leave warm-up after a few sweeps, and the spike and
+# volume thresholds are opened so a shadow position opens on recorded data. The hard
+# filters (freeze authority, blacklist, market cap, organicity) stay as in guide-v1.
+# Never use this file for a real run: these numbers are not a strategy.
+config_version: "acceptance-relaxed-v1"
+thresholds:
+  baseline_points: 3
+  minimum_baseline_points: 2
+  maximum_history_points: 20
+  minimum_volume_per_minute: "10"
+  overvolume_volume_per_minute: "100000000"
+  minimum_volume_to_liquidity: "0"
+  minimum_short_ratio: "0"
+  minimum_long_ratio: "0"
+  minimum_robust_z_score: "0"
+  minimum_fee_tvl: "0"
+  minimum_score: "0"

@@ -1,0 +1,57 @@
+# Acceptance smoke overlay (ticket 08). Used only together with the main file:
+#   docker compose -p meteora-acceptance --project-directory . --env-file tests/acceptance/acceptance.env \
+#     -f docker-compose.yml -f tests/acceptance/compose.acceptance.yml up -d --build --wait
+# Paths are relative to the project directory (the repository root).
+#
+# The shadow stack runs on recorded Data API sweeps served by ``fixture-api``: no Solana
+# RPC, no wallet, no executor secrets, no external network. The api is published on its
+# own port so a running main stack on 8000 is not disturbed.
+
+services:
+  fixture-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "tests/acceptance/fixture_api.py"]
+    environment:
+      FIXTURE_FREEZE_AFTER: ${FIXTURE_FREEZE_AFTER:-6}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    expose:
+      - "8080"
+
+  api:
+    ports: !override
+      - "127.0.0.1:${ACCEPTANCE_API_PORT:-18080}:8000"
+    environment:
+      RULESET_OVERRIDES_FILE: /app/tests/acceptance/acceptance-rules.yaml
+
+  worker:
+    environment:
+      METEORA_DATA_API_BASE_URL: http://fixture-api:8080
+      METEORA_UNIVERSE_FILTER: ""
+      SOLANA_RPC_URL: ""
+      GMGN_API_KEY: ""
+      GMGN_API_KEY_FILE: ""
+      GMGN_URL: ""
+      # 61 s keeps adjacent sweeps inside the short-window interval (60 s .. 91 s).
+      WORKER_UNIVERSE_INTERVAL_SECONDS: "61"
+      WORKER_CANDIDATE_INTERVAL_SECONDS: "15"
+      WORKER_POSITION_INTERVAL_SECONDS: "10"
+      RULESET_OVERRIDES_FILE: /app/tests/acceptance/acceptance-rules.yaml
+    depends_on:
+      fixture-api:
+        condition: service_healthy
+
+  executor-quotes:
+    environment:
+      SOLANA_RPC_URL: ""

@@ -1,0 +1,26 @@
+# Build context of Dockerfile, Dockerfile.executor and Dockerfile.gmgn: secrets, local
+# environments, caches and scratch never reach the Docker daemon. The Dockerfiles copy
+# explicit paths only; nothing they copy is excluded here.
+.git
+.env
+.env.*
+!.env.example
+docker-compose.override.yml
+docker-compose.override.yaml
+.venv
+**/.venv
+**/node_modules
+**/__pycache__
+**/*.pyc
+**/.pytest*
+**/.mypy_cache
+**/.ruff_cache
+.uv-cache
+.firecrawl
+work
+outputs
+.autopilot
+executor/dist
+**/*.log
+**/*.dump
+**/*.sqlite3
