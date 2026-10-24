@@ -49,7 +49,14 @@ from pydantic import SecretStr
 from src.core.clock import Clock
 from src.domain.models.primitives import PublicKey
 from src.gmgn.client import AMOUNT_SIGNALS, SHARE_SIGNALS
-from src.market.models import EnhancedTokenSignals, Freshness, ProviderHealth, ProviderState
+from src.market.models import (
+    DeveloperStatus,
+    EnhancedTokenSignals,
+    Freshness,
+    ProviderHealth,
+    ProviderState,
+    RiskSignal,
+)
 from src.observability.logging import get_logger
 from src.providers.contracts import ProviderUnavailableError
 from src.providers.resilience import CircuitBreaker
@@ -382,6 +389,7 @@ class GmgnOpenApiProvider:
             "total_fees_sol": _amount(info.get("total_fee")),
         }
         missing = tuple(name for name in (*SHARE_SIGNALS, *AMOUNT_SIGNALS) if values[name] is None)
+        market = _market(info, stat, dev, security)
         return EnhancedTokenSignals(
             top10_holder_share=values["top10_holder_share"],
             insiders_share=values["insiders_share"],
@@ -393,6 +401,7 @@ class GmgnOpenApiProvider:
             provider=PROVIDER,
             source_at=source_at,
             freshness=Freshness.FRESH,
+            **market,
         )
 
     async def _call(self, route: str, mint: PublicKey) -> dict[str, Any] | _Refused:
@@ -589,3 +598,89 @@ def _amount(value: object) -> Decimal | None:
 
 def _first(*values: Decimal | None) -> Decimal | None:
     return next((value for value in values if value is not None), None)
+
+
+# ``creator_token_status``: token info answers ``creator_hold``/``creator_close`` live
+# (2026-10-24) while gmgn-token SKILL.md documents ``hold``/``sell`` for info and
+# ``creator_hold``/``creator_close`` for security; both vocabularies are understood.
+_DEVELOPER_STATUSES = {
+    "creator_hold": DeveloperStatus.HOLDING,
+    "hold": DeveloperStatus.HOLDING,
+    "creator_close": DeveloperStatus.SOLD,
+    "creator_sell": DeveloperStatus.SOLD,
+    "sell": DeveloperStatus.SOLD,
+    "close": DeveloperStatus.SOLD,
+}
+
+
+def _market(
+    info: Mapping[str, Any],
+    stat: Mapping[str, Any],
+    dev: Mapping[str, Any],
+    security: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Token-level market figures of token info (T18) - the same request, no extra weight.
+
+    Source, checked against gmgn-token SKILL.md and the live answers of 2026-10-24 (WIF and
+    a trending pump.fun token): ``price.volume_5m``/``price.volume_1h`` are USD over every
+    pool of the token (the "1h" volume matched the trending rank's own hourly volume), so
+    no kline request is needed; ``price.price`` is USD and the market cap, which info does
+    not serve, is ``price.price x circulating_supply`` as the SKILL.md says; ``ath_price``
+    is the token's own ATH in USD (``dev.ath_token_info`` is the creator's best token, not
+    this one). Snipers: ``wallet_tags_stat.sniper_wallets`` (security's documented
+    ``sniper_count`` when info has none) and ``stat.top70_sniper_hold_rate``. The creator's
+    status: ``dev.creator_token_status``, else security's. Wash trading:
+    ``is_wash_trading`` of security (documented) or info; absent - unknown, never "clean".
+    A figure that is missing or malformed stays ``None``; the reading itself is kept.
+    """
+
+    price_section = info.get("price")
+    prices: Mapping[str, Any] = price_section if isinstance(price_section, Mapping) else {}
+    tags = info.get("wallet_tags_stat")
+    wallets: Mapping[str, Any] = tags if isinstance(tags, Mapping) else {}
+    price = _positive(prices.get("price"))
+    ath = _positive(info.get("ath_price"))
+    supply = _positive(info.get("circulating_supply"))
+    snipers = _count(wallets.get("sniper_wallets"))
+    wash = _verdict(security.get("is_wash_trading"))
+    return {
+        "volume_5m_usd": _amount(prices.get("volume_5m")),
+        "volume_1h_usd": _amount(prices.get("volume_1h")),
+        "price_usd": price,
+        "market_cap_usd": None if price is None or supply is None else price * supply,
+        "ath_price_usd": ath,
+        "ath_market_cap_usd": None if ath is None or supply is None else ath * supply,
+        "sniper_count": snipers if snipers is not None else _count(security.get("sniper_count")),
+        "sniper_share": _share(stat.get("top70_sniper_hold_rate")),
+        "developer_status": _developer_status(dev.get("creator_token_status"))
+        or _developer_status(security.get("creator_token_status")),
+        "created_at": _unix(info.get("creation_timestamp")),
+        "wash_trading": wash
+        if wash is not RiskSignal.UNKNOWN
+        else _verdict(info.get("is_wash_trading")),
+    }
+
+
+def _positive(value: object) -> Decimal | None:
+    number = _number(value)
+    return number if number is not None and number > 0 else None
+
+
+def _count(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _developer_status(value: object) -> DeveloperStatus | None:
+    if not isinstance(value, str):
+        return None
+    return _DEVELOPER_STATUSES.get(value.strip().lower())
+
+
+def _verdict(value: object) -> RiskSignal:
+    if value is True:
+        return RiskSignal.UNSAFE
+    if value is False:
+        return RiskSignal.SAFE
+    return RiskSignal.UNKNOWN

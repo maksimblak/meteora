@@ -44,8 +44,13 @@ _TRIGGERS: dict[str, frozenset[str]] = {
     "top10_holder_share": frozenset({"HOLDER_CONCENTRATION_HIGH"}),
     "volume_per_minute": frozenset({"VOLUME_PER_MINUTE_BELOW_THRESHOLD"}),
     "volume_to_liquidity": frozenset({"VOLUME_TO_LIQUIDITY_BELOW_THRESHOLD"}),
-    "fee_efficiency": frozenset({"ARTIFICIAL_VOLUME_SUSPECTED"}),
     "total_fees_sol": frozenset({"TOTAL_FEES_BELOW_THRESHOLD"}),
+    # Selection as the author does it (G24, T18); fee organicity no longer decides anything.
+    "hourly_volume_per_minute": frozenset({"HOURLY_VOLUME_PER_MINUTE_BELOW_THRESHOLD"}),
+    "theme": frozenset({"THEME_EXCLUDED"}),
+    "token_volume_rank": frozenset({"CANDIDATE_RANK_BELOW_LIMIT"}),
+    "fee_tvl": frozenset({"FEE_TVL_BELOW_THRESHOLD"}),
+    "developer_share": frozenset({"DEVELOPER_HOLDS_TOKENS"}),
     "tvl": frozenset({"LOW_TVL"}),
     "depth": frozenset({"LOW_DEPTH"}),
     "price_impact": frozenset({"PRICE_IMPACT_HIGH"}),
@@ -58,9 +63,17 @@ _TRIGGERS: dict[str, frozenset[str]] = {
     "gmgn_status": frozenset({"GMGN_UNAVAILABLE"}),
     "depth_source": frozenset({"DEPTH_UNAVAILABLE"}),
 }
-# Several minimums share one code; the row that fell short of its own threshold is marked.
+# shadow-hypothesis-v1: several minimums share one code; the row that fell short of its own
+# threshold is marked. guide-v1 (G24) has no such reason: the spike is the VOLUME_SPIKE flag
+# and fee/TVL has its own code (``_TRIGGERS``).
 _SPIKE_MINIMUMS = frozenset({"short_ratio", "long_ratio", "robust_z_score", "fee_tvl"})
 _SPIKE_CODE = "VOLUME_SIGNAL_BELOW_THRESHOLD"
+# ARTIFICIAL_VOLUME_SUSPECTED (G24): total fees below what the cap calls for at a tenfold
+# hourly turnover marks these rows; GMGN's wash-trading verdict marks its own row.
+_ARTIFICIAL_CODE = "ARTIFICIAL_VOLUME_SUSPECTED"
+_ARTIFICIAL_FEES_ROWS = frozenset({"total_fees_sol", "required_total_fees_sol"})
+_TURNOVER_ROW = "pool_hourly_turnover"
+_WASH_ROW = "gmgn_wash_trading"
 # GMGN metrics (G18, spec 6.7); top-10 and total fees join them once GMGN reports any.
 _GMGN_MARKERS = ("gmgn", "insider", "bundl", "phish", "developer", "dev_")
 _GMGN_COMPANIONS = ("top10_holder_share", "total_fees_sol")
@@ -173,12 +186,16 @@ def decision_summary(record: DecisionRecord) -> DecisionSummary:
 
 def evidence_views(items: Sequence[EvidenceItem], reasons: Iterable[str]) -> list[EvidenceView]:
     fired = set(reasons)
+    turnover = next((item for item in items if item.name == _TURNOVER_ROW), None)
+    cap_rule = (
+        _ARTIFICIAL_CODE in fired and turnover is not None and _at_least_threshold(turnover)
+    )
     return [
         EvidenceView(
             name=item.name,
             value=item.value,
             threshold=item.threshold,
-            triggered=_triggered(item, fired),
+            triggered=_triggered(item, fired, cap_rule=cap_rule),
             note=labels.evidence_note(item.name, item.value, item.threshold),
         )
         for item in items
@@ -347,13 +364,21 @@ def performance_group_view(group: PerformanceGroup) -> PerformanceGroupView:
     return PerformanceGroupView(**group.model_dump())
 
 
-def _triggered(item: EvidenceItem, fired: set[str]) -> bool:
-    if item.name in _SPIKE_MINIMUMS:
-        if _SPIKE_CODE not in fired:
-            return False
+def _triggered(item: EvidenceItem, fired: set[str], *, cap_rule: bool = False) -> bool:
+    if item.name in _SPIKE_MINIMUMS and _SPIKE_CODE in fired:
         value, threshold = _decimal(item.value), _decimal(item.threshold)
-        return value is None or (threshold is not None and value < threshold)
+        if value is None or (threshold is not None and value < threshold):
+            return True
+    if cap_rule and (item.name in _ARTIFICIAL_FEES_ROWS or item.name == _TURNOVER_ROW):
+        return True
+    if item.name == _WASH_ROW:
+        return _ARTIFICIAL_CODE in fired and item.value == "UNSAFE"
     return bool(_TRIGGERS.get(item.name, frozenset()) & fired)
+
+
+def _at_least_threshold(item: EvidenceItem) -> bool:
+    value, threshold = _decimal(item.value), _decimal(item.threshold)
+    return value is not None and threshold is not None and value >= threshold
 
 
 def _decimal(value: str | None) -> Decimal | None:

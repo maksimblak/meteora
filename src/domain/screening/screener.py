@@ -1,7 +1,10 @@
 """Hard filters run before a transparent weighted score."""
 
+import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 
 from src.domain.features import SignalReadiness, VolumeSpikeFeatures
 from src.domain.models.trading import TradingMode
@@ -15,10 +18,12 @@ from src.domain.screening.models import (
     EvidenceItem,
     GmgnScreeningRules,
     GuideAssessment,
+    GuideScreeningRules,
     IntegrityStatus,
     RejectionCode,
     ScoreComponent,
     ScreeningPolicy,
+    TokenSelection,
     VolumeIntegrityAssessment,
     VolumeIntegrityMode,
     VolumeRegime,
@@ -43,8 +48,8 @@ def assess_volume_integrity(
     """Require corroboration; a large spike alone is never labelled fake volume.
 
     ``PARTICIPANTS``: transaction and participant counts and a wash-trading verdict are
-    mandatory. ``AVAILABLE_SIGNALS`` (D07, the Data API has no counts): turnover, fee
-    organicity and burst self-similarity are mandatory; counts are checked when present,
+    mandatory. ``AVAILABLE_SIGNALS`` (D07, the Data API has no counts): burst
+    self-similarity is mandatory (G24 dropped fee organicity); counts are checked when present,
     and their absence (with no wash-trading verdict either) is the
     ``VOLUME_PARTICIPANTS_UNAVAILABLE`` flag instead of an unknown.
     """
@@ -112,24 +117,16 @@ def assess_volume_integrity(
 def _available_signal_reasons(
     features: VolumeSpikeFeatures, policy: ScreeningPolicy, missing: list[str]
 ) -> list[str]:
-    """Artificial volume on the signals a source without participant counts still has."""
+    """Artificial volume on the signals a source without participant counts still has.
+
+    Self-similar bursts only. Fees over ``volume x base fee`` cannot expose wash trading in
+    DLMM - every swap pays at least the base fee, so the ratio is one or more by
+    construction (G24); the author's own signal, total fees too low for the token's cap at
+    a tenfold hourly turnover, is judged with the guide thresholds instead.
+    """
 
     reasons: list[str] = []
-    efficiency = features.fee_efficiency
-    turnover = features.turnover
     spread = features.short_burst_spread
-    if efficiency is None:
-        missing.append("fee_efficiency")
-    elif efficiency < policy.minimum_fee_support:
-        reasons.append("fees_below_base_fee")
-    if turnover is None:
-        missing.append("turnover")
-    elif (
-        turnover > policy.maximum_turnover
-        and efficiency is not None
-        and efficiency < policy.minimum_fee_support
-    ):
-        reasons.append("turnover_without_fee_support")
     if spread is None:
         missing.append("short_burst_spread")
     elif spread <= policy.maximum_burst_spread:
@@ -242,27 +239,143 @@ def _merge_authority(current: AuthorityStatus, disabled: bool | None) -> Authori
     return AuthorityStatus.UNKNOWN
 
 
+# GMGN and the selection report 5-minute and one-hour volumes.
+_SHORT_MINUTES = Decimal(5)
+_HOUR_MINUTES = Decimal(60)
+
+
+class TokenVolumeSource(StrEnum):
+    """Where the token-level volume of a decision came from (G24)."""
+
+    GMGN = "GMGN"  # a fresh enhanced reading over every pool of the token
+    DLMM_POOLS = "DLMM_POOLS"  # the sum of the token's DLMM pools (``TOKEN_VOLUME_POOL_ONLY``)
+    PENDING = "PENDING"  # the enhanced source is asked only after the cheap filters
+
+
+@dataclass(frozen=True, slots=True)
+class _TokenVolume:
+    source: TokenVolumeSource
+    per_minute: Decimal | None
+    hourly_per_minute: Decimal | None
+    dlmm_pools: int
+
+
+def _fresh_reading(token: TokenRiskSnapshot) -> EnhancedTokenSignals | None:
+    reading = token.enhanced
+    return reading if reading is not None and reading.freshness is Freshness.FRESH else None
+
+
+def _token_volume(
+    token: TokenRiskSnapshot, features: VolumeSpikeFeatures, selection: TokenSelection
+) -> _TokenVolume:
+    """The token's volume as the author reads it in GMGN: over every pool of the token.
+
+    A fresh enhanced reading with both windows is that figure. Without one the token's
+    DLMM pools are summed - this pool's own windows plus its siblings' - and the decision is
+    flagged ``TOKEN_VOLUME_POOL_ONLY``; on other venues the token may trade far more. While
+    an enhanced source is still to be asked (``enhanced_pending``), nothing is decided.
+    """
+
+    pools = 1 + selection.sibling_pools
+    reading = _fresh_reading(token)
+    short = reading.volume_5m_usd if reading is not None else None
+    hour = reading.volume_1h_usd if reading is not None else None
+    if short is not None and hour is not None:
+        return _TokenVolume(
+            TokenVolumeSource.GMGN, short / _SHORT_MINUTES, hour / _HOUR_MINUTES, pools
+        )
+    if selection.enhanced_pending:
+        return _TokenVolume(TokenVolumeSource.PENDING, None, None, pools)
+    own_now = features.volume_per_minute
+    own_hour = features.hourly_volume_per_minute
+    return _TokenVolume(
+        TokenVolumeSource.DLMM_POOLS,
+        None if own_now is None else own_now + selection.sibling_volume_5m / _SHORT_MINUTES,
+        None if own_hour is None else own_hour + selection.sibling_volume_1h / _HOUR_MINUTES,
+        pools,
+    )
+
+
+def _volume_spike(features: VolumeSpikeFeatures, policy: ScreeningPolicy) -> bool | None:
+    """Spec 6.2's spike: 5m against the baseline median, robust z and 30m confirmation."""
+
+    ratio, robust, confirmation = features.short_ratio, features.robust_z_score, features.long_ratio
+    if features.readiness is not SignalReadiness.READY or None in (ratio, robust, confirmation):
+        return None
+    assert ratio is not None and robust is not None and confirmation is not None
+    return (
+        ratio >= policy.minimum_short_ratio
+        and robust >= policy.minimum_robust_z_score
+        and confirmation >= policy.minimum_long_ratio
+    )
+
+
+def _normalized_text(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold().replace("ё", "е")
+
+
+def _theme(pool: PoolSnapshot, words: tuple[str, ...]) -> str | None:
+    """The first excluded word found in the base token's name or ticker, if any."""
+
+    texts = [
+        _normalized_text(text)
+        for text in (pool.base_token_name, pool.base_token_symbol)
+        if text is not None
+    ]
+    for word in words:
+        needle = _normalized_text(word.strip())
+        if any(needle in text for text in texts):
+            return word
+    return None
+
+
 def assess_guide_thresholds(
     pool: PoolSnapshot,
     token: TokenRiskSnapshot,
     features: VolumeSpikeFeatures,
     policy: ScreeningPolicy,
+    selection: TokenSelection | None = None,
 ) -> GuideAssessment:
-    """Apply the guide-v1 table (spec 6.6); a signal no source reported is UNKNOWN."""
+    """Apply the guide-v1 table (spec 6.6) and the author's selection (spec 6.8, G24).
+
+    A signal no source reported is UNKNOWN. Volume, market cap and total fees are the
+    token's (see ``_token_volume``); a fresh GMGN market cap replaces the Data API's.
+    """
 
     rules = policy.guide
     if rules is None:
         raise ValueError("policy has no guide thresholds")
+    chosen = selection or TokenSelection()
     reasons: list[RejectionCode] = []
     missing: list[str] = []
     evidence: list[EvidenceItem] = []
+    flags: list[DecisionFlag] = []
+    reading = _fresh_reading(token)
 
-    cap = pool.base_token_market_cap
+    theme = _theme(pool, rules.excluded_theme_words)
+    if theme is not None:
+        reasons.append(RejectionCode.THEME_EXCLUDED)
+    named = pool.base_token_name is not None or pool.base_token_symbol is not None
+    if not named:
+        # Nothing to match the theme against: SHADOW goes on with the flag, APPROVAL and
+        # LIVE treat it as the missing signal ``theme`` (see ``PoolScreener.evaluate``).
+        flags.append(DecisionFlag.THEME_UNKNOWN)
+    evidence.append(
+        EvidenceItem(name="theme", value=theme or ("none" if named else "UNKNOWN"))
+    )
+
+    gmgn_cap = reading.market_cap_usd if reading is not None else None
+    cap = gmgn_cap if gmgn_cap is not None else pool.base_token_market_cap
     if cap is None:
         missing.append("market_cap")
     elif cap < rules.minimum_market_cap:
         reasons.append(RejectionCode.MARKET_CAP_BELOW_THRESHOLD)
     evidence.append(_item("market_cap", cap, rules.minimum_market_cap))
+    if gmgn_cap is not None:
+        cap_source = "GMGN"
+    else:
+        cap_source = "DATA_API" if cap is not None else "UNKNOWN"
+    evidence.append(EvidenceItem(name="market_cap_source", value=cap_source))
     evidence.append(
         EvidenceItem(
             name="market_cap_preferred",
@@ -277,6 +390,8 @@ def assess_guide_thresholds(
             reasons.append(RejectionCode.TOKEN_TOO_YOUNG)
         else:
             missing.append("token_age")
+    if age >= rules.revived_token_age:
+        flags.append(DecisionFlag.TOKEN_REVIVED)
     evidence.append(
         EvidenceItem(
             name="token_age_seconds",
@@ -288,8 +403,17 @@ def assess_guide_thresholds(
         _item("top10_holder_share", token.holder_concentration, policy.maximum_holder_concentration)
     )
 
-    per_minute = features.volume_per_minute
-    if per_minute is None:
+    volume = _token_volume(token, features, chosen)
+    if volume.source is TokenVolumeSource.DLMM_POOLS:
+        flags.append(DecisionFlag.TOKEN_VOLUME_POOL_ONLY)
+    evidence.append(EvidenceItem(name="token_volume_source", value=volume.source.value))
+    evidence.append(EvidenceItem(name="token_pool_count", value=str(volume.dlmm_pools)))
+    per_minute = volume.per_minute
+    hourly = volume.hourly_per_minute
+    if volume.source is TokenVolumeSource.PENDING:
+        missing.append("token_volume")
+        regime = VolumeRegime.UNKNOWN
+    elif per_minute is None:
         missing.append("volume_per_minute")
         regime = VolumeRegime.UNKNOWN
     elif per_minute < rules.minimum_volume_per_minute:
@@ -299,7 +423,15 @@ def assess_guide_thresholds(
         regime = VolumeRegime.OVERVOLUME
     else:
         regime = VolumeRegime.WORKING
+    if volume.source is not TokenVolumeSource.PENDING:
+        if hourly is None:
+            missing.append("hourly_volume_per_minute")
+        elif hourly < rules.minimum_hourly_volume_per_minute:
+            reasons.append(RejectionCode.HOURLY_VOLUME_PER_MINUTE_BELOW_THRESHOLD)
     evidence.append(_item("volume_per_minute", per_minute, rules.minimum_volume_per_minute))
+    evidence.append(
+        _item("hourly_volume_per_minute", hourly, rules.minimum_hourly_volume_per_minute)
+    )
     evidence.append(
         EvidenceItem(
             name="volume_regime",
@@ -310,6 +442,20 @@ def assess_guide_thresholds(
             ),
         )
     )
+    spike = _volume_spike(features, policy)
+    if spike:
+        flags.append(DecisionFlag.VOLUME_SPIKE)
+    evidence.append(
+        EvidenceItem(
+            name="volume_spike",
+            value="UNKNOWN" if spike is None else str(spike).lower(),
+            threshold=(
+                f"short>={policy.minimum_short_ratio}; "
+                f"robust_z>={policy.minimum_robust_z_score}; "
+                f"long>={policy.minimum_long_ratio}"
+            ),
+        )
+    )
 
     turnover = features.volume_to_liquidity
     if turnover is None:
@@ -317,18 +463,27 @@ def assess_guide_thresholds(
     elif turnover < rules.minimum_volume_to_liquidity:
         reasons.append(RejectionCode.VOLUME_TO_LIQUIDITY_BELOW_THRESHOLD)
     evidence.append(_item("volume_to_liquidity", turnover, rules.minimum_volume_to_liquidity))
-
-    efficiency = features.fee_efficiency
-    if efficiency is None:
-        missing.append("fee_efficiency")
-    elif efficiency < rules.minimum_fee_efficiency:
-        reasons.append(RejectionCode.ARTIFICIAL_VOLUME_SUSPECTED)
-    evidence.append(_item("fee_efficiency", efficiency, rules.minimum_fee_efficiency))
+    # The pool that is evaluated: the token's main pool (largest LP fees in the hour).
+    hour = pool.windows.get("1h")
+    evidence.extend(
+        (
+            EvidenceItem(
+                name="pool_base_fee_rate",
+                value="UNKNOWN" if pool.base_fee_rate is None else str(pool.base_fee_rate),
+            ),
+            EvidenceItem(name="pool_bin_step", value=str(pool.bin_step)),
+            EvidenceItem(
+                name="pool_fees_1h",
+                value="UNKNOWN" if hour is None or hour.fees is None else str(hour.fees),
+            ),
+            # Information only since G24: fees over ``volume x base fee`` is >= 1 in DLMM.
+            _reported("fee_efficiency", features.fee_efficiency, missing="UNKNOWN"),
+        )
+    )
 
     # D03: a conditional threshold. Applied when an enhanced provider reports it; when no
     # source does, the decision is flagged for a manual check instead of failing closed.
     total_fees = token.total_fees_sol
-    flags: list[DecisionFlag] = []
     if total_fees is None:
         flags.append(DecisionFlag.TOTAL_FEES_UNAVAILABLE)
     elif total_fees < rules.minimum_total_fees_sol:
@@ -340,16 +495,78 @@ def assess_guide_thresholds(
             threshold=str(rules.minimum_total_fees_sol),
         )
     )
+    reasons.extend(_artificial_volume(token, features, rules, cap, evidence))
 
     if missing:
         reasons.append(RejectionCode.GUIDE_SIGNAL_UNKNOWN)
     return GuideAssessment(
-        reasons=tuple(reasons),
+        reasons=tuple(dict.fromkeys(reasons)),
         missing_signals=tuple(sorted(missing)),
         evidence=tuple(evidence),
         volume_regime=regime,
         flags=tuple(flags),
+        hourly_volume_per_minute=hourly,
+        volume_spike=spike,
     )
+
+
+def _artificial_volume(
+    token: TokenRiskSnapshot,
+    features: VolumeSpikeFeatures,
+    rules: GuideScreeningRules,
+    cap: Decimal | None,
+    evidence: list[EvidenceItem],
+) -> list[RejectionCode]:
+    """The author's signal of inorganic volume (video 2, Savash: 980k an hour on 87k).
+
+    Total fees too low for the cap - the author's 30 SOL at a 500k cap, scaled with the
+    cap (``minimum_total_fees_sol x cap / total_fees_reference_market_cap``; both sides are
+    SOL, so no SOL price is needed) - while the pool turned over at least
+    ``maximum_hourly_turnover`` times its TVL in the hour. GMGN's own wash-trading verdict
+    rejects too. Without total fees the rule waits (D03 flag).
+    """
+
+    reasons: list[RejectionCode] = []
+    required = (
+        None
+        if cap is None
+        else rules.minimum_total_fees_sol * cap / rules.total_fees_reference_market_cap
+    )
+    turnover = features.hourly_turnover
+    total_fees = token.total_fees_sol
+    if (
+        total_fees is not None
+        and required is not None
+        and turnover is not None
+        and total_fees < required
+        and turnover >= rules.maximum_hourly_turnover
+    ):
+        reasons.append(RejectionCode.ARTIFICIAL_VOLUME_SUSPECTED)
+    evidence.append(
+        EvidenceItem(
+            name="required_total_fees_sol",
+            value="UNKNOWN" if required is None else str(required),
+            threshold=(
+                f"{rules.minimum_total_fees_sol} x market_cap / "
+                f"{rules.total_fees_reference_market_cap}"
+            ),
+        )
+    )
+    evidence.append(
+        _item("pool_hourly_turnover", turnover, rules.maximum_hourly_turnover)
+    )
+    reading = token.enhanced
+    if reading is not None:
+        fresh = reading.freshness is Freshness.FRESH
+        if fresh and reading.wash_trading is RiskSignal.UNSAFE:
+            reasons.append(RejectionCode.ARTIFICIAL_VOLUME_SUSPECTED)
+        evidence.append(
+            EvidenceItem(
+                name="gmgn_wash_trading",
+                value=reading.wash_trading.value if fresh else _UNAVAILABLE,
+            )
+        )
+    return reasons
 
 
 _UNAVAILABLE = "UNAVAILABLE"
@@ -439,6 +656,10 @@ def _gmgn_assessment(
             )
         )
     developer = reading.developer_share if fresh else None
+    if developer is None:
+        # G24: LIVE rejects a developer share above zero, so an unknown share leaves the
+        # reading incomplete like any threshold metric (LIVE closed while required).
+        complete = False
     evidence.append(
         EvidenceItem(
             name="developer_share",
@@ -448,6 +669,32 @@ def _gmgn_assessment(
     )
     if developer is not None and developer > 0:
         flags.append(DecisionFlag.DEVELOPER_HOLDS_TOKENS)
+        if mode is TradingMode.LIVE:
+            # LIVE has no operator to tick "the developer's supply is checked" (G24, No 6).
+            reasons.append(RejectionCode.DEVELOPER_HOLDS_TOKENS)
+    status_value = reading.developer_status if fresh else None
+    evidence.append(
+        EvidenceItem(
+            name="developer_status",
+            value=_UNAVAILABLE if status_value is None else status_value.value,
+        )
+    )
+    snipers = reading.sniper_count if fresh else None
+    if snipers is not None and snipers > rules.maximum_sniper_count:
+        flags.append(DecisionFlag.SNIPERS_HIGH)
+    evidence.extend(
+        (
+            EvidenceItem(
+                name="gmgn_sniper_count",
+                value=_UNAVAILABLE if snipers is None else str(snipers),
+                threshold=str(rules.maximum_sniper_count),
+            ),
+            _reported("gmgn_sniper_share", reading.sniper_share if fresh else None),
+            # The token's own all-time high (G24): the Spot-on-ATH rule reads it (T19).
+            _reported("gmgn_token_ath_price", reading.ath_price_usd if fresh else None),
+            _reported("gmgn_token_ath_market_cap", reading.ath_market_cap_usd if fresh else None),
+        )
+    )
     if not complete:
         flags.append(DecisionFlag.GMGN_UNAVAILABLE)
         if closes_live:
@@ -462,18 +709,29 @@ def _token_age(
 
     A pool cannot predate its base mint, so pool age bounds token age from below; the
     oldest mint activity from RPC is exact only when the signature history was exhausted.
+    A fresh enhanced reading's creation time (GMGN ``creation_timestamp``) is exact.
     """
 
     bounds = [decision_at - pool.created_at]
     if token.earliest_activity_at is not None:
         bounds.append(decision_at - token.earliest_activity_at)
-    return max(bounds), token.activity_history_complete
+    reading = _fresh_reading(token)
+    created = reading.created_at if reading is not None else None
+    if created is not None and created <= decision_at:
+        bounds.append(decision_at - created)
+    return max(bounds), token.activity_history_complete or (
+        created is not None and created <= decision_at
+    )
 
 
 def _item(name: str, value: Decimal | None, threshold: Decimal) -> EvidenceItem:
     return EvidenceItem(
         name=name, value="UNKNOWN" if value is None else str(value), threshold=str(threshold)
     )
+
+
+def _reported(name: str, value: Decimal | None, *, missing: str = _UNAVAILABLE) -> EvidenceItem:
+    return EvidenceItem(name=name, value=missing if value is None else str(value))
 
 
 class PoolScreener:
@@ -487,8 +745,12 @@ class PoolScreener:
         context: DecisionContext,
         estimated_price_impact: Decimal,
         depth: DepthEvidence | None = None,
+        selection: TokenSelection | None = None,
     ) -> CandidateDecision:
-        """``depth``: measured depth and impact (D07); ``None`` uses the snapshot's depth."""
+        """``depth``: measured depth and impact (D07); ``None`` uses the snapshot's depth.
+
+        ``selection``: what the cycle knows about the base token beyond this pool (G24);
+        ``None`` is a token with this one pool, not held, not ranked."""
 
         if isinstance(estimated_price_impact, (float, bool)):
             raise ValueError("estimated_price_impact must use Decimal")
@@ -516,8 +778,9 @@ class PoolScreener:
             pool, token, features, integrity, estimated_price_impact, policy, depth
         )
         flags: list[DecisionFlag] = []
+        guide: GuideAssessment | None = None
         if policy.guide is not None:
-            guide = assess_guide_thresholds(pool, token, features, policy)
+            guide = assess_guide_thresholds(pool, token, features, policy, selection)
             reasons.extend(guide.reasons)
             missing.update(guide.missing_signals)
             evidence = (*evidence, *guide.evidence)
@@ -530,6 +793,9 @@ class PoolScreener:
                 evidence = (*evidence, *gmgn_evidence)
                 flags.extend(gmgn_flags)
         flags.extend(integrity.flags)
+        if DecisionFlag.THEME_UNKNOWN in flags and context.mode is not TradingMode.SHADOW:
+            missing.add("theme")
+            reasons.append(RejectionCode.GUIDE_SIGNAL_UNKNOWN)
         if depth is not None and depth.source is DepthSource.UNAVAILABLE:
             flags.append(DecisionFlag.DEPTH_UNAVAILABLE)
             if context.mode is not TradingMode.SHADOW:
@@ -543,6 +809,23 @@ class PoolScreener:
             flags.append(DecisionFlag.TOKEN_RISK_UNAVAILABLE)
             if context.mode is not TradingMode.SHADOW:
                 reasons.append(RejectionCode.TOKEN_RISK_UNAVAILABLE)
+        if selection is not None:
+            # One position per token (G24, No 24): any pool of a token already held.
+            if selection.held:
+                reasons.append(RejectionCode.TOKEN_ALREADY_HELD)
+            if selection.rank is not None:
+                evidence = (
+                    *evidence,
+                    EvidenceItem(
+                        name="token_volume_rank",
+                        value=str(selection.rank),
+                        threshold=None
+                        if selection.rank_limit is None
+                        else str(selection.rank_limit),
+                    ),
+                )
+                if selection.rank_limit is not None and selection.rank > selection.rank_limit:
+                    reasons.append(RejectionCode.CANDIDATE_RANK_BELOW_LIMIT)
         reasons = list(dict.fromkeys(reasons))
 
         warming = features.readiness is SignalReadiness.WARMING_UP
@@ -564,13 +847,13 @@ class PoolScreener:
             components = ()
         elif reasons and context.mode is TradingMode.SHADOW:
             status = CandidateStatus.UNKNOWN
-            score, components = _score(features, token, policy, flagged)
+            score, components = _score(features, token, policy, flagged, guide)
         elif reasons:
             status = CandidateStatus.REJECT
             score = None
             components = ()
         else:
-            score, components = _score(features, token, policy, flagged)
+            score, components = _score(features, token, policy, flagged, guide)
             if score < policy.minimum_score:
                 reasons.append(RejectionCode.SCORE_BELOW_THRESHOLD)
                 status = CandidateStatus.REJECT
@@ -696,7 +979,14 @@ class PoolScreener:
             reasons.append(RejectionCode.ARTIFICIAL_VOLUME_CONFIRMED)
         elif integrity.status is IntegrityStatus.UNKNOWN:
             reasons.append(RejectionCode.VOLUME_INTEGRITY_UNKNOWN)
-        if features.readiness is SignalReadiness.READY and (
+        if features.readiness is not SignalReadiness.READY:
+            return reasons
+        if policy.guide is not None:
+            # guide-v1 (G24): the spike is a score bonus and a flag, not a filter; the fee
+            # opportunity of the pool keeps its minimum under its own code.
+            if features.fee_tvl is None or features.fee_tvl < policy.minimum_fee_tvl:
+                reasons.append(RejectionCode.FEE_TVL_BELOW_THRESHOLD)
+        elif (
             features.short_ratio is None
             or features.long_ratio is None
             or features.robust_z_score is None
@@ -736,7 +1026,10 @@ def _score(
     token: TokenRiskSnapshot,
     policy: ScreeningPolicy,
     flagged: frozenset[str] = frozenset(),
+    guide: GuideAssessment | None = None,
 ) -> tuple[Decimal, tuple[ScoreComponent, ...]]:
+    if policy.guide is not None and guide is not None:
+        return _guide_score(features, token, policy, policy.guide, flagged, guide)
     values = (
         (
             "volume_acceleration",
@@ -776,6 +1069,47 @@ def _score(
             normalized_value=value,
             weight=weight,
             contribution=value * weight,
+        )
+        for name, value, weight in values
+    )
+    return sum((item.contribution for item in components), Decimal(0)), components
+
+
+def _guide_score(
+    features: VolumeSpikeFeatures,
+    token: TokenRiskSnapshot,
+    policy: ScreeningPolicy,
+    rules: GuideScreeningRules,
+    flagged: frozenset[str],
+    guide: GuideAssessment,
+) -> tuple[Decimal, tuple[ScoreComponent, ...]]:
+    """guide-v1 score (G24): the token's sustained hourly volume per minute against the
+    author's "good" figure carries it; a spike adds its weight as a bonus."""
+
+    weights = rules.weights
+    values = (
+        (
+            "sustained_volume",
+            _cap(guide.hourly_volume_per_minute, rules.target_volume_per_minute),
+            weights.sustained_volume,
+        ),
+        ("volume_spike", Decimal(1) if guide.volume_spike else Decimal(0), weights.volume_spike),
+        (
+            "fee_opportunity",
+            _cap(_net_edge(features.fee_tvl, policy.assumed_cost_rate), policy.target_fee_tvl),
+            weights.fee_opportunity,
+        ),
+        ("liquidity_stability", _stability(features.tvl_change), weights.liquidity_stability),
+        (
+            "volatility_fit",
+            _volatility_fit(features.price_volatility, policy.target_volatility),
+            weights.volatility_fit,
+        ),
+        ("token_quality", _token_quality(token, flagged), weights.token_quality),
+    )
+    components = tuple(
+        ScoreComponent(
+            name=name, normalized_value=value, weight=weight, contribution=value * weight
         )
         for name, value, weight in values
     )

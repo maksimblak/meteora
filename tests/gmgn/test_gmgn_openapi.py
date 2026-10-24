@@ -227,32 +227,34 @@ def test_the_official_answer_becomes_the_same_enhanced_signals_as_the_browser_pa
     assert provider.health.state is ProviderState.HEALTHY
 
 
+def busy_clean_info(request: httpx.Request) -> httpx.Response:
+    """WIF with clean holders and a token volume of 20 000 a minute now and over the hour."""
+
+    body = info_body(
+        asked(request), top_entrapment_trader_percentage="0.05", top_10_holder_rate="0.15"
+    )
+    body["data"]["price"].update(volume_5m="100000", volume_1h="1200000")
+    return httpx.Response(200, json=body)
+
+
 def test_the_live_wif_answer_meets_the_unchanged_guide_thresholds_and_panel() -> None:
     clock = FrozenClock(GUIDE_NOW - timedelta(minutes=1))
-    clean = Api(
-        clock,
-        info=(
-            lambda request: httpx.Response(
-                200,
-                json=info_body(
-                    asked(request),
-                    top_entrapment_trader_percentage="0.05",
-                    top_10_holder_rate="0.15",
-                ),
-            ),
-        ),
-    )
+    clean = Api(clock, info=(busy_clean_info,))
 
     (wif,), _ = run(Api(clock), [WIF], clock=clock)
     (fine,), _ = run(clean, [WIF], clock=clock)
     rejected = evaluate(token_with(wif), mode=TradingMode.LIVE)
     accepted = evaluate(token_with(fine), mode=TradingMode.LIVE)
 
-    # WIF on 2026-10-24: phishing 73.67% and top-10 32.3% fail the guide-v1 maxima.
+    # WIF on 2026-10-24: phishing 73.67% and top-10 32.3% fail the guide-v1 maxima, and
+    # (G24, by token) its GMGN volume - 1 542 in 5m, 1 733 in the hour - is far from
+    # 14 000 a minute, whatever the one DLMM pool of the fixture shows.
     assert rejected.status is CandidateStatus.REJECT
     assert set(rejected.reasons) == {
         RejectionCode.PHISHING_SHARE_HIGH,
         RejectionCode.GMGN_TOP10_HOLDER_SHARE_HIGH,
+        RejectionCode.VOLUME_PER_MINUTE_BELOW_THRESHOLD,
+        RejectionCode.HOURLY_VOLUME_PER_MINUTE_BELOW_THRESHOLD,
     }
     assert DecisionFlag.GMGN_UNAVAILABLE not in rejected.flags
     found = evidence(rejected)
@@ -263,9 +265,14 @@ def test_the_live_wif_answer_meets_the_unchanged_guide_thresholds_and_panel() ->
     assert found["gmgn_top10_holder_share"] == ("0.323", "0.30")
     assert found["developer_share"] == ("0", "0")
     assert found["total_fees_sol"] == ("1223.6575276103256", "30")
-    # With the key LIVE no longer stops at GMGN_UNAVAILABLE.
+    # With the key LIVE no longer stops at GMGN_UNAVAILABLE. WIF (created 2023-11-20, 1 000
+    # sniper wallets) is flagged as a revival with many snipers; the fixture's 5m spikes.
     assert accepted.status is CandidateStatus.ACCEPT
-    assert accepted.flags == ()
+    assert set(accepted.flags) == {
+        DecisionFlag.VOLUME_SPIKE,
+        DecisionFlag.SNIPERS_HIGH,
+        DecisionFlag.TOKEN_REVIVED,
+    }
     shown = {item.name for item in gmgn_metrics(accepted.evidence)}
     assert {"gmgn_status", "insiders_share", "bundling_share", "phishing_share"} <= shown
     assert {"gmgn_top10_holder_share", "developer_share", "total_fees_sol"} <= shown

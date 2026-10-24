@@ -5,8 +5,10 @@ any new action) -> lease-guarded scheduler. Jobs, by priority:
 
 0. ``position_cycle``  - open positions first: marks, exits, daily stop;
 1. ``recovery``        - periodic reconciliation of unresolved commands;
-2. ``candidate_pipeline`` - opens the UTC risk day, then evaluates the universe except
-   pools with an open position or an entry still in flight;
+2. ``candidate_pipeline`` - opens the UTC risk day, then evaluates the universe by token
+   (G24): one main pool per token, tokens ranked by hourly volume with only the top N
+   checked in depth, nothing for pools with an open position or an entry still in flight
+   and ``TOKEN_ALREADY_HELD`` for the other pools of their token;
 3. ``universe_sync``   - paginated discovery, open-position pools first;
 4. ``outbox_relay`` / 5. ``retention`` - publication and telemetry clean-up.
 
@@ -43,6 +45,7 @@ from src.core.config import AppConfig
 from src.core.logging import configure_logging
 from src.domain.models.primitives import PublicKey
 from src.domain.models.trading import TradingMode
+from src.domain.screening.selection import TokenGroup, token_groups
 from src.execution.contracts import LivePromotionEvidence
 from src.execution.http_gateway import HttpExecutionGateway, HttpQuoteClient
 from src.execution.service import (
@@ -61,6 +64,7 @@ from src.market.models import (
     AuthorityStatus,
     DataQuality,
     Freshness,
+    PoolSnapshot,
     ProviderHealth,
     ProviderState,
     RiskSignal,
@@ -99,7 +103,7 @@ from src.worker.execution import (
     shadow_address,
     snapshot_anchor,
 )
-from src.worker.pipeline import CandidatePipeline, QuoteSource
+from src.worker.pipeline import CandidatePipeline, QuoteSource, ScreenedPool
 from src.worker.policy import PipelinePolicy, load_pipeline_policy, universe_interval
 from src.worker.portfolio import RiskDayKeeper, ShadowPortfolio
 from src.worker.positions import PositionCycle
@@ -185,6 +189,14 @@ class InFlightEntryUnresolved(RuntimeError):
     def __init__(self, plan_id: UUID) -> None:
         super().__init__(f"the pool of in-flight plan {plan_id} is unknown")
         self.plan_id = plan_id
+
+
+@dataclass(frozen=True, slots=True)
+class _BusyEntries:
+    """Pools with an open position or an entry in flight, and their base mints."""
+
+    pools: set[str] = field(default_factory=set)
+    mints: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +393,7 @@ class WorkerRuntime:
             quotes=quotes,
             warmup=warmup,
             evidence=self.evidence,
+            enhanced_signals=gmgn is not None,
         )
         self.positions = PositionCycle(
             modes=repos.mode,
@@ -464,6 +477,19 @@ class WorkerRuntime:
         self.alerts.flush()
 
     async def candidate_job(self, context: JobContext) -> None:
+        """One candidate cycle, by token as the author works (spec 6.8, G24).
+
+        1. The universe is grouped by base token, tokens ranked by hourly volume summed
+           over their DLMM pools. Pools with an open position or an entry in flight are not
+           evaluated; the token of such a pool is held (``TOKEN_ALREADY_HELD``).
+        2. Cheap filters, no request: a token's pools are tried main pool first (largest
+           LP fees in the hour, then TVL); the first that passes is the token's candidate,
+           the ones before it are recorded with their rejects, the rest wait.
+        3. Candidates in rank order: the first ``deep_candidate_limit`` are checked in depth
+           (volume history, token risk with GMGN, quote) and may enter; the rest are recorded
+           as ``CANDIDATE_RANK_BELOW_LIMIT``.
+        """
+
         self.keeper.ensure_open()
         # The first cycle of a UTC day hands the day before to the promotion evidence.
         self.evidence.close_finished_days()
@@ -471,13 +497,14 @@ class WorkerRuntime:
             # Approved and interrupted entries first, under this job's lease.
             await self.gateway_entries.run()
         snapshots = await self.repositories.history.latest_universe()
-        busy = await self._busy_pools()
-        addresses = [
-            snapshot.pool.address.root
-            for snapshot in snapshots
-            if snapshot.pool.address.root not in busy
+        busy = await self._busy_entries()
+        queue = [
+            (group, [item for item in group.pools if item.pool.address.root not in busy.pools])
+            for group in token_groups(snapshots)
         ]
-        self.metrics.queue_depth("candidate_pipeline", len(addresses))
+        queue = [(group, pools) for group, pools in queue if pools]
+        remaining = sum(len(pools) for _, pools in queue)
+        self.metrics.queue_depth("candidate_pipeline", remaining)
         decided_at = self.clock.now()
         last_sync = max((snapshot.observed_at for snapshot in snapshots), default=None)
         self.evidence.cycle(
@@ -487,22 +514,60 @@ class WorkerRuntime:
             mode=self.repositories.mode.mode_state().mode,
         )
         slots = asyncio.Semaphore(self.settings.candidate_concurrency)
-        remaining = len(addresses)
 
-        async def evaluate(address: str) -> None:
+        def done(count: int = 1) -> None:
             nonlocal remaining
+            remaining -= count
+            self.metrics.queue_depth("candidate_pipeline", remaining)
+
+        async def screen_token(group: TokenGroup, pools: list[PoolSnapshot]) -> ScreenedPool | None:
+            async with slots:
+                held = group.base_mint in busy.mints
+                for index, snapshot in enumerate(pools):
+                    address = snapshot.pool.address.root
+                    try:
+                        screened = await self.pipeline.screen(
+                            address,
+                            decided_at,
+                            causation_id=context.correlation_id,
+                            selection=group.selection_for(address, held=held),
+                        )
+                        if isinstance(screened, ScreenedPool):
+                            if screened.candidate:
+                                done(len(pools) - index - 1)  # the token's other pools wait
+                                return screened
+                            await self.pipeline.complete(screened)
+                    except Exception as error:
+                        self._log.error(
+                            "candidate_failed", pool_address=address, **error_fields(error)
+                        )
+                    finally:
+                        done()
+                return None
+
+        screened = await asyncio.gather(*(screen_token(group, pools) for group, pools in queue))
+        candidates = [item for item in screened if item is not None]
+        limit = self.policy.deep_candidate_limit
+
+        async def complete(rank: int, candidate: ScreenedPool) -> None:
             async with slots:
                 try:
-                    await self.pipeline.evaluate(
-                        address, decided_at, causation_id=context.correlation_id
+                    await self.pipeline.complete(
+                        candidate,
+                        deep=limit is None or rank <= limit,
+                        rank=None if limit is None else rank,
+                        rank_limit=limit,
                     )
                 except Exception as error:
-                    self._log.error("candidate_failed", pool_address=address, **error_fields(error))
-                finally:
-                    remaining -= 1
-                    self.metrics.queue_depth("candidate_pipeline", remaining)
+                    self._log.error(
+                        "candidate_failed",
+                        pool_address=candidate.pool_address,
+                        **error_fields(error),
+                    )
 
-        await asyncio.gather(*(evaluate(address) for address in addresses))
+        await asyncio.gather(
+            *(complete(rank, item) for rank, item in enumerate(candidates, start=1))
+        )
 
     async def universe_job(self, context: JobContext) -> None:
         if self._market is None:
@@ -612,12 +677,18 @@ class WorkerRuntime:
             if context.position_id in open_ids
         }
 
-    async def _busy_pools(self) -> set[str]:
-        """Pools no new entry is planned for: an open position, or an entry still in
-        flight - a PENDING plan before its expiry, or EXECUTING (awaiting the operator,
-        or an unknown outcome being reconciled). One pool never takes two slots."""
+    async def _busy_entries(self) -> _BusyEntries:
+        """Pools and base tokens no new entry is planned for: an open position, or an entry
+        still in flight - a PENDING plan before its expiry, or EXECUTING (awaiting the
+        operator, or an unknown outcome being reconciled). One pool never takes two slots,
+        and one token never two positions in any of its pools (G24, ``TOKEN_ALREADY_HELD``)."""
 
-        pools = await self._open_position_pools()
+        busy = _BusyEntries()
+        open_ids = set(self.repositories.mode.open_positions())
+        for position in await self.repositories.positions.all():
+            if position.position_id in open_ids:
+                busy.pools.add(position.pool_address)
+                busy.mints.add(position.base_mint)
         now = self.clock.now()
         decisions = self.repositories.decisions
         for plan in self.repositories.mode.entry_plans():
@@ -631,8 +702,9 @@ class WorkerRuntime:
             if decision is None:
                 # Fail closed: without its pool, any candidate could be a second entry.
                 raise InFlightEntryUnresolved(plan.plan_id)
-            pools.add(decision.market.pool.address.root)
-        return pools
+            busy.pools.add(decision.market.pool.address.root)
+            busy.mints.add(decision.market.pool.base_mint.root)
+        return busy
 
     def close(self) -> None:
         self.repositories.close()

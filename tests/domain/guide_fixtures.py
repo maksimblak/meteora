@@ -32,16 +32,21 @@ def guide_snapshot(
     *,
     short: str = "100000",
     long: str = "300000",
-    hour: str = "600000",
-    hour_fees: str = "5400",
+    hour: str = "900000",
+    hour_fees: str = "8100",
     tvl: str = "150000",
     price: str = "1",
     base_fee_rate: str | None = "0.01",
     market_cap: str | None = "2000000",
     bin_step: int = 250,
     created_at: datetime | None = None,
+    name: str | None = "Guide Coin",
+    symbol: str | None = "GUIDE",
 ) -> PoolSnapshot:
-    """A memecoin pool: 5m volume ``short``, 30m ``long``, 1h ``hour`` with ``hour_fees``."""
+    """A memecoin pool: 5m volume ``short``, 30m ``long``, 1h ``hour`` with ``hour_fees``.
+
+    The default hour, 900 000 (15 000 a minute), is a sustained volume above the guide-v1
+    minimum of 14 000 a minute (G24); the default name and ticker name no excluded theme."""
 
     windows = {
         "5m": WindowMetrics(
@@ -70,6 +75,8 @@ def guide_snapshot(
         data_quality=DataQuality.COMPLETE,
         base_fee_rate=None if base_fee_rate is None else Decimal(base_fee_rate),
         base_token_market_cap=None if market_cap is None else Decimal(market_cap),
+        base_token_name=name,
+        base_token_symbol=symbol,
     )
 
 

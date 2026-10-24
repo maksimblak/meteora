@@ -135,7 +135,8 @@ def test_a_clean_fresh_reading_passes_live_and_every_metric_reaches_the_record()
 
     assert decision.status is CandidateStatus.ACCEPT
     assert decision.reasons == ()
-    assert decision.flags == ()
+    # G24: this reading has no token volume, so the pool's own counts; the fixture spikes.
+    assert set(decision.flags) == {DecisionFlag.TOKEN_VOLUME_POOL_ONLY, DecisionFlag.VOLUME_SPIKE}
     assert found["gmgn_status"] == ("FRESH", None)
     assert found["gmgn_source_at"][0] == (NOW - timedelta(minutes=1)).isoformat()
     assert found["insiders_share"] == ("0.02", "0.10")
@@ -177,13 +178,20 @@ def test_reported_total_fees_below_30_sol_reject_through_the_d03_threshold() -> 
     assert DecisionFlag.TOTAL_FEES_UNAVAILABLE not in decision.flags
 
 
-def test_a_developer_share_is_a_flag_in_the_record_never_a_reject() -> None:
-    decision = evaluate(token_with(reading(developer="0.035")))
+def test_a_developer_share_is_a_flag_where_an_operator_checks_it_and_closes_live() -> None:
+    """G24 (No 6): the author skips such coins; LIVE has no checklist, so it rejects there."""
 
-    assert decision.status is CandidateStatus.ACCEPT
-    assert decision.reasons == ()
-    assert decision.flags == (DecisionFlag.DEVELOPER_HOLDS_TOKENS,)
-    assert evidence(decision)["developer_share"] == ("0.035", "0")
+    token = token_with(reading(developer="0.035"))
+
+    for mode in (TradingMode.SHADOW, TradingMode.APPROVAL):
+        decision = evaluate(token, mode=mode)
+        assert decision.status is CandidateStatus.ACCEPT
+        assert decision.reasons == ()
+        assert DecisionFlag.DEVELOPER_HOLDS_TOKENS in decision.flags
+        assert evidence(decision)["developer_share"] == ("0.035", "0")
+    live = evaluate(token, mode=TradingMode.LIVE)
+    assert live.status is CandidateStatus.REJECT
+    assert live.reasons == (RejectionCode.DEVELOPER_HOLDS_TOKENS,)
 
 
 @pytest.mark.parametrize(
@@ -251,10 +259,12 @@ def test_a_token_gmgn_never_read_is_flagged_unavailable_in_every_mode() -> None:
         decision = evaluate(token, mode=mode)
         assert decision.status is without_rules.status is CandidateStatus.ACCEPT
         assert decision.reasons == without_rules.reasons == ()
-        assert decision.flags == (
+        assert set(decision.flags) == {
             DecisionFlag.TOTAL_FEES_UNAVAILABLE,
             DecisionFlag.GMGN_UNAVAILABLE,
-        )
+            DecisionFlag.TOKEN_VOLUME_POOL_ONLY,  # G24: no reading, so the pool's own volume
+            DecisionFlag.VOLUME_SPIKE,
+        }
         assert evidence(decision)["gmgn_status"] == ("NOT_CONFIGURED", None)
     live = evaluate(token, mode=TradingMode.LIVE)
     assert live.status is CandidateStatus.REJECT

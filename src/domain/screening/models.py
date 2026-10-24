@@ -74,6 +74,19 @@ class RejectionCode(StrEnum):
     GMGN_UNAVAILABLE = "GMGN_UNAVAILABLE"
     # D09: no on-chain source configured; APPROVAL and LIVE only (SHADOW has the flag).
     TOKEN_RISK_UNAVAILABLE = "TOKEN_RISK_UNAVAILABLE"  # noqa: S105 - stable domain code
+    # Selection as the author does it (G24, T18).
+    # The token's average volume per minute over the last hour is below the guide minimum.
+    HOURLY_VOLUME_PER_MINUTE_BELOW_THRESHOLD = "HOURLY_VOLUME_PER_MINUTE_BELOW_THRESHOLD"
+    # guide-v1 fee opportunity (30m LP fees / TVL); the spike is a score bonus, not a filter.
+    FEE_TVL_BELOW_THRESHOLD = "FEE_TVL_BELOW_THRESHOLD"
+    # The token's name or ticker names an excluded theme (Elon, Trump, politics, streams).
+    THEME_EXCLUDED = "THEME_EXCLUDED"
+    # An open position or a PENDING/EXECUTING plan already holds this base token.
+    TOKEN_ALREADY_HELD = "TOKEN_ALREADY_HELD"  # noqa: S105 - stable domain code
+    # LIVE only: the developer still holds tokens (no operator checklist in LIVE).
+    DEVELOPER_HOLDS_TOKENS = "DEVELOPER_HOLDS_TOKENS"  # noqa: S105 - stable domain code
+    # A candidate whose token ranked below the cycle's deep-check limit by hourly volume.
+    CANDIDATE_RANK_BELOW_LIMIT = "CANDIDATE_RANK_BELOW_LIMIT"
 
 
 class DecisionFlag(StrEnum):
@@ -95,11 +108,24 @@ class DecisionFlag(StrEnum):
     # unless ``GmgnScreeningRules.required_for_live`` was switched off.
     GMGN_UNAVAILABLE = "GMGN_UNAVAILABLE"
     # G18: GMGN reports a developer share above zero ("желательно 0" in the guide): shown and
-    # recorded for the operator's checklist, never a reject.
+    # recorded for the operator's checklist in SHADOW and APPROVAL; LIVE, where no operator
+    # checks it, is closed (reason ``DEVELOPER_HOLDS_TOKENS``, G24).
     DEVELOPER_HOLDS_TOKENS = "DEVELOPER_HOLDS_TOKENS"  # noqa: S105 - stable domain code
     # D09: no on-chain source (RPC) is configured, every base token signal is unknown.
     # SHADOW goes on; APPROVAL and LIVE are closed (reason ``TOKEN_RISK_UNAVAILABLE``).
     TOKEN_RISK_UNAVAILABLE = "TOKEN_RISK_UNAVAILABLE"  # noqa: S105 - stable domain code
+    # G24: the 5m window spiked (ratio, robust z and 30m confirmation): a score bonus.
+    VOLUME_SPIKE = "VOLUME_SPIKE"
+    # G24: token volume is the sum of the token's DLMM pools, not GMGN's figure over every
+    # pool of the token (no key, or no fresh GMGN reading).
+    TOKEN_VOLUME_POOL_ONLY = "TOKEN_VOLUME_POOL_ONLY"  # noqa: S105 - stable domain code
+    # GMGN counts more launch snipers than the guide-v1 maximum ("большие - ждать").
+    SNIPERS_HIGH = "SNIPERS_HIGH"
+    # The token is at least ``revived_token_age`` old: a revival whose volume tends to fade.
+    TOKEN_REVIVED = "TOKEN_REVIVED"  # noqa: S105 - stable domain code
+    # The source reports neither the token's name nor its ticker, so the theme filter could
+    # not run. SHADOW goes on; APPROVAL and LIVE are closed (missing signal ``theme``).
+    THEME_UNKNOWN = "THEME_UNKNOWN"
 
 
 class VolumeIntegrityMode(StrEnum):
@@ -250,6 +276,9 @@ class GmgnScreeningRules(BaseModel):
     maximum_phishing_share: Decimal = Decimal("0.30")
     maximum_top10_holder_share: Decimal = Decimal("0.30")
     required_for_live: bool = True
+    # More launch snipers than this is the ``SNIPERS_HIGH`` flag (never a reject): the
+    # gmgn-token SKILL.md scores over 20 snipers as a danger signal; video 2, 17:35 - wait.
+    maximum_sniper_count: int = 20
 
     _reject_float = field_validator(
         "maximum_insiders_share",
@@ -261,6 +290,8 @@ class GmgnScreeningRules(BaseModel):
 
     @model_validator(mode="after")
     def validate_gmgn(self) -> "GmgnScreeningRules":
+        if self.maximum_sniper_count < 0:
+            raise ValueError("maximum_sniper_count must not be negative")
         if not all(
             Decimal(0) < value <= Decimal(1)
             for value in (
@@ -274,13 +305,82 @@ class GmgnScreeningRules(BaseModel):
         return self
 
 
+# The author skips coins about Elon and Trump "in 99% of cases" (guide, video 2 19:05) and
+# tries to skip political and stream coins (guide, "щитки"). Matched as substrings of the
+# token's name and ticker, case-insensitively, in Latin and Cyrillic; "MELON" contains "elon"
+# and is skipped too - a missed coin is the safe side. The list is a guide-v1 setting.
+DEFAULT_THEME_WORDS: tuple[str, ...] = (
+    "elon",
+    "musk",
+    "илон",
+    "маск",
+    "trump",
+    "трамп",
+    "maga",
+    "melania",
+    "меланья",
+    "мелания",
+    "biden",
+    "байден",
+    "kamala",
+    "камала",
+    "obama",
+    "обама",
+    "putin",
+    "путин",
+    "zelensky",
+    "зеленск",
+    "politic",
+    "политик",
+    "president",
+    "президент",
+    "election",
+    "выборы",
+    "stream",
+    "стрим",
+    "twitch",
+    "твич",
+)
+
+
+class GuideScoreWeights(BaseModel):
+    """guide-v1 score (G24): sustained volume carries it, a spike only adds a bonus."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    sustained_volume: Decimal = Decimal("0.40")
+    volume_spike: Decimal = Decimal("0.15")
+    fee_opportunity: Decimal = Decimal("0.15")
+    liquidity_stability: Decimal = Decimal("0.10")
+    volatility_fit: Decimal = Decimal("0.10")
+    token_quality: Decimal = Decimal("0.10")
+
+    _reject_float = field_validator("*", mode="before")(_exact_decimal)
+
+    @model_validator(mode="after")
+    def validate_weights(self) -> "GuideScoreWeights":
+        values = tuple(self.model_dump().values())
+        if any(value < 0 for value in values):
+            raise ValueError("score weights cannot be negative")
+        if sum(values, Decimal(0)) != Decimal(1):
+            raise ValueError("score weights must sum exactly to one")
+        return self
+
+
 class GuideScreeningRules(BaseModel):
     """Starting thresholds of the LexDollar guide (spec 6.6, G16) — a shadow hypothesis.
 
-    Top-10 holder share uses ``ScreeningPolicy.maximum_holder_concentration``. Fee
-    organicity compares collected fees with ``volume * base fee``: honest DLMM swaps pay
-    at least the base fee and the LP share is about 90%, so a ratio far below one means
-    the reported volume did not pay for itself.
+    Top-10 holder share uses ``ScreeningPolicy.maximum_holder_concentration``.
+
+    Selection as the author does it (spec 6.8, G24): the token's volume must be sustained -
+    the hour's average per minute (``minimum_hourly_volume_per_minute``) and the current 5m
+    rate (``minimum_volume_per_minute``) both clear the bar; a spike is a score bonus. The
+    score normalizes the hourly rate by ``target_volume_per_minute`` (the author's "20 000 a
+    minute is a good figure"). Artificial volume (Savash) is total fees below
+    ``minimum_total_fees_sol x market cap / total_fees_reference_market_cap`` while the pool
+    turned over at least ``maximum_hourly_turnover`` times its TVL in the hour.
+    ``minimum_fee_efficiency`` is kept only so stored records still load: fees over
+    ``volume x base fee`` is at least one by construction in DLMM and no longer screened.
     """
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
@@ -295,6 +395,13 @@ class GuideScreeningRules(BaseModel):
     minimum_total_fees_sol: Decimal = Decimal("30")
     # GMGN holder structure (G18); ``None`` = the bundle has no GMGN rules at all.
     gmgn: GmgnScreeningRules | None = None
+    minimum_hourly_volume_per_minute: Decimal = Decimal("14000")
+    target_volume_per_minute: Decimal = Decimal("20000")
+    total_fees_reference_market_cap: Decimal = Decimal("500000")
+    maximum_hourly_turnover: Decimal = Decimal("10")
+    excluded_theme_words: tuple[str, ...] = DEFAULT_THEME_WORDS
+    revived_token_age: timedelta = timedelta(days=60)
+    weights: GuideScoreWeights = GuideScoreWeights()
 
     _reject_float = field_validator(
         "minimum_market_cap",
@@ -304,6 +411,10 @@ class GuideScreeningRules(BaseModel):
         "minimum_volume_to_liquidity",
         "minimum_fee_efficiency",
         "minimum_total_fees_sol",
+        "minimum_hourly_volume_per_minute",
+        "target_volume_per_minute",
+        "total_fees_reference_market_cap",
+        "maximum_hourly_turnover",
         mode="before",
     )(_exact_decimal)
 
@@ -317,15 +428,63 @@ class GuideScreeningRules(BaseModel):
                 self.minimum_volume_to_liquidity,
                 self.minimum_fee_efficiency,
                 self.minimum_total_fees_sol,
+                self.minimum_hourly_volume_per_minute,
+                self.maximum_hourly_turnover,
             )
         ):
             raise ValueError("guide thresholds cannot be negative")
-        if self.minimum_token_age < timedelta(0):
-            raise ValueError("minimum_token_age cannot be negative")
+        if self.target_volume_per_minute <= 0 or self.total_fees_reference_market_cap <= 0:
+            raise ValueError("score target and total-fees reference cap must be positive")
+        if self.minimum_token_age < timedelta(0) or self.revived_token_age <= timedelta(0):
+            raise ValueError("token age thresholds must be valid durations")
         if self.preferred_market_cap < self.minimum_market_cap:
             raise ValueError("preferred_market_cap is below minimum_market_cap")
         if self.overvolume_volume_per_minute < self.minimum_volume_per_minute:
             raise ValueError("overvolume threshold is below the working volume threshold")
+        if any(not word.strip() for word in self.excluded_theme_words):
+            raise ValueError("an excluded theme word must not be blank")
+        return self
+
+
+class TokenSelection(BaseModel):
+    """What the cycle knows about the pool's base token beyond this pool (G24).
+
+    ``sibling_*``: the token's other DLMM pools in the universe - how many, their summed
+    1h volume and summed current 5m volume (``sibling_pools_without_5m`` had no 5m window
+    and add nothing, so the sum is a lower bound). ``held``: an open position or an entry
+    in flight already holds the token. ``enhanced_pending``: an enhanced source (GMGN) will
+    report the token's own volume after the cheap filters, so pool sums must not decide it
+    yet. ``rank``/``rank_limit``: the token's place among the cycle's candidates by hourly
+    volume and how many of them are checked in depth.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    sibling_pools: int = 0
+    sibling_volume_1h: Decimal = Decimal(0)
+    sibling_volume_5m: Decimal = Decimal(0)
+    sibling_pools_without_5m: int = 0
+    held: bool = False
+    enhanced_pending: bool = False
+    rank: int | None = None
+    rank_limit: int | None = None
+
+    _reject_float = field_validator("sibling_volume_1h", "sibling_volume_5m", mode="before")(
+        _exact_decimal
+    )
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "TokenSelection":
+        if min(self.sibling_pools, self.sibling_pools_without_5m) < 0:
+            raise ValueError("pool counts must not be negative")
+        if self.sibling_pools_without_5m > self.sibling_pools:
+            raise ValueError("more siblings without a 5m window than siblings")
+        if self.sibling_volume_1h < 0 or self.sibling_volume_5m < 0:
+            raise ValueError("sibling volumes must not be negative")
+        if (self.rank is not None and self.rank < 1) or (
+            self.rank_limit is not None and self.rank_limit < 1
+        ):
+            raise ValueError("rank and rank_limit start at one")
         return self
 
 
@@ -354,8 +513,9 @@ class ScreeningPolicy(BaseModel):
     weights: ScoreWeights = ScoreWeights()
     guide: GuideScreeningRules | None = None
     volume_integrity: VolumeIntegrityMode = VolumeIntegrityMode.PARTICIPANTS
-    # AVAILABLE_SIGNALS: bursts closer than this spread are one repeated trade (G07); the
-    # fee organicity below ``minimum_fee_support`` does not pay for the volume it reports.
+    # AVAILABLE_SIGNALS: bursts closer than this spread are one repeated trade (G07).
+    # ``minimum_fee_support`` is no longer applied (G24: fees over ``volume x base fee`` is
+    # at least one by construction in DLMM); it stays so stored records still load.
     maximum_burst_spread: Decimal = Decimal("0.02")
     minimum_fee_support: Decimal = Decimal("0.5")
 
@@ -435,6 +595,10 @@ class GuideAssessment(BaseModel):
     evidence: tuple[EvidenceItem, ...]
     volume_regime: VolumeRegime
     flags: tuple[DecisionFlag, ...] = ()
+    # The token's hourly volume per minute the sustained rule used (G24) and whether the 5m
+    # window spiked (``None``: not enough history to tell); both feed the guide-v1 score.
+    hourly_volume_per_minute: Decimal | None = None
+    volume_spike: bool | None = None
 
 
 class VolumeIntegrityAssessment(BaseModel):

@@ -48,13 +48,16 @@ REJECTION = {
     "ARTIFICIAL_VOLUME_CONFIRMED": "подтверждён искусственный объём",
     "VOLUME_INTEGRITY_UNKNOWN": "органичность объёма неизвестна",
     "PRICE_IMPACT_HIGH": "слишком большой price impact",
-    "VOLUME_SIGNAL_BELOW_THRESHOLD": "всплеск объёма ниже порога",
+    "VOLUME_SIGNAL_BELOW_THRESHOLD": "всплеск объёма ниже порога (shadow-hypothesis-v1)",
     "SCORE_BELOW_THRESHOLD": "score ниже порога",
     "MARKET_CAP_BELOW_THRESHOLD": "капитализация ниже порога",
     "TOKEN_TOO_YOUNG": "токен слишком молодой",
     "VOLUME_PER_MINUTE_BELOW_THRESHOLD": "объём в минуту ниже порога",
     "VOLUME_TO_LIQUIDITY_BELOW_THRESHOLD": "объём к ликвидности ниже порога",
-    "ARTIFICIAL_VOLUME_SUSPECTED": "подозрение на искусственный объём (комиссии малы)",
+    "ARTIFICIAL_VOLUME_SUSPECTED": (
+        "подозрение на накрутку: total fees малы для такой капы при обороте пула за час "
+        "≥ 10× TVL, или GMGN видит wash trading"
+    ),
     "TOTAL_FEES_BELOW_THRESHOLD": "total fees токена ниже порога",
     "GUIDE_SIGNAL_UNKNOWN": "обязательный сигнал guide-v1 недоступен",
     "BLACKLISTED_POOL": "пул в чёрном списке Meteora",
@@ -66,6 +69,17 @@ REJECTION = {
     "GMGN_TOP10_HOLDER_SHARE_HIGH": "доля top-10 по GMGN не ниже порога",
     "GMGN_UNAVAILABLE": "нет свежих данных GMGN (LIVE закрыт, пока GMGN_REQUIRED_FOR_LIVE)",
     "TOKEN_RISK_UNAVAILABLE": "источник риска токена (RPC) не настроен: вне SHADOW вход закрыт",
+    # Selection as the author does it (G24, T18).
+    "HOURLY_VOLUME_PER_MINUTE_BELOW_THRESHOLD": (
+        "средний объём токена в минуту за час ниже порога — объём не устойчивый"
+    ),
+    "FEE_TVL_BELOW_THRESHOLD": "комиссии пула к TVL ниже порога",
+    "THEME_EXCLUDED": "тема монеты в списке исключений (Илон, Трамп, политика, стримы)",
+    "TOKEN_ALREADY_HELD": "по этому токену уже есть позиция или вход в работе (в любом пуле)",
+    "DEVELOPER_HOLDS_TOKENS": "у девелопера есть доля токена — в LIVE вход закрыт",
+    "CANDIDATE_RANK_BELOW_LIMIT": (
+        "токен ниже лимита глубокой проверки по часовому объёму — в этом цикле не проверялся"
+    ),
 }
 
 # D03 / D07 / G18 / D09: the operator-facing line for each non-blocking decision flag.
@@ -77,10 +91,23 @@ FLAG_NOTICES = {
         "APPROVAL и LIVE закрыты"
     ),
     "VOLUME_PARTICIPANTS_UNAVAILABLE": (
-        "нет числа сделок и участников: органичность объёма — по обороту и комиссиям"
+        "нет числа сделок и участников: органичность объёма — по повторам всплесков и "
+        "total fees к капе"
     ),
-    "DEVELOPER_HOLDS_TOKENS": "у девелопера есть доля токена — проверь вручную",
+    "DEVELOPER_HOLDS_TOKENS": (
+        "у девелопера есть доля токена — проверь вручную (в LIVE вход закрыт)"
+    ),
     "TOKEN_RISK_UNAVAILABLE": "риск токена не проверен: RPC не настроен (SOLANA_RPC_URL)",
+    # G24 (T18).
+    "VOLUME_SPIKE": "всплеск объёма в окне 5m — плюс к баллу",
+    "TOKEN_VOLUME_POOL_ONLY": (
+        "объём токена — сумма его DLMM-пулов, не GMGN по всем площадкам: проверь в GMGN"
+    ),
+    "SNIPERS_HIGH": "много снайперов по GMGN — автор советует подождать",
+    "TOKEN_REVIVED": "токену 60+ дней: монета ожила, объёмы обычно быстро пропадают",
+    "THEME_UNKNOWN": (
+        "у токена нет ни имени, ни тикера: тема не проверена — APPROVAL и LIVE закрыты"
+    ),
 }
 
 STRATEGY_SELECTION = {

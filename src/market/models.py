@@ -354,6 +354,10 @@ class PoolSnapshot(BaseModel):
     base_token_verified: bool | None = None
     quote_token_verified: bool | None = None
     base_freeze_authority_disabled: bool | None = None
+    # The base token's name and ticker as the source reports them (theme filter, G24);
+    # ``None`` when the source has none.
+    base_token_name: str | None = None
+    base_token_symbol: str | None = None
 
     _reject_binary_float = field_validator(
         "tvl",
@@ -427,7 +431,24 @@ _SHARE_FIELDS = (
     "bundling_share",
     "phishing_share",
     "developer_share",
+    "sniper_share",
 )
+# Token-level USD figures of an enhanced source (GMGN, T18); never negative.
+_USD_FIELDS = (
+    "volume_5m_usd",
+    "volume_1h_usd",
+    "price_usd",
+    "market_cap_usd",
+    "ath_price_usd",
+    "ath_market_cap_usd",
+)
+
+
+class DeveloperStatus(StrEnum):
+    """What the token's creator did with the supply (GMGN ``creator_token_status``)."""
+
+    HOLDING = "HOLDING"
+    SOLD = "SOLD"
 
 
 class EnhancedTokenSignals(BaseModel):
@@ -439,6 +460,13 @@ class EnhancedTokenSignals(BaseModel):
     ``top10_holder_share``, ``insiders_share``, ``bundling_share``, ``phishing_share`` and
     the developer's ``developer_share``. ``None`` = the source did not report it;
     ``detail`` says why a reading is unavailable.
+
+    Token-level market figures (T18, G24), all USD and over every pool of the token as the
+    author reads them in GMGN: ``volume_5m_usd`` and ``volume_1h_usd``, ``price_usd`` and
+    ``market_cap_usd``, the all-time high ``ath_price_usd`` and ``ath_market_cap_usd``.
+    ``sniper_count`` wallets bought at launch and hold ``sniper_share``;
+    ``developer_status`` says whether the creator still holds or sold; ``created_at`` is the
+    token's creation time.
     """
 
     model_config = ConfigDict(frozen=True, strict=True)
@@ -458,11 +486,26 @@ class EnhancedTokenSignals(BaseModel):
     source_at: datetime
     freshness: Freshness
     detail: str | None = None
+    volume_5m_usd: Decimal | None = None
+    volume_1h_usd: Decimal | None = None
+    price_usd: Decimal | None = None
+    market_cap_usd: Decimal | None = None
+    ath_price_usd: Decimal | None = None
+    ath_market_cap_usd: Decimal | None = None
+    sniper_count: int | None = None
+    sniper_share: Decimal | None = None
+    developer_status: DeveloperStatus | None = None
+    created_at: datetime | None = None
 
     _reject_binary_float = field_validator(
-        "holder_concentration", "total_fees_sol", *_SHARE_FIELDS, mode="before"
+        "holder_concentration", "total_fees_sol", *_SHARE_FIELDS, *_USD_FIELDS, mode="before"
     )(_exact_decimal)
     _normalize_utc = field_validator("source_at")(_utc)
+
+    @field_validator("created_at")
+    @classmethod
+    def _normalize_created(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _utc(value)
 
     @model_validator(mode="after")
     def validate_signals(self) -> "EnhancedTokenSignals":
@@ -472,6 +515,12 @@ class EnhancedTokenSignals(BaseModel):
                 raise ValueError(f"{name} must be a fraction in [0, 1]")
         if self.total_fees_sol is not None and self.total_fees_sol < 0:
             raise ValueError("total_fees_sol must not be negative")
+        for name in _USD_FIELDS:
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must not be negative")
+        if self.sniper_count is not None and self.sniper_count < 0:
+            raise ValueError("sniper_count must not be negative")
         return self
 
 

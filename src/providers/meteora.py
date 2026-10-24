@@ -107,6 +107,8 @@ class _PoolQuote:
     base_verified: bool | None = None
     quote_verified: bool | None = None
     base_freeze_disabled: bool | None = None
+    base_name: str | None = None
+    base_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,6 +533,8 @@ class MeteoraDataApiProvider:
             base_token_verified=quote.base_verified,
             quote_token_verified=quote.quote_verified,
             base_freeze_authority_disabled=quote.base_freeze_disabled,
+            base_token_name=quote.base_name,
+            base_token_symbol=quote.base_symbol,
         )
 
 
@@ -670,6 +674,8 @@ def _quote(value: Any, arrived_at: datetime) -> _PoolQuote:
         base_freeze_disabled=_token_value(
             tokens, pool.base_mint, "freeze_authority_disabled", _optional_flag
         ),
+        base_name=_token_value(tokens, pool.base_mint, "name", _optional_text),
+        base_symbol=_token_value(tokens, pool.base_mint, "symbol", _optional_text),
     )
 
 
@@ -730,6 +736,15 @@ def _flag(value: Any) -> bool | None:
 def _optional_flag(value: Any, label: str) -> bool | None:
     del label
     return _flag(value)
+
+
+def _optional_text(value: Any, label: str) -> str | None:
+    """A token's name or ticker; anything but non-empty text is unknown, never a reject."""
+
+    del label
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
 
 
 def _base_fee_rate(config: Mapping[str, Any]) -> Decimal | None:

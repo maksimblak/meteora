@@ -45,6 +45,8 @@ CADENCE = timedelta(seconds=90)
 SOL_USDC = "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6"
 RELAXED = GuidePolicySettings(
     minimum_volume_per_minute=Decimal("10"),
+    # G24: the hour's average is a second volume minimum; opened like the current one.
+    minimum_hourly_volume_per_minute=Decimal("10"),
     overvolume_volume_per_minute=Decimal("100000000"),
     minimum_volume_to_liquidity=Decimal("0"),
     minimum_short_ratio=Decimal("0"),

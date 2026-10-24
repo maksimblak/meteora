@@ -1,6 +1,7 @@
 """Explainable hard filters and deterministic candidate scoring."""
 
 from src.domain.screening.models import (
+    DEFAULT_THEME_WORDS,
     CandidateDecision,
     CandidateStatus,
     DecisionContext,
@@ -10,12 +11,14 @@ from src.domain.screening.models import (
     EvidenceItem,
     GmgnScreeningRules,
     GuideAssessment,
+    GuideScoreWeights,
     GuideScreeningRules,
     IntegrityStatus,
     RejectionCode,
     ScoreComponent,
     ScoreWeights,
     ScreeningPolicy,
+    TokenSelection,
     VolumeIntegrityAssessment,
     VolumeIntegrityMode,
     VolumeRegime,
@@ -27,8 +30,10 @@ from src.domain.screening.screener import (
     merge_enhanced_signals,
     merge_pool_token_signals,
 )
+from src.domain.screening.selection import TokenGroup, token_groups
 
 __all__ = [
+    "DEFAULT_THEME_WORDS",
     "CandidateDecision",
     "CandidateStatus",
     "DecisionContext",
@@ -38,6 +43,7 @@ __all__ = [
     "EvidenceItem",
     "GmgnScreeningRules",
     "GuideAssessment",
+    "GuideScoreWeights",
     "GuideScreeningRules",
     "IntegrityStatus",
     "PoolScreener",
@@ -45,6 +51,8 @@ __all__ = [
     "ScoreComponent",
     "ScoreWeights",
     "ScreeningPolicy",
+    "TokenGroup",
+    "TokenSelection",
     "VolumeIntegrityAssessment",
     "VolumeIntegrityMode",
     "VolumeRegime",
@@ -52,4 +60,5 @@ __all__ = [
     "assess_volume_integrity",
     "merge_enhanced_signals",
     "merge_pool_token_signals",
+    "token_groups",
 ]

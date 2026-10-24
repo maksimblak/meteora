@@ -142,15 +142,20 @@ def test_the_same_burst_repeated_is_artificial_volume_on_available_signals() -> 
     assert RejectionCode.ARTIFICIAL_VOLUME_CONFIRMED in decision.reasons
 
 
-def test_heavy_turnover_that_pays_no_fees_is_artificial_volume() -> None:
-    # 30m volume 24x the pool's liquidity; the hour paid a tenth of the base fee.
+def test_heavy_turnover_with_too_few_total_fees_for_the_cap_is_suspected_artificial() -> None:
+    """G24 replaced "the hour paid a tenth of the base fee" (fees over volume x base fee is
+    at least one in DLMM, so it never fires on real swaps) with the author's signal: the
+    hour turned the pool over 40x (6 000 000 on 150 000) while the token's total fees, 45
+    SOL, are below the 30 x 2 000 000 / 500 000 = 120 SOL its cap calls for."""
+
     history = guide_history(long="3600000", hour="6000000", hour_fees="6000")
 
     decision = evaluate(without_counts(history), wash_unknown(), mode=TradingMode.SHADOW)
 
     assert decision.status is CandidateStatus.REJECT
-    assert RejectionCode.ARTIFICIAL_VOLUME_CONFIRMED in decision.reasons
-    assert ("volume_integrity", "CONFIRMED") in {
+    assert RejectionCode.ARTIFICIAL_VOLUME_SUSPECTED in decision.reasons
+    assert RejectionCode.ARTIFICIAL_VOLUME_CONFIRMED not in decision.reasons
+    assert ("volume_integrity", "CLEAR") in {
         (item.name, item.value) for item in decision.evidence
     }
 

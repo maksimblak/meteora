@@ -81,7 +81,12 @@ def test_missing_total_fees_is_flagged_in_the_record_and_still_planned() -> None
 
     assert outcome.status is CandidateStatus.ACCEPT
     assert outcome.plan_id is not None
-    assert record.decision.flags == (DecisionFlag.TOTAL_FEES_UNAVAILABLE,)
+    # G24: without GMGN the token volume is its DLMM pools'; the fixture's 5m window spikes.
+    assert set(record.decision.flags) == {
+        DecisionFlag.TOTAL_FEES_UNAVAILABLE,
+        DecisionFlag.TOKEN_VOLUME_POOL_ONLY,
+        DecisionFlag.VOLUME_SPIKE,
+    }
     assert RejectionCode.GUIDE_SIGNAL_UNKNOWN not in record.decision.reasons
 
 

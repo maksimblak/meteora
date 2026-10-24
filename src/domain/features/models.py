@@ -47,12 +47,20 @@ class GuideFeatureRules(BaseModel):
     local_high_lookback: timedelta = timedelta(hours=1)
     ath_coverage_tolerance: timedelta = timedelta(minutes=15)
     maximum_observation_gap: timedelta = timedelta(minutes=5, seconds=30)
+    # Sustained volume (G24): the author sorts GMGN by the hour's volume, so the pool's own
+    # share of it is this window's volume per minute and its turnover against the TVL.
+    sustained_window: str = "1h"
 
     @model_validator(mode="after")
     def validate_guide(self) -> "GuideFeatureRules":
         if any(
             window not in WINDOW_MINUTES
-            for window in (self.volume_window, self.maximum_volume_window, self.organicity_window)
+            for window in (
+                self.volume_window,
+                self.maximum_volume_window,
+                self.organicity_window,
+                self.sustained_window,
+            )
         ):
             raise ValueError("unsupported guide window")
         if self.local_high_lookback <= timedelta(0):
@@ -158,6 +166,10 @@ class VolumeSpikeFeatures(BaseModel):
     # (max - min) / max of the last ``burst_points`` short windows: near zero means the
     # same burst repeats (self-similar volume, G07); ``None`` with too few windows.
     short_burst_spread: Decimal | None = None
+    # The pool's volume per minute over the guide's ``sustained_window`` (1h) and that
+    # window's volume over the TVL (G24); ``None`` without the window or outside guide-v1.
+    hourly_volume_per_minute: Decimal | None = None
+    hourly_turnover: Decimal | None = None
 
     _reject_float = field_validator(
         "volume_per_minute",
@@ -165,6 +177,8 @@ class VolumeSpikeFeatures(BaseModel):
         "fee_efficiency",
         "local_high_price",
         "all_time_high_price",
+        "hourly_volume_per_minute",
+        "hourly_turnover",
         mode="before",
     )(_exact_decimal)
 

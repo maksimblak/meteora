@@ -15,6 +15,12 @@ risk (RPC) and a read-only executor quote of the reference size for depth and pr
 impact. The decision instant is the cycle's, moved forward to the token observation
 when that arrived during the cycle (never more than ``EVALUATION_LATENCY``), so no
 input is newer than the decision.
+
+The worker's cycle (G24) runs the two halves apart: ``screen`` (cheap filters, nothing
+recorded) for the pools of every token, main pool first, and ``complete`` for the one pool
+per token it keeps - in depth only for the top-ranked candidates. ``evaluate`` is both at
+once. A ``TokenSelection`` brings what the cycle knows about the token beyond the pool; with
+an enhanced source (``enhanced_signals``) the token volume waits for its reading.
 """
 
 from collections.abc import Awaitable
@@ -39,6 +45,7 @@ from src.domain.screening import (
     DepthSource,
     PoolScreener,
     RejectionCode,
+    TokenSelection,
     merge_pool_token_signals,
 )
 from src.domain.strategy import StrategyPlanner
@@ -121,6 +128,29 @@ class CandidateOutcome:
     reasons: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ScreenedPool:
+    """A pool after the cheap filters and before any request (G24 cycle, first phase).
+
+    ``candidate``: no hard filter the snapshot and features decide has failed, so the pool
+    may be checked in depth; ``complete`` records it either way.
+    """
+
+    pool_address: str
+    decision_at: datetime
+    correlation: UUID
+    causation_id: UUID | None
+    history: tuple[PoolSnapshot, ...]
+    features: VolumeSpikeFeatures
+    unchecked: TokenRiskSnapshot
+    selection: TokenSelection | None
+    candidate: bool
+
+    @property
+    def market(self) -> PoolSnapshot:
+        return self.history[-1]
+
+
 class PersistenceFailure(RuntimeError):
     """A record that must precede any money step could not be persisted."""
 
@@ -143,7 +173,11 @@ class CandidatePipeline:
         quotes: QuoteSource | None = None,
         warmup: VolumeHistorySource | None = None,
         evidence: DailyEvidence | None = None,
+        enhanced_signals: bool = False,
     ) -> None:
+        """``enhanced_signals``: an enhanced source (GMGN) reads the token of every deep
+        candidate, so its token-level volume decides the volume thresholds (G24)."""
+
         self._history = history
         self._onchain = onchain
         self._decisions = decisions
@@ -158,6 +192,7 @@ class CandidatePipeline:
         self._quotes = quotes
         self._warmup = warmup
         self._evidence = evidence
+        self._enhanced = enhanced_signals
         self._log = get_logger("worker.candidates")
 
     async def evaluate(
@@ -167,23 +202,80 @@ class CandidatePipeline:
         *,
         correlation_id: UUID | None = None,
         causation_id: UUID | None = None,
+        selection: TokenSelection | None = None,
     ) -> CandidateOutcome:
+        """``screen`` and ``complete`` in one go: the pool checked in depth if it passes."""
+
         correlation = correlation_id or uuid4()
         with cycle_context(
             correlation_id=correlation, causation_id=causation_id, pool_address=pool_address
         ):
-            try:
-                return await self._evaluate(pool_address, observed_at, correlation, causation_id)
-            except PersistenceFailure as failure:
-                return CandidateOutcome(pool_address, str(correlation), reasons=(str(failure),))
+            screened = await self._screen(
+                pool_address, observed_at, correlation, causation_id, selection
+            )
+            if isinstance(screened, CandidateOutcome):
+                return screened
+            return await self._completed(screened, deep=True)
 
-    async def _evaluate(
+    async def screen(
+        self,
+        pool_address: str,
+        observed_at: datetime,
+        *,
+        correlation_id: UUID | None = None,
+        causation_id: UUID | None = None,
+        selection: TokenSelection | None = None,
+    ) -> "ScreenedPool | CandidateOutcome":
+        """The cheap filters only - no request, nothing recorded (``NO_HISTORY`` outcome)."""
+
+        correlation = correlation_id or uuid4()
+        with cycle_context(
+            correlation_id=correlation, causation_id=causation_id, pool_address=pool_address
+        ):
+            return await self._screen(
+                pool_address, observed_at, correlation, causation_id, selection
+            )
+
+    async def complete(
+        self,
+        screened: ScreenedPool,
+        *,
+        deep: bool = True,
+        rank: int | None = None,
+        rank_limit: int | None = None,
+    ) -> CandidateOutcome:
+        """Record the decision of a screened pool. A candidate is checked in depth (volume
+        history, token risk, quote) only with ``deep``; ``rank`` of ``rank_limit`` is its
+        token's place by hourly volume among the cycle's candidates (G24)."""
+
+        if rank is not None:
+            selection = (screened.selection or TokenSelection()).model_copy(
+                update={"rank": rank, "rank_limit": rank_limit}
+            )
+            screened = replace(screened, selection=selection)
+        with cycle_context(
+            correlation_id=screened.correlation,
+            causation_id=screened.causation_id,
+            pool_address=screened.pool_address,
+        ):
+            return await self._completed(screened, deep=deep)
+
+    async def _completed(self, screened: ScreenedPool, *, deep: bool) -> CandidateOutcome:
+        try:
+            return await self._complete(screened, deep=deep)
+        except PersistenceFailure as failure:
+            return CandidateOutcome(
+                screened.pool_address, str(screened.correlation), reasons=(str(failure),)
+            )
+
+    async def _screen(
         self,
         pool_address: str,
         decision_at: datetime,
         correlation: UUID,
         causation_id: UUID | None,
-    ) -> CandidateOutcome:
+        selection: TokenSelection | None,
+    ) -> ScreenedPool | CandidateOutcome:
         policy = self._policy
         history = await self._history.history(
             pool_address, until=decision_at, limit=policy.features.maximum_history_points
@@ -191,11 +283,40 @@ class CandidatePipeline:
         if not history:
             return CandidateOutcome(pool_address, str(correlation), reasons=("NO_HISTORY",))
         market = history[-1]
+        features = VolumeFeatureEngine().compute(history, policy.features, decision_at=decision_at)
+        unchecked = merge_pool_token_signals(_unchecked_token(market, decision_at), market)
+        return ScreenedPool(
+            pool_address=pool_address,
+            decision_at=decision_at,
+            correlation=correlation,
+            causation_id=causation_id,
+            history=tuple(history),
+            features=features,
+            unchecked=unchecked,
+            selection=selection,
+            candidate=self._is_candidate(market, unchecked, features, correlation, selection),
+        )
+
+    def _unread(self, selection: TokenSelection | None) -> TokenSelection | None:
+        """The selection while the enhanced source has not read the token (G24)."""
+
+        if not self._enhanced:
+            return selection
+        return (selection or TokenSelection()).model_copy(update={"enhanced_pending": True})
+
+    async def _complete(self, screened: ScreenedPool, *, deep: bool) -> CandidateOutcome:
+        policy = self._policy
+        pool_address = screened.pool_address
+        decision_at = screened.decision_at
+        correlation = screened.correlation
+        causation_id = screened.causation_id
+        history = screened.history
+        market = screened.market
+        features = screened.features
+        unchecked = screened.unchecked
         engine = VolumeFeatureEngine()
         mode = self._modes.mode_state().mode
-        features = engine.compute(history, policy.features, decision_at=decision_at)
-        unchecked = merge_pool_token_signals(_unchecked_token(market, decision_at), market)
-        candidate = self._is_candidate(market, unchecked, features, correlation)
+        candidate = screened.candidate and deep
         buckets: tuple[VolumeBucket, ...] = ()
         if candidate and features.readiness is SignalReadiness.WARMING_UP:
             buckets = await self._volume_history(market, decision_at)
@@ -203,10 +324,13 @@ class CandidatePipeline:
                 features = engine.compute(
                     history, policy.features, decision_at=decision_at, warmup=buckets
                 )
-                candidate = self._is_candidate(market, unchecked, features, correlation)
+                candidate = self._is_candidate(
+                    market, unchecked, features, correlation, screened.selection
+                )
             candidate = candidate and features.readiness is SignalReadiness.READY
         token = unchecked
         depth = _snapshot_depth(market, "NOT_A_CANDIDATE")
+        selection = self._unread(screened.selection)
         if candidate:
             token = merge_pool_token_signals(await self._token_risk(market, decision_at), market)
             evaluated_at = _evaluation_instant(decision_at, token)
@@ -215,6 +339,7 @@ class CandidatePipeline:
                     history, policy.features, decision_at=evaluated_at, warmup=buckets
                 )
             depth = await self._depth(market)
+            selection = screened.selection
         decision = PoolScreener().evaluate(
             market,
             token,
@@ -223,6 +348,7 @@ class CandidatePipeline:
             context=self._context(mode, correlation),
             estimated_price_impact=self._price_impact(market, depth),
             depth=depth,
+            selection=selection,
         )
         decision_id = uuid5(
             NAMESPACE_URL,
@@ -302,11 +428,14 @@ class CandidatePipeline:
         unchecked: TokenRiskSnapshot,
         features: VolumeSpikeFeatures,
         correlation: UUID,
+        selection: TokenSelection | None = None,
     ) -> bool:
         """Cheap filters: no hard filter the snapshot and features decide has failed.
 
         Evaluated as SHADOW with the token unchecked and depth unmeasured, so only
-        mode-independent, request-free reasons can reject; a reject here is final.
+        mode-independent, request-free reasons can reject; a reject here is final. A token
+        already held, or an excluded theme, rejects here. With an enhanced source the token
+        volume waits for its reading (``enhanced_pending``) instead of the pool sums.
         """
 
         unmeasured = _snapshot_depth(market, "NOT_MEASURED")
@@ -318,6 +447,7 @@ class CandidatePipeline:
             context=self._context(TradingMode.SHADOW, correlation),
             estimated_price_impact=self._price_impact(market, unmeasured),
             depth=unmeasured,
+            selection=self._unread(selection),
         )
         return preliminary.status is not CandidateStatus.REJECT
 

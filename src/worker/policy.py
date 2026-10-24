@@ -22,6 +22,7 @@ from src.accounting.models import CostModel
 from src.domain.features import GuideFeatureRules, VolumeFeatureRules
 from src.domain.risk.models import RiskPolicy
 from src.domain.screening import (
+    DEFAULT_THEME_WORDS,
     GmgnScreeningRules,
     GuideScreeningRules,
     ScreeningPolicy,
@@ -122,6 +123,9 @@ class PipelinePolicy:
     conservative_depth_fraction: Decimal = Decimal("0.05")
     # Native SOL kept for fees and rent when the wallet's SOL funds a wSOL leg.
     wallet_native_reserve_lamports: int = 20_000_000
+    # G24: a cycle's candidates are ranked by their token's hourly volume and only this many
+    # are checked in depth (token risk, GMGN, quote); ``None`` checks every candidate.
+    deep_candidate_limit: int | None = None
 
     def __post_init__(self) -> None:
         versions = {
@@ -149,6 +153,8 @@ class PipelinePolicy:
             )
         if self.wallet_native_reserve_lamports < 0:
             raise ValueError("wallet_native_reserve_lamports must not be negative")
+        if self.deep_candidate_limit is not None and self.deep_candidate_limit < 1:
+            raise ValueError("deep_candidate_limit must be at least one")
 
     @property
     def ruleset_version(self) -> str:
@@ -220,7 +226,10 @@ class GuidePolicySettings(BaseModel):
     """Every tunable number of ``guide-v1``; the defaults are the spec 6.6 table.
 
     Author thresholds: market cap, token age, top-10 share, volume per minute (working and
-    overvolume), volume to liquidity, fee organicity and total fees. Pool age only
+    overvolume), volume to liquidity and total fees; the author's selection (spec 6.8,
+    G24): the hour's average volume per minute, total fees against the cap, the theme
+    words, snipers, revivals and the deep-check limit. ``minimum_fee_efficiency`` now only
+    feeds the Spot-on-ATH organicity of the strategy; screening no longer uses it. Pool age only
     guards history warm-up here: the guide trades tokens a few hours old, and token age
     has its own threshold. Price shock is widened to the deepest Bid-Ask range so the
     default strategy is invalidated by its range, not by the first 10% dip.
@@ -287,6 +296,17 @@ class GuidePolicySettings(BaseModel):
     entry_notional_quote: Decimal = Decimal("100")
     quote_base_units_per_unit: Decimal = Decimal(1_000_000)
     max_slippage_bps: int = 100
+    # Selection as the author does it (spec 6.8, G24). Sustained: the token's hourly
+    # average per minute; the score's "good" rate (guide: 20k+ a minute); artificial volume:
+    # total fees below 30 SOL x cap / reference cap at a tenfold hourly pool turnover.
+    minimum_hourly_volume_per_minute: Decimal = Decimal("14000")
+    target_volume_per_minute: Decimal = Decimal("20000")
+    total_fees_reference_market_cap: Decimal = Decimal("500000")
+    maximum_hourly_turnover: Decimal = Decimal("10")
+    excluded_theme_words: tuple[str, ...] = DEFAULT_THEME_WORDS
+    maximum_sniper_count: int = 20
+    revived_token_age: timedelta = timedelta(days=60)
+    maximum_deep_candidates: int = 50
 
     @field_validator("*", mode="before")
     @classmethod
@@ -323,6 +343,7 @@ def guide_policy(
             maximum_phishing_share=values.maximum_phishing_share,
             maximum_top10_holder_share=values.maximum_gmgn_top10_holder_share,
             required_for_live=gmgn_required_for_live,
+            maximum_sniper_count=values.maximum_sniper_count,
         )
     )
     return PipelinePolicy(
@@ -371,6 +392,12 @@ def guide_policy(
                 minimum_fee_efficiency=values.minimum_fee_efficiency,
                 minimum_total_fees_sol=values.minimum_total_fees_sol,
                 gmgn=gmgn,
+                minimum_hourly_volume_per_minute=values.minimum_hourly_volume_per_minute,
+                target_volume_per_minute=values.target_volume_per_minute,
+                total_fees_reference_market_cap=values.total_fees_reference_market_cap,
+                maximum_hourly_turnover=values.maximum_hourly_turnover,
+                excluded_theme_words=values.excluded_theme_words,
+                revived_token_age=values.revived_token_age,
             ),
             volume_integrity=VolumeIntegrityMode.AVAILABLE_SIGNALS,
             maximum_burst_spread=values.maximum_burst_spread,
@@ -404,6 +431,7 @@ def guide_policy(
         quote_base_units_per_unit=values.quote_base_units_per_unit,
         max_slippage_bps=values.max_slippage_bps,
         kill_switch_policy=kill_switch_policy,
+        deep_candidate_limit=values.maximum_deep_candidates,
     )
 
 

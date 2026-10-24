@@ -92,7 +92,10 @@ def test_organic_working_volume_passes_and_records_every_guide_threshold() -> No
     assert recorded["volume_per_minute"] == ("20000", "14000")
     assert recorded["market_cap"] == ("2000000", "500000")
     assert recorded["market_cap_preferred"][0] == "true"
-    assert recorded["fee_efficiency"][1] == "0.5"
+    # G24: the hour's average must be sustained too (900 000 / 60); organicity by base fee
+    # is information only (>= 1 by construction in DLMM), so it carries no threshold.
+    assert recorded["hourly_volume_per_minute"] == ("15000", "14000")
+    assert recorded["fee_efficiency"][1] is None
     assert recorded["total_fees_sol"] == ("45", "30")
     assert recorded["token_age_seconds"] == ("21600", "7200")  # 6h pool age bounds the token
 
@@ -108,7 +111,8 @@ def test_overvolume_is_distinguished_from_working_volume() -> None:
 
 
 def test_savash_inorganic_volume_is_rejected_as_artificial_in_every_mode() -> None:
-    """980k/h on 87k liquidity with ~900 of fees where a 1% base fee implies ~9 800."""
+    """980k/h on 87k liquidity (11x) with total fees of 45 SOL where a 2M cap needs 120 (G24:
+    the author's "fees too low for the cap"; the base-fee organicity is only recorded)."""
 
     history = guide_history(
         short="81000", hour="980000", hour_fees="900", tvl="87000", base_fee_rate="0.01"
@@ -210,13 +214,20 @@ def test_unavailable_guide_signal_is_flagged_in_shadow_and_closes_approval_and_l
 
     assert shadow.status is CandidateStatus.UNKNOWN
     assert shadow.reasons == (RejectionCode.GUIDE_SIGNAL_UNKNOWN,)
-    assert {"market_cap", "fee_efficiency"} <= set(shadow.missing_signals)
+    assert "market_cap" in shadow.missing_signals
+    # G24: organicity by base fee no longer decides anything, so its absence is no gap.
+    assert "fee_efficiency" not in shadow.missing_signals
     assert approval.status is CandidateStatus.REJECT
     assert live.status is CandidateStatus.REJECT
     assert RejectionCode.GUIDE_SIGNAL_UNKNOWN in live.reasons
     # Absent total fees add their flag but never rescue a missing required signal.
     assert without_fees.status is CandidateStatus.UNKNOWN
-    assert without_fees.flags == (DecisionFlag.TOTAL_FEES_UNAVAILABLE,)
+    assert DecisionFlag.TOTAL_FEES_UNAVAILABLE in without_fees.flags
+
+
+# G24 flags every fixture decision carries: no GMGN, so the token volume is the DLMM pool's
+# own, and the fixture's 5m window spikes over its calm baseline.
+SELECTION_FLAGS = {DecisionFlag.TOKEN_VOLUME_POOL_ONLY, DecisionFlag.VOLUME_SPIKE}
 
 
 def test_absent_total_fees_pass_with_a_flag_instead_of_unknown() -> None:
@@ -232,10 +243,10 @@ def test_absent_total_fees_pass_with_a_flag_instead_of_unknown() -> None:
     for decision in decisions.values():
         assert decision.status is CandidateStatus.ACCEPT
         assert decision.reasons == ()
-        assert decision.flags == (DecisionFlag.TOTAL_FEES_UNAVAILABLE,)
+        assert set(decision.flags) == {DecisionFlag.TOTAL_FEES_UNAVAILABLE, *SELECTION_FLAGS}
         assert "total_fees_sol" not in decision.missing_signals
         assert evidence(decision)["total_fees_sol"] == ("UNAVAILABLE", "30")
-    assert evaluate(guide_history()).flags == ()
+    assert set(evaluate(guide_history()).flags) == SELECTION_FLAGS
 
 
 def test_reported_total_fees_below_30_sol_reject_at_a_qualifying_market_cap() -> None:
@@ -243,7 +254,7 @@ def test_reported_total_fees_below_30_sol_reject_at_a_qualifying_market_cap() ->
 
     assert decision.status is CandidateStatus.REJECT
     assert decision.reasons == (RejectionCode.TOTAL_FEES_BELOW_THRESHOLD,)
-    assert decision.flags == ()
+    assert set(decision.flags) == SELECTION_FLAGS
 
 
 def test_same_inputs_change_outcome_only_through_the_ruleset_version() -> None:

@@ -164,6 +164,8 @@ class VolumeFeatureEngine:
             local_high_price=guide.local_high_price,
             all_time_high_price=guide.all_time_high_price,
             volume_window_source=guide.volume_window_source,
+            hourly_volume_per_minute=guide.hourly_volume_per_minute,
+            hourly_turnover=guide.hourly_turnover,
             short_window_origin=short.origin if short is not None else None,
             baseline_origin=baseline_origin,
             short_burst_spread=_burst_spread(
@@ -278,6 +280,8 @@ class _GuideValues:
     local_high_price: Decimal | None = None
     all_time_high_price: Decimal | None = None
     volume_window_source: str | None = None
+    hourly_volume_per_minute: Decimal | None = None
+    hourly_turnover: Decimal | None = None
 
 
 def _guide_features(
@@ -342,6 +346,7 @@ def _guide_features(
         )
     )
     all_time_high = max(item.price for item in prior) if covers_pool_life else None
+    hour = latest.windows.get(rules.sustained_window)
     return _GuideValues(
         volume_per_minute=per_minute,
         volume_to_liquidity=to_liquidity,
@@ -349,6 +354,12 @@ def _guide_features(
         local_high_price=local_high,
         all_time_high_price=all_time_high,
         volume_window_source=window if per_minute is not None else None,
+        hourly_volume_per_minute=(
+            hour.volume / Decimal(WINDOW_MINUTES[rules.sustained_window])
+            if hour is not None
+            else None
+        ),
+        hourly_turnover=hour.volume / latest.tvl if hour is not None and latest.tvl > 0 else None,
     )
 
 
