@@ -1,0 +1,36 @@
+# F2 — Ремонт ветки: исполнение, алерты и kill switch
+
+**Требования:** R16, R27i, R30i, G02, G03, D02
+**Зависит от:** —
+**Зона:** `src/worker/runtime.py` · `src/worker/execution.py` · `src/worker/positions.py` · `src/execution/` · `src/recovery/` · `src/modes/` · `src/api/approvals.py` · `src/api/schemas.py` · `src/web/templates/dashboard.html` и `src/web/templates/mode.html` (только аварийная форма) · `migrations/` (миграция 0003 — колонка политики kill switch) · `src/persistence/mode_repository.py` · `src/persistence/models.py` (только запись состояния режима) · `tests/persistence/test_postgres_infrastructure.py` · `tests/persistence/test_repository_contracts.py` · `tests/worker/harness.py` · `tests/worker/test_gateway_execution.py` · `tests/worker/test_gateway_runtime.py` · `tests/worker/test_live_entries.py` · `tests/worker/test_live_runtime.py` · `tests/worker/test_positions.py` · `tests/worker/test_restart.py` · `tests/worker/test_daily_evidence.py` · `tests/worker/test_scheduler.py` · `tests/worker/test_token_risk_coverage.py` · новые `tests/worker/test_f2_*.py` · `tests/execution/` · `tests/modes/` · `tests/recovery/` · `tests/api/` (подтверждения и kill switch)
+**Волна:** 11
+**Ревью:** да — ремонт ветки
+**Модель:** сильная
+
+## Что должно заработать
+
+Денежный путь не делает двойных входов, не тратит попытки выхода на неотвеченные подтверждения и не освобождает ёмкость при неизвестном исходе. Kill switch делает то, что выбрал оператор. Алерты, которые worker сам разрешил, закрываются, и не держат допуск в следующий режим навсегда. Каждая fail-closed ветка денежного пути доказана тестом.
+
+## Из брифа, дословно
+
+> «условно торговлю»
+>
+> «затем сделки с ручным подтверждением»
+>
+> «после успешной проверки — автоматический live-режим»
+
+## Разделы спецификации
+
+§5.4, §6.5, §7 (7.1–7.3), §8.5 (поправки D02, D06, D08); границы `application.execution`, `application.pipeline`, `domain.risk` в `interfaces.md`. Пробы ревьюера, красные на HEAD: `C:\Users\Maks\AppData\Local\Temp\claude\C--Users-Maks\e031e0e7-d09d-43a0-9bde-5d6517e42951\scratchpad\review_b\`.
+
+## Критерии приёмки (находки ревью ветки, дословно)
+
+- [ ] B1 · Craft · src/worker/runtime.py:459-464 · новые входы не пускаются только в пулы с открытой позицией. Пул, где вход ещё в работе (план PENDING/EXECUTING: ждёт одобрения или исход UNKNOWN), снова проходит отбор и получает второй план. Проба в APPROVAL: второй цикл кандидатов дал 2 плана EXECUTING и 2 симуляции OPEN на один пул; оператор может одобрить оба, и пул займёт два слота из трёх · условие: пока у пула есть план PENDING/EXECUTING, новый план и симуляция OPEN для него не создаются; тест: второй цикл, пока первый вход ждёт одобрения, даёт один план и одну симуляцию.
+- [ ] B2 · Spec · src/worker/execution.py:1516-1524, 1549-1554 · выход в APPROVAL, который оператор не одобрил до истечения (ничего не отправлено), всё равно тратит одну из 5 попыток. Проба: 5 неотвеченных выходов (~10-15 мин) — и позиция навсегда EXHAUSTED, бот её больше не выводит, в том числе после рестарта · условие: попытка, истёкшая в AWAITING_APPROVAL без одобрения, не входит в POSITION_ACTION_ATTEMPTS; тест: 6 истёкших неодобренных выходов, затем одобрение седьмого → CLOSE отправлен.
+- [ ] B3 · Spec · src/worker/positions.py:252-257, src/worker/execution.py:1525-1530, src/execution/service.py:652-655 · политику kill switch, выбранную при активации, никто не читает: три места берут PipelinePolicy.kill_switch_policy, а её нельзя задать из env (всегда HOLD_AND_ALERT). При ORDERLY_EXIT монитор считает KILL_SWITCH_ACTIVE только поводом для алерта, поэтому позиция без другой причины выхода не закрывается (§7.3; обе пробы красные) (C020, C092, C125) · условие: политика из activate_kill_switch хранится в состоянии режима, и все три места читают её; при ORDERLY_EXIT каждая открытая позиция получает CLOSE со свежей симуляцией без других причин, при HOLD_AND_ALERT — ни одна; тест: активация с ORDERLY_EXIT при конфиге по умолчанию → CLOSE.
+- [ ] C7 · Spec §7.3 · src/web/templates/dashboard.html:97-99, mode.html:87-89, src/api/schemas.py:509 · аварийная форма (в двух местах) и API предлагают «упорядоченный выход», а worker и экран подтверждений всегда применяют HOLD_AND_ALERT из правил. В аварии оператор выбирает действие, которого не будет · условие: выбранная политика применяется worker'ом и экраном подтверждений (вариант «не принимать 422» отброшен — закрывается вместе с B3); экран подтверждений (src/api/approvals.py:343) читает ту же политику из состояния режима; тест.
+- [ ] B4 · Craft · src/worker/positions.py:258-264 · критический алерт EXIT_REQUIRES_EXECUTION_GATEWAY поднимается на каждый EXIT не-SHADOW позиции даже при подключённом gateway и остаётся открытым после успешного выхода (проба). Любой открытый алерт блокирует повышение режима (src/modes/repository.py:223), значит каждый выход в APPROVAL/LIVE его блокирует (C035, C041) · условие: при подключённом gateway этот алерт не поднимается; тест: выход через gateway → 0 открытых алертов.
+- [ ] B5 · Spec · src/recovery/service.py:191-194 (тот же приём: src/worker/execution.py:1634, 1686) · запись UNKNOWN без подписи recovery сразу отдаёт оператору (EXECUTION_RECOVERY_REQUIRED) и не сверяет её через lookup по command_id, хотя service.reconcile это умеет (§5.4 R16.3: «сначала сверяется с сетью»). Проба: таймаут submit, следующий цикл подтвердил вход, алерт остался открытым навсегда. POSITION_ACTION_FAILED и EXIT_GATEWAY_UNAVAILABLE тоже не закрываются после последующего успеха · условие: recovery сначала вызывает reconcile и эскалирует только то, что осталось неизвестным; алерт о состоянии, которое worker потом снял сам, worker закрывает (resolve_alert с системной причиной); тест: таймаут submit → подтверждение → 0 открытых алертов.
+- [ ] B6 · Spec · src/execution/http_gateway.py:111-112 · любой 4xx, включая 409 idempotency_conflict и approval_already_used, становится GatewayRejected → FAILED → fail_entry освобождает ёмкость. А эти коды значат, что у executor уже есть отправка под этим ключом или approval (engine.ts:543, 677, 778) (C043) · условие: эти два кода от POST /v1/commands дают ExecutionOutcomeUnknown: запись UNKNOWN, план остаётся EXECUTING; тест в test_http_gateway и на уровне worker.
+- [ ] B8 · Craft · src/execution/service.py:860-861; src/worker/execution.py:779-780, 1133-1142, 1337-1346 · четыре fail-closed ветки денежного пути без тестов: вход без измеренного impact (PRICE_IMPACT_UNAVAILABLE), PLAN_NOT_EXECUTING, ENTRY_FILL_UNTRACKED, ENTRY_POSITION_UNKNOWN (C026, C086, C087) · условие: у каждой ветки есть тест, который краснеет, если ветку убрать (нет submit, верный статус плана, есть алерт).
+- [ ] C9 · Craft (повтор в 3+ местах) · src/api/approvals.py:81,369-373 против src/execution/service.py:46,854-864 (третье место — worker/execution.py:823, C076) · C090: правило «impact входа против лимита» продублировано с разными кодами. Карточка подтверждения пишет PRICE_IMPACT_UNMEASURED / PRICE_IMPACT_ABOVE_LIMIT, а alert и результат входа — PRICE_IMPACT_UNAVAILABLE / SLIPPAGE_BREACH · условие: экран подтверждений вызывает одно определение из execution и показывает те же коды; тест: preview с null impact показывает PRICE_IMPACT_UNAVAILABLE.
