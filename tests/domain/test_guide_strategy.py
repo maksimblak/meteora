@@ -133,8 +133,9 @@ def test_spot_on_all_time_high_breakout_with_organic_working_volume() -> None:
 
     assert result.strategy is StrategyKind.SPOT
     assert result.selection_reason is StrategySelectionReason.SPOT_ATH_BREAKOUT
-    assert result.lower_bin_offset == -result.upper_bin_offset
-    assert result.exit_policy.maximum_holding_period == timedelta(hours=1)
+    # T19: one-sided like the author's - nothing above the price.
+    assert result.upper_bin_offset == 0 and result.lower_bin_offset < 0
+    assert result.exit_policy.maximum_holding_period == timedelta(hours=3)
     assert recorded(result)["all_time_high_price"] == "1.2"
 
 
@@ -192,16 +193,16 @@ def test_same_candidate_is_spot_under_shadow_hypothesis_and_bid_ask_under_guide(
     assert guided.selection_reason is StrategySelectionReason.BID_ASK_FROM_LOCAL_HIGH
 
 
-def test_the_bid_only_plan_carries_its_upside_exit_and_spot_keeps_the_plain_breach() -> None:
+def test_both_bid_only_plans_carry_the_upside_exit() -> None:
     bid_ask = plan(guide_history(bin_step=250))
+    # T19: the one-sided Spot is a bid-only range too.
     spot = plan(guide_history(short="600000", tvl="1000000"))
 
     rules = GuideStrategyRules()
-    assert bid_ask.exit_policy.upside_breach_grace == rules.bid_only_upside_grace
-    assert bid_ask.exit_policy.upside_breach_grace == timedelta(minutes=30)
-    assert bid_ask.exit_policy.upside_breach_fraction == rules.bid_only_upside_exit
-    assert spot.exit_policy.upside_breach_grace is None
-    assert spot.exit_policy.upside_breach_fraction is None
+    for result in (bid_ask, spot):
+        assert result.exit_policy.upside_breach_grace == rules.bid_only_upside_grace
+        assert result.exit_policy.upside_breach_grace == timedelta(minutes=30)
+        assert result.exit_policy.upside_breach_fraction == rules.bid_only_upside_exit
 
 
 def test_bid_ask_born_at_its_upper_edge_is_held_until_price_nears_the_lower_edge() -> None:

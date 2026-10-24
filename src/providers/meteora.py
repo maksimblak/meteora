@@ -283,6 +283,25 @@ class MeteoraDataApiProvider:
         except ValidationError as error:
             raise ProviderPayloadError("Meteora returned an invalid snapshot") from error
 
+    async def current_snapshot(self, pool: PoolRef) -> PoolSnapshot:
+        """``pool`` as ``/pools/{address}`` serves it now, observed on arrival (spec 6.8).
+
+        The open positions' frequent read (every 30 s by default): one request under the
+        same rate limit as the sweep, without the LB pair read (a position needs no active
+        bin), and outside the sweep - the pools a sweep in progress listed stay as they are.
+        The short window is the caller's to derive from its previous snapshot (F1).
+        """
+
+        try:
+            quote = await self._fetch_quote(pool, anchor=False)
+        except ProviderPayloadError as error:
+            self._degrade("pool_payload", error)
+            raise
+        try:
+            return self._snapshot(quote, quote.source_at)
+        except ValidationError as error:
+            raise ProviderPayloadError("Meteora returned an invalid snapshot") from error
+
     async def volume_history(
         self, pool: PoolRef, *, start: datetime, end: datetime
     ) -> tuple[VolumeBucket, ...]:
@@ -478,7 +497,7 @@ class MeteoraDataApiProvider:
         payload = await self._get(self._pools_path, params)
         return _RawPage(payload, self._clock.now())
 
-    async def _fetch_quote(self, pool: PoolRef) -> _PoolQuote:
+    async def _fetch_quote(self, pool: PoolRef, *, anchor: bool = True) -> _PoolQuote:
         payload = await self._get(f"{self._pools_path}/{pool.address.root}", None)
         arrived_at = self._clock.now()
         try:
@@ -487,6 +506,8 @@ class MeteoraDataApiProvider:
             raise ProviderPayloadError(f"Meteora pool rejected: {rejection.reason}") from None
         if quote.pool != pool:
             raise ProviderPayloadError("Meteora pool identity differs from the requested pool")
+        if not anchor:
+            return quote
         (anchored,) = await self._anchor([quote])
         return anchored
 

@@ -15,6 +15,9 @@ x-policy-environment: &policy-environment
   RULESET_OVERRIDES_FILE: ${RULESET_OVERRIDES_FILE:-}
   WORKER_UNIVERSE_INTERVAL_SECONDS: ${WORKER_UNIVERSE_INTERVAL_SECONDS:-}
   GMGN_REQUIRED_FOR_LIVE: ${GMGN_REQUIRED_FOR_LIVE:-}
+  # The executor's priority fee ceiling per transaction; SHADOW books it on every entry,
+  # exit and sale (the money executor below reads the same variable).
+  PRIORITY_FEE_MAX_LAMPORTS: ${PRIORITY_FEE_MAX_LAMPORTS:-}
 
 x-python-service: &python-service
   build:
@@ -132,6 +135,15 @@ services:
       GMGN_URL: ${GMGN_URL:-}
       GMGN_TIMEOUT_SECONDS: ${GMGN_TIMEOUT_SECONDS:-}
       GMGN_STALE_AFTER_SECONDS: ${GMGN_STALE_AFTER_SECONDS:-}
+      # Open positions reread their pool from the Data API this often (empty = 30 s).
+      WORKER_POSITION_SNAPSHOT_SECONDS: ${WORKER_POSITION_SNAPSHOT_SECONDS:-}
+      # The sale of the base token an exit returned (G22); empty = the defaults.
+      SWAP_AFTER_EXIT: ${SWAP_AFTER_EXIT:-}
+      SWAP_MAX_PRICE_IMPACT_BPS: ${SWAP_MAX_PRICE_IMPACT_BPS:-}
+      SWAP_SLIPPAGE_BPS: ${SWAP_SLIPPAGE_BPS:-}
+      SWAP_AFTER_EXIT_MAX_SPLITS: ${SWAP_AFTER_EXIT_MAX_SPLITS:-}
+      SWAP_AFTER_EXIT_ATTEMPTS: ${SWAP_AFTER_EXIT_ATTEMPTS:-}
+      SWAP_SETTLEMENT_TIMEOUT_SECONDS: ${SWAP_SETTLEMENT_TIMEOUT_SECONDS:-}
     expose:
       - "9100"
     depends_on:
@@ -203,6 +215,12 @@ services:
       context: .
       dockerfile: Dockerfile.executor
     logging: *logging
+    environment:
+      # Priority fee of every transaction (No 49); empty = the defaults: percentile 75 of
+      # the pool's recent fees, at least 1000 micro-lamports a CU, at most 0.015 SOL.
+      PRIORITY_FEE_MAX_LAMPORTS: ${PRIORITY_FEE_MAX_LAMPORTS:-}
+      PRIORITY_FEE_PERCENTILE: ${PRIORITY_FEE_PERCENTILE:-}
+      PRIORITY_FEE_MIN_MICRO_LAMPORTS: ${PRIORITY_FEE_MIN_MICRO_LAMPORTS:-}
     expose:
       - "3000"
 

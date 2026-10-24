@@ -27,6 +27,9 @@ class RiskReason(StrEnum):
     LIQUIDITY_CAP = "LIQUIDITY_CAP"
     BALANCE_CAP = "BALANCE_CAP"
     SIZED_PLAN_INVARIANT_BREACH = "SIZED_PLAN_INVARIANT_BREACH"
+    # A plan its strategy refused (``StrategyPlan.blocked_by``, spec 6.8) gets no size.
+    NOT_NEAR_LOCAL_HIGH = "NOT_NEAR_LOCAL_HIGH"
+    RANGE_TOO_NARROW = "RANGE_TOO_NARROW"
 
 
 class RiskDecisionStatus(StrEnum):
@@ -152,6 +155,8 @@ class SizedPlan(BaseModel):
 
     @model_validator(mode="after")
     def validate_sized_plan(self) -> "SizedPlan":
+        if self.plan.blocked_by:
+            raise ValueError("a plan its strategy refused cannot be sized")
         if self.size_base_units <= 0:
             raise ValueError("sized plan must have positive size")
         if self.size_base_units > min(self.caps.model_dump().values()):

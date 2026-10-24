@@ -17,12 +17,21 @@ from src.domain.strategy.models import (
     PositionReason,
     PositionSignals,
     PositionState,
+    StrategyFlag,
     StrategyKind,
     StrategyPlan,
     StrategyPolicy,
+    StrategyRejection,
     StrategySelectionReason,
 )
-from src.market.models import DataQuality, Freshness, PoolSnapshot, RiskSignal
+from src.market.models import (
+    DataQuality,
+    DeveloperStatus,
+    EnhancedTokenSignals,
+    Freshness,
+    PoolSnapshot,
+    RiskSignal,
+)
 
 if TYPE_CHECKING:
     from src.domain.risk.models import PortfolioState, RiskState
@@ -140,6 +149,15 @@ class PositionMonitor:
             exit_reasons.append(PositionReason.RANGE_BREACH)
         if risk.as_of - position.opened_at >= position.maximum_holding_period:
             exit_reasons.append(PositionReason.MAX_HOLDING_PERIOD)
+        target = position.take_profit_fraction
+        if (
+            target is not None
+            and signals.net_pnl_fraction is not None
+            and signals.net_pnl_fraction >= target
+        ):
+            exit_reasons.append(PositionReason.TAKE_PROFIT)
+        if signals.developer_sold:
+            exit_reasons.append(PositionReason.DEV_SOLD)
         # The short window is reported or derived from the counters (D07); the decay ratio
         # is the position plan's own when it carries one (an overvolume Spot: 1).
         short = market.windows.get("5m")
@@ -211,6 +229,32 @@ class PositionMonitor:
             reasons=(),
             position_id=position.position_id,
         )
+
+
+def developer_sold(entry: EnhancedTokenSignals | None, current: EnhancedTokenSignals) -> bool:
+    """The developer sold since the entry, by a fresh GMGN reading (spec 6.8, No 10).
+
+    Sold: the status is "sold/closed" now and was not at the entry (an unknown entry status
+    counts as not sold), or the developer's share is less than half of the share at the
+    entry. A stale or unavailable reading decides nothing.
+    """
+
+    if current.freshness is not Freshness.FRESH:
+        return False
+    entry_status = entry.developer_status if entry is not None else None
+    if (
+        current.developer_status is DeveloperStatus.SOLD
+        and entry_status is not DeveloperStatus.SOLD
+    ):
+        return True
+    entry_share = entry.developer_share if entry is not None else None
+    share = current.developer_share
+    return (
+        entry_share is not None
+        and entry_share > 0
+        and share is not None
+        and share * 2 < entry_share
+    )
 
 
 def _upper_border(position: PositionState, market: PoolSnapshot) -> Decimal:
@@ -288,16 +332,22 @@ def _guide_plan(
     policy: StrategyPolicy,
     rules: GuideStrategyRules,
 ) -> StrategyPlan:
-    """guide-v1 (spec 6.6): Bid-Ask from the local high unless a Spot case is proven."""
+    """guide-v1 (spec 6.6, 6.8): Bid-Ask from the local high unless a Spot case is proven.
+
+    Both strategies are one-sided like the author's (D08, No 27): the range ends at the
+    active bin, so the entry is the quote token only - the executor never swaps and the
+    wallet holds no base token; Bid-Ask and Spot differ by the SDK's distribution.
+    """
 
     features = candidate.features
     step = Decimal(1) + Decimal(market.bin_step) / Decimal(10_000)
     per_minute = features.volume_per_minute
     efficiency = features.fee_efficiency
-    ath = features.all_time_high_price
     high = features.local_high_price
     organic = efficiency is not None and efficiency >= rules.spot_minimum_fee_efficiency
-    breakout = ath is not None and market.price > ath * (Decimal(1) + rules.ath_breakout_margin)
+    breakout, ath_evidence, flags = _ath_breakout(candidate, market, rules)
+    cap = _recorded_decimal(candidate, "market_cap")
+    high_cap = cap is not None and cap >= rules.spot_ath_minimum_market_cap
     evidence = [
         EvidenceItem(
             name="volume_per_minute",
@@ -312,10 +362,11 @@ def _guide_plan(
             value=_text(efficiency),
             threshold=str(rules.spot_minimum_fee_efficiency),
         ),
+        *ath_evidence,
         EvidenceItem(
-            name="all_time_high_price",
-            value=_text(ath),
-            threshold=f"breakout_margin={rules.ath_breakout_margin}",
+            name="spot_ath_market_cap",
+            value=_text(cap),
+            threshold=str(rules.spot_ath_minimum_market_cap),
         ),
         EvidenceItem(name="price", value=str(market.price)),
         EvidenceItem(name="local_high_price", value=_text(high)),
@@ -326,28 +377,31 @@ def _guide_plan(
     elif (
         organic
         and breakout
+        and high_cap
         and per_minute is not None
         and (per_minute >= rules.spot_minimum_volume_per_minute)
     ):
         spot_reason = StrategySelectionReason.SPOT_ATH_BREAKOUT
     volatility_loss = _volatility_loss(candidate, policy)
+    upside_exit = (rules.bid_only_upside_grace, rules.bid_only_upside_exit)
 
     if spot_reason is not None:
         overvolume = spot_reason is StrategySelectionReason.SPOT_OVERVOLUME
         horizon = (
             rules.overvolume_maximum_holding_period if overvolume else rules.spot_holding_horizon
         )
-        side_cap = min(policy.maximum_bins, (rules.maximum_position_bins - 1) // 2)
-        span = _bin_span(candidate, market, policy, horizon, side_cap)
-        depth = Decimal(1) - step ** (-span)
-        evidence.append(EvidenceItem(name="range_depth", value=str(depth)))
+        # Evenly from the price down to ``spot_depth`` (the author: "spot at -60").
+        wanted = _bins_for_depth(step, rules.spot_depth)
+        below = min(wanted, rules.maximum_position_bins - 1)
+        depth = Decimal(1) - step ** (-below)
+        evidence.extend(_range_evidence(depth, str(rules.spot_depth), below < wanted, rules))
         return _assemble(
             candidate,
             market,
             policy,
             strategy=StrategyKind.SPOT,
             direction=Direction.NEUTRAL,
-            bounds=(-span, span),
+            bounds=(-below, 0),
             horizon=horizon,
             loss_fraction=min(max(volatility_loss, depth), Decimal(1)),
             volume_decay_ratio=(
@@ -355,29 +409,39 @@ def _guide_plan(
             ),
             reason=spot_reason,
             evidence=tuple(evidence),
+            upside_exit=upside_exit,
+            take_profit=(
+                rules.overvolume_take_profit if overvolume else rules.spot_ath_take_profit
+            ),
+            flags=flags,
         )
 
-    # One-sided bid from the price down (D08): the range ends at the active bin, so the entry
-    # is the quote token only - the executor never swaps and the wallet holds no base token.
     # Bins up to a higher local high would need base liquidity: only their distance is kept.
     target = _bins_for_depth(step, rules.bid_ask_target_depth, rules.bid_ask_maximum_depth)
     below = min(target, rules.maximum_position_bins - 1)
     to_high = 0 if high is None or high <= market.price else _bins_between(step, market.price, high)
     depth = Decimal(1) - step ** (-below)
+    blocked: list[StrategyRejection] = []
+    if depth < rules.bid_ask_minimum_depth:
+        blocked.append(StrategyRejection.RANGE_TOO_NARROW)
+    # "From the highs" (No 31): an unknown high proves nothing, so it refuses too.
+    near_high = high is not None and market.price >= high * rules.bid_ask_local_high_fraction
+    if not near_high:
+        blocked.append(StrategyRejection.NOT_NEAR_LOCAL_HIGH)
     evidence.extend(
         (
-            EvidenceItem(
-                name="range_depth",
-                value=str(depth),
-                threshold=f"{rules.bid_ask_minimum_depth}..{rules.bid_ask_maximum_depth}",
-            ),
-            EvidenceItem(
-                name="range_limited_by_bins",
-                value=str(below < target).lower(),
-                threshold=str(rules.maximum_position_bins),
+            *_range_evidence(
+                depth,
+                f"{rules.bid_ask_minimum_depth}..{rules.bid_ask_maximum_depth}",
+                below < target,
+                rules,
             ),
             EvidenceItem(name="bins_to_local_high", value=str(to_high)),
-            EvidenceItem(name="range_side", value="BID_ONLY"),
+            EvidenceItem(
+                name="price_to_local_high",
+                value="UNKNOWN" if high is None or high <= 0 else str(market.price / high),
+                threshold=str(rules.bid_ask_local_high_fraction),
+            ),
         )
     )
     return _assemble(
@@ -391,20 +455,95 @@ def _guide_plan(
         # Conservative: all capital converted at the entry price, marked at the lower edge.
         loss_fraction=min(max(volatility_loss, depth), Decimal(1)),
         volume_decay_ratio=policy.volume_decay_ratio,
-        reason=StrategySelectionReason.BID_ASK_FROM_LOCAL_HIGH,
+        reason=StrategySelectionReason.BID_ASK_FROM_LOCAL_HIGH if near_high else None,
         evidence=tuple(evidence),
-        upside_exit=(rules.bid_only_upside_grace, rules.bid_only_upside_exit),
+        upside_exit=upside_exit,
+        take_profit=rules.bid_ask_take_profit,
+        blocked_by=tuple(blocked),
+        flags=flags,
     )
 
 
-def _bins_for_depth(step: Decimal, target: Decimal, maximum: Decimal) -> int:
+def _ath_breakout(
+    candidate: CandidateDecision, market: PoolSnapshot, rules: GuideStrategyRules
+) -> tuple[bool, list[EvidenceItem], tuple[StrategyFlag, ...]]:
+    """Whether the price breaks the all-time high, the evidence, and the plan's flags.
+
+    The token's ATH from GMGN (``gmgn_token_ath_price``, USD, G24) when the decision has it:
+    the pool price in USD (by the quote token's USD price) at or above it - GMGN's ATH
+    includes the latest trades, so the breakout is the price standing at it. Otherwise the
+    pool's own ATH (proven by an unbroken history) and the flag ``ATH_POOL_ONLY``.
+    """
+
+    margin = Decimal(1) + rules.ath_breakout_margin
+    ath = candidate.features.all_time_high_price
+    pool_ath = EvidenceItem(
+        name="all_time_high_price",
+        value=_text(ath),
+        threshold=f"breakout_margin={rules.ath_breakout_margin}",
+    )
+    token_ath = _recorded_decimal(candidate, "gmgn_token_ath_price")
+    if token_ath is not None:
+        quote_usd = market.quote_price_usd
+        price_usd = market.price * quote_usd if quote_usd is not None and quote_usd > 0 else None
+        breakout = price_usd is not None and price_usd >= token_ath * margin
+        return (
+            breakout,
+            [
+                EvidenceItem(name="ath_source", value="GMGN_TOKEN"),
+                EvidenceItem(
+                    name="token_ath_price_usd",
+                    value=str(token_ath),
+                    threshold=f"breakout_margin={rules.ath_breakout_margin}",
+                ),
+                EvidenceItem(name="token_price_usd", value=_text(price_usd)),
+                pool_ath,
+            ],
+            (),
+        )
+    breakout = ath is not None and market.price > ath * margin
+    return (
+        breakout,
+        [EvidenceItem(name="ath_source", value=StrategyFlag.ATH_POOL_ONLY.value), pool_ath],
+        (StrategyFlag.ATH_POOL_ONLY,),
+    )
+
+
+def _recorded_decimal(candidate: CandidateDecision, name: str) -> Decimal | None:
+    """A number the decision recorded as evidence; ``None`` when absent or not a number."""
+
+    for item in candidate.evidence:
+        if item.name == name:
+            try:
+                value = Decimal(item.value)
+            except ArithmeticError:
+                return None
+            return value if value.is_finite() else None
+    return None
+
+
+def _range_evidence(
+    depth: Decimal, threshold: str, limited: bool, rules: GuideStrategyRules
+) -> tuple[EvidenceItem, ...]:
+    return (
+        EvidenceItem(name="range_depth", value=str(depth), threshold=threshold),
+        EvidenceItem(
+            name="range_limited_by_bins",
+            value=str(limited).lower(),
+            threshold=str(rules.maximum_position_bins),
+        ),
+        EvidenceItem(name="range_side", value="BID_ONLY"),
+    )
+
+
+def _bins_for_depth(step: Decimal, target: Decimal, maximum: Decimal | None = None) -> int:
     """Fewest bins whose lower edge is at least ``target`` below price, not past ``maximum``."""
 
     raw = ((Decimal(1) / (Decimal(1) - target)).ln() / step.ln()).to_integral_value(
         rounding=ROUND_CEILING
     )
     bins = max(int(raw), 1)
-    if bins > 1 and Decimal(1) - step ** (-bins) > maximum:
+    if maximum is not None and bins > 1 and Decimal(1) - step ** (-bins) > maximum:
         bins -= 1
     return bins
 
@@ -429,9 +568,12 @@ def _assemble(
     horizon: timedelta,
     loss_fraction: Decimal,
     volume_decay_ratio: Decimal,
-    reason: StrategySelectionReason,
+    reason: StrategySelectionReason | None,
     evidence: tuple[EvidenceItem, ...],
     upside_exit: tuple[timedelta, Decimal] | None = None,
+    take_profit: Decimal | None = None,
+    blocked_by: tuple[StrategyRejection, ...] = (),
+    flags: tuple[StrategyFlag, ...] = (),
 ) -> StrategyPlan:
     expires_at = market.observed_at + policy.plan_ttl
     grace, fraction = upside_exit if upside_exit is not None else (None, None)
@@ -451,6 +593,7 @@ def _assemble(
             maximum_holding_period=horizon,
             upside_breach_grace=grace,
             upside_breach_fraction=fraction,
+            take_profit_fraction=take_profit,
         ),
         created_at=market.observed_at,
         expires_at=expires_at,
@@ -461,6 +604,8 @@ def _assemble(
         correlation_id=candidate.correlation_id,
         selection_reason=reason,
         selection_evidence=evidence,
+        blocked_by=blocked_by,
+        flags=flags,
     )
 
 

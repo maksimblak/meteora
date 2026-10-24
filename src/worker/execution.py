@@ -27,7 +27,6 @@ quote - only once its sale has ended, sold or explicitly left unsold under an al
 """
 
 import hashlib
-import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -932,15 +931,25 @@ class EntryExecutor:
                     EntryStatus.NOT_CONFIGURED, plan_id, "EXECUTION_GATEWAY_NOT_CONFIGURED"
                 ),
             )
+        plan = sized.plan
+        # Liquidity slippage (spec 6.8): a share of this plan's range, or the fixed bins.
+        tolerance = self._policy.active_bin_tolerance_for(
+            plan.lower_bin_offset, plan.upper_bin_offset
+        )
         anchor: BinAnchor | None = None
+        # Bins the fresh active bin moved from the snapshot's: the range the executor opens
+        # (around the fresh bin) sits that far from the snapshot's price.
+        drift = 0
         if mode is not TradingMode.SHADOW:
-            anchor = self._anchors(market)
+            planned = self._anchors(market)
+            anchor = planned
             reason = "ENTRY_ANCHOR_UNAVAILABLE"
-            if anchor is not None:
-                anchor, reason = await self._fresh_anchor(market, anchor)
-            if anchor is None:
+            if planned is not None:
+                anchor, reason = await self._fresh_anchor(market, planned, tolerance)
+            if anchor is None or planned is None:
                 self._cancel(plan_id)
                 return self._finish(mode, EntryResult(EntryStatus.BLOCKED, plan_id, reason))
+            drift = anchor.active_bin_id - planned.active_bin_id
         try:
             self._modes.claim_entry(plan_id, self._clock.now())
         except ValueError as error:
@@ -949,7 +958,6 @@ class EntryExecutor:
                 mode, EntryResult(EntryStatus.BLOCKED, plan_id, _claim_reason(error))
             )
 
-        plan = sized.plan
         try:
             command = build_entry_command(
                 plan_id=plan_id,
@@ -965,7 +973,7 @@ class EntryExecutor:
                 wallet_address=self._wallet,
                 max_slippage_bps=self._policy.max_slippage_bps,
                 anchor=anchor,
-                active_bin_tolerance=self._policy.active_bin_tolerance,
+                active_bin_tolerance=tolerance,
             )
         except EntryCommandUnavailable as unavailable:
             self._fail(plan_id)
@@ -1024,7 +1032,7 @@ class EntryExecutor:
                 result = await submitter.submit(command, market, guard)
             else:
                 recorder = self._position_recorder(
-                    plan_id, decision_id, sized, market, command, entry_short_volume
+                    plan_id, decision_id, sized, market, command, entry_short_volume, drift
                 )
                 result = await submitter.submit(command, market, guard, recorder)
         except Exception as error:
@@ -1064,14 +1072,18 @@ class EntryExecutor:
         market: PoolSnapshot,
         command: DlmmCommand,
         entry_short_volume: Decimal | None,
+        drift: int,
     ) -> PositionRecorder:
-        """The context of a gateway entry, under the position the executor created."""
+        """The context of a gateway entry, under the position the executor created; its
+        range follows the active bin the command was anchored on (``drift`` bins from the
+        snapshot's)."""
 
         async def record(position_id: str) -> None:
             context = _position_context(
                 plan_id, decision_id, sized, market, command.mode, command,
                 position_id=position_id,
                 entry_short_volume=entry_short_volume,
+                drift=drift,
             )
             try:
                 await self._contexts.put(context)
@@ -1086,12 +1098,13 @@ class EntryExecutor:
         return record
 
     async def _fresh_anchor(
-        self, market: PoolSnapshot, anchor: BinAnchor
+        self, market: PoolSnapshot, anchor: BinAnchor, tolerance: int
     ) -> tuple[BinAnchor | None, str]:
         """Re-read the LB pair: the sweep's active bin is minutes old by now (D07).
 
-        The fresh bin becomes the anchor when it is within ``active_bin_tolerance`` of the
-        planned one; a larger move, another pair or no read at all cancels the entry.
+        The fresh bin becomes the anchor when it is within ``tolerance`` bins of the planned
+        one (the plan's liquidity slippage); a larger move, another pair or no read at all
+        cancels the entry.
         """
 
         reader = self._pool_states
@@ -1111,12 +1124,12 @@ class EntryExecutor:
             or state.bin_step != market.bin_step
         ):
             return None, "POOL_STATE_MISMATCH"
-        if abs(state.active_bin_id - anchor.active_bin_id) > self._policy.active_bin_tolerance:
+        if abs(state.active_bin_id - anchor.active_bin_id) > tolerance:
             self._log.info(
                 "active_bin_drift",
                 planned=anchor.active_bin_id,
                 current=state.active_bin_id,
-                tolerance=self._policy.active_bin_tolerance,
+                tolerance=tolerance,
             )
             return None, "ACTIVE_BIN_DRIFT"
         return replace(anchor, active_bin_id=state.active_bin_id), ""
@@ -1261,7 +1274,12 @@ def _position_context(
     *,
     position_id: str,
     entry_short_volume: Decimal | None = None,
+    drift: int = 0,
 ) -> PositionContext:
+    """``drift``: bins between the active bin the command was anchored on and the snapshot's
+    (a non-SHADOW entry re-reads it, D07); the entry is that bin's price, the snapshot price
+    moved by as many bin steps, and the range is the plan's bins around it."""
+
     plan = sized.plan
     step = Decimal(1) + Decimal(market.bin_step) / _BPS
     short = market.windows.get("5m")
@@ -1271,15 +1289,16 @@ def _position_context(
         entry_short_volume = short.volume if short is not None else Decimal(0)
     if command.min_bin_id is None or command.max_bin_id is None:  # pragma: no cover
         raise ValueError("an entry command always carries its bin range")
+    entry_price = market.price * step**drift
     return PositionContext(
         position_id=position_id,
         plan_id=plan_id,
         decision_id=decision_id,
         pool_address=market.pool.address.root,
         base_mint=market.pool.base_mint.root,
-        entry_price=market.price,
-        lower_price=market.price * step**plan.lower_bin_offset,
-        upper_price=market.price * step**plan.upper_bin_offset,
+        entry_price=entry_price,
+        lower_price=entry_price * step**plan.lower_bin_offset,
+        upper_price=entry_price * step**plan.upper_bin_offset,
         entry_short_volume=entry_short_volume,
         baseline_fee_tvl=fees / market.tvl if market.tvl > 0 else Decimal(0),
         entry_tvl=market.tvl,
@@ -1676,12 +1695,12 @@ class GatewayPositionManager:
     ) -> None:
         """``cleared`` closes this manager's own alerts once the position's action went
         through; the kill-switch policy is read from the durable mode state. ``swap``:
-        the sale after an exit; without it the process environment (``SWAP_*``) decides,
-        so a worker built without the setting still sells by default."""
+        the sale after an exit, which the worker's runtime reads with its other settings
+        (``SWAP_*``); without it the defaults - the sale on."""
 
         if attempts <= 0 or not 0 < reduce_bps < 10_000:
             raise ValueError("attempts must be positive and reduce_bps inside (0, 10000)")
-        self._swap = swap if swap is not None else SwapSettings.from_environment(os.environ)
+        self._swap = swap if swap is not None else SwapSettings()
         self._modes = modes
         self._accounting = accounting
         self._contexts = contexts

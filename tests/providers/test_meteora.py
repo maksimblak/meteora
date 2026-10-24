@@ -503,6 +503,49 @@ def test_a_single_pool_is_read_from_its_own_endpoint_and_never_predates_it() -> 
     asyncio.run(exercise())
 
 
+def test_an_open_positions_pool_is_reread_alone_under_the_shared_rate_limit() -> None:
+    """T19 (spec 6.8): a position's pool every 30 s - one ``/pools/{address}`` request each,
+    through the sweep's own limiter, without an LB pair read, and the sweep in progress keeps
+    the pools it listed."""
+
+    async def exercise() -> None:
+        clock = FrozenClock(NOW)
+        sleep = RecordedSleep()
+        states = StubPoolStates({}, fail=True)  # an LB pair read would raise
+        api = _sweep_api()
+        provider, client = _provider(
+            api, clock, rate_limiter=_limiter(sleep), pool_states=StubPoolStates({})
+        )
+        sol = PoolRef(
+            address=PublicKey(SOL_POOL),
+            base_mint=PublicKey(SOL_MINT),
+            quote_mint=PublicKey(USDC_MINT),
+        )
+        async with client:
+            listed = await provider.list_pools(None)
+            first = await provider.current_snapshot(sol)
+            clock.advance(timedelta(seconds=30))
+            second = await provider.current_snapshot(sol)
+            kept = await provider.get_pool_snapshot(listed.items[0], NOW)
+        unanchored, unanchored_client = _provider(_sweep_api(), clock, pool_states=states)
+        async with unanchored_client:
+            alone = await unanchored.current_snapshot(sol)
+
+        paths = [request.url.path for request in api.requests]
+        assert paths == ["/pools", f"/pools/{SOL_POOL}", f"/pools/{SOL_POOL}"]
+        # One limiter for the sweep and the rereads, 2 requests a second: with the limiter's
+        # clock frozen, the 2nd and 3rd requests are due 0.5 s and 1 s after the 1st.
+        assert sleep.delays == [0.5, 1.0]
+        assert first.observed_at == first.source_at == NOW
+        assert second.observed_at == NOW + timedelta(seconds=30)
+        assert second.freshness is Freshness.FRESH
+        assert second.pool == sol
+        assert kept.pool == listed.items[0]  # served from the listing, no request
+        assert alone.active_bin_id is None and alone.pool == sol
+
+    asyncio.run(exercise())
+
+
 class StubPoolStates:
     def __init__(
         self,

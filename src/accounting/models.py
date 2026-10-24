@@ -20,7 +20,12 @@ def _exact_decimal(value: object) -> object:
 class CostModel(BaseModel):
     """Conservative per-fill cost estimate. ``fee_income_base_units`` is an accrual the caller
     adds to a fill; the shadow broker books the position's share of the pool's LP fees
-    since its last fill on top of it (``shadow_fee_income``)."""
+    since its last fill on top of it (``shadow_fee_income``).
+
+    ``priority_fee_lamports`` (spec 6.8, No 49): the priority fee of one transaction - the
+    executor's ceiling ``PRIORITY_FEE_MAX_LAMPORTS``, so SHADOW never pays less than LIVE may.
+    Lamports are quote base units only in a pool quoted in wrapped SOL; the broker books it
+    there, with the tip, on the entry, the exit and the sale (``priority_fee_base_units``)."""
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
@@ -28,6 +33,7 @@ class CostModel(BaseModel):
     network_fee_base_units: Decimal
     jito_tip_base_units: Decimal
     fee_income_base_units: Decimal = Decimal(0)
+    priority_fee_lamports: int = 0
 
     _reject_float = field_validator(
         "network_fee_base_units", "jito_tip_base_units", "fee_income_base_units", mode="before"
@@ -42,6 +48,8 @@ class CostModel(BaseModel):
             < 0
         ):
             raise ValueError("cost model values cannot be negative")
+        if self.priority_fee_lamports < 0:
+            raise ValueError("priority_fee_lamports cannot be negative")
         return self
 
 

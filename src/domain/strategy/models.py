@@ -37,14 +37,35 @@ class StrategySelectionReason(StrEnum):
     SPOT_OVERVOLUME = "SPOT_OVERVOLUME"
 
 
-class GuideStrategyRules(BaseModel):
-    """LexDollar strategy choice (spec 6.6, G15) — a shadow hypothesis, not a promise.
+class StrategyRejection(StrEnum):
+    """Why a guide plan must not be entered (spec 6.8); the sizer refuses such a plan."""
 
-    Default is Bid-Ask from the local high: liquidity from the high down to
-    ``bid_ask_target_depth`` below the current price, inside one DLMM position
-    (``maximum_position_bins``, the SDK's 70-bin default width). Spot is allowed only on a
-    pool all-time-high breakout with working, organic volume, or on overvolume with a hard
-    holding limit and an exit on the first volume drop.
+    # The price is below ``bid_ask_local_high_fraction`` of the hour's high: not "from the high".
+    NOT_NEAR_LOCAL_HIGH = "NOT_NEAR_LOCAL_HIGH"
+    # One position of the official SDK cannot reach ``bid_ask_minimum_depth`` at this bin step.
+    RANGE_TOO_NARROW = "RANGE_TOO_NARROW"
+
+
+class StrategyFlag(StrEnum):
+    """What a plan was decided without (shown with the plan; changes nothing by itself)."""
+
+    # No token ATH from GMGN: the Spot-on-ATH rule compared the pool's own ATH.
+    ATH_POOL_ONLY = "ATH_POOL_ONLY"
+
+
+class GuideStrategyRules(BaseModel):
+    """LexDollar strategy choice (spec 6.6, 6.8, G15) — a shadow hypothesis, not a promise.
+
+    Default is Bid-Ask from the local high: the price at least ``bid_ask_local_high_fraction``
+    of the hour's high, liquidity from the price down to ``bid_ask_target_depth`` inside one
+    position of the official SDK (``maximum_position_bins``: ``initializePosition`` of
+    ``@meteora-ag/dlmm`` 1.9 opens at most 70 bins in one transaction; wider positions need
+    several dependent transactions the executor does not build), and a pool where even that
+    is short of ``bid_ask_minimum_depth`` is refused. Spot is allowed only on an all-time-high
+    breakout (the token's ATH from GMGN, else the pool's) of a high cap with working, organic
+    volume, or on overvolume with a hard holding limit and an exit on the first volume drop.
+    Both are one-sided like the author's: the quote token only, evenly from the price down
+    to ``spot_depth``. Every plan carries its take profit on net P&L.
     """
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
@@ -53,13 +74,19 @@ class GuideStrategyRules(BaseModel):
     bid_ask_target_depth: Decimal = Decimal("0.75")
     bid_ask_maximum_depth: Decimal = Decimal("0.80")
     maximum_position_bins: int = 70
+    bid_ask_local_high_fraction: Decimal = Decimal("0.90")
+    spot_depth: Decimal = Decimal("0.60")
     spot_minimum_volume_per_minute: Decimal = Decimal("14000")
     spot_minimum_fee_efficiency: Decimal = Decimal("0.5")
+    spot_ath_minimum_market_cap: Decimal = Decimal("1000000")
     overvolume_volume_per_minute: Decimal = Decimal("100000")
     ath_breakout_margin: Decimal = Decimal("0")
-    spot_holding_horizon: timedelta = timedelta(hours=1)
+    spot_holding_horizon: timedelta = timedelta(hours=3)
     overvolume_maximum_holding_period: timedelta = timedelta(minutes=30)
     overvolume_volume_decay_ratio: Decimal = Decimal("1")
+    bid_ask_take_profit: Decimal = Decimal("0.05")
+    spot_ath_take_profit: Decimal = Decimal("0.05")
+    overvolume_take_profit: Decimal = Decimal("0.03")
     # The bid-only range ends at the entry bin: a price above it leaves the position all in
     # the quote token, earning nothing. It exits once the price has stayed above the entry
     # bin's top for ``bid_only_upside_grace`` or runs ``bid_only_upside_exit`` beyond it.
@@ -70,11 +97,17 @@ class GuideStrategyRules(BaseModel):
         "bid_ask_minimum_depth",
         "bid_ask_target_depth",
         "bid_ask_maximum_depth",
+        "bid_ask_local_high_fraction",
+        "spot_depth",
         "spot_minimum_volume_per_minute",
         "spot_minimum_fee_efficiency",
+        "spot_ath_minimum_market_cap",
         "overvolume_volume_per_minute",
         "ath_breakout_margin",
         "overvolume_volume_decay_ratio",
+        "bid_ask_take_profit",
+        "spot_ath_take_profit",
+        "overvolume_take_profit",
         "bid_only_upside_exit",
         mode="before",
     )(_exact_decimal)
@@ -91,16 +124,30 @@ class GuideStrategyRules(BaseModel):
             raise ValueError("bid-ask depths must satisfy 0 < minimum <= target <= maximum < 1")
         if self.maximum_position_bins < 3:
             raise ValueError("maximum_position_bins must allow a range around the active bin")
+        if not Decimal(0) < self.bid_ask_local_high_fraction <= Decimal(1):
+            raise ValueError("bid_ask_local_high_fraction must be in (0, 1]")
+        if not Decimal(0) < self.spot_depth < Decimal(1):
+            raise ValueError("spot_depth must be in (0, 1)")
         if any(
             value < 0
             for value in (
                 self.spot_minimum_volume_per_minute,
                 self.spot_minimum_fee_efficiency,
+                self.spot_ath_minimum_market_cap,
                 self.overvolume_volume_per_minute,
                 self.ath_breakout_margin,
             )
         ):
             raise ValueError("spot thresholds cannot be negative")
+        if any(
+            value <= 0
+            for value in (
+                self.bid_ask_take_profit,
+                self.spot_ath_take_profit,
+                self.overvolume_take_profit,
+            )
+        ):
+            raise ValueError("take profit targets must be positive")
         if self.spot_holding_horizon <= timedelta(0) or (
             self.overvolume_maximum_holding_period <= timedelta(0)
         ):
@@ -212,13 +259,20 @@ class ExitPolicy(BaseModel):
     # beyond it. ``None``: any price above the range is a breach at once.
     upside_breach_grace: timedelta | None = None
     upside_breach_fraction: Decimal | None = None
+    # Exit once the position's net P&L (fees and every cost of leaving included) reaches this
+    # share of its capital (spec 6.8); ``None``: no take profit.
+    take_profit_fraction: Decimal | None = None
 
-    _reject_float = field_validator("upside_breach_fraction", mode="before")(_exact_decimal)
+    _reject_float = field_validator(
+        "upside_breach_fraction", "take_profit_fraction", mode="before"
+    )(_exact_decimal)
 
     @model_validator(mode="after")
     def validate_exit(self) -> "ExitPolicy":
         if (self.upside_breach_grace is None) != (self.upside_breach_fraction is None):
             raise ValueError("the upside exit needs both its grace and its distance")
+        if self.take_profit_fraction is not None and self.take_profit_fraction <= 0:
+            raise ValueError("take_profit_fraction must be positive")
         return self
 
 
@@ -242,6 +296,9 @@ class StrategyPlan(BaseModel):
     correlation_id: str
     selection_reason: StrategySelectionReason | None = None
     selection_evidence: tuple[EvidenceItem, ...] = ()
+    # Non-empty: the plan must not be entered (the sizer refuses it with these codes).
+    blocked_by: tuple[StrategyRejection, ...] = ()
+    flags: tuple[StrategyFlag, ...] = ()
 
     _reject_float = field_validator(
         "range_exit_probability",
@@ -281,6 +338,8 @@ class PositionState(BaseModel):
     # The plan's upside exit of a bid-only range (``ExitPolicy``); ``None`` for other plans.
     upside_breach_grace: timedelta | None = None
     upside_breach_fraction: Decimal | None = None
+    # The plan's take profit on net P&L (``ExitPolicy``); ``None``: none.
+    take_profit_fraction: Decimal | None = None
 
     _reject_float = field_validator(
         "entry_price",
@@ -289,6 +348,7 @@ class PositionState(BaseModel):
         "entry_short_volume",
         "volume_decay_ratio",
         "upside_breach_fraction",
+        "take_profit_fraction",
         mode="before",
     )(_exact_decimal)
 
@@ -310,6 +370,8 @@ class PositionState(BaseModel):
             raise ValueError("volume_decay_ratio must be in (0, 1]")
         if (self.upside_breach_grace is None) != (self.upside_breach_fraction is None):
             raise ValueError("the upside exit needs both its grace and its distance")
+        if self.take_profit_fraction is not None and self.take_profit_fraction <= 0:
+            raise ValueError("take_profit_fraction must be positive")
         return self
 
 
@@ -335,6 +397,10 @@ class PositionReason(StrEnum):
     FEE_SIGNAL_UNKNOWN = "FEE_SIGNAL_UNKNOWN"
     REBALANCE_AFTER_COSTS = "REBALANCE_AFTER_COSTS"
     CLOSE_BEATS_REBALANCE = "CLOSE_BEATS_REBALANCE"
+    # Net P&L reached the plan's take profit (spec 6.8).
+    TAKE_PROFIT = "TAKE_PROFIT"
+    # GMGN: the developer sold or closed, or holds less than half of the entry share.
+    DEV_SOLD = "DEV_SOLD"
 
 
 class PositionSignals(BaseModel):
@@ -351,12 +417,18 @@ class PositionSignals(BaseModel):
     # Since when the price has stayed above a bid-only range (``PositionMonitor.above_range``)
     # without a break; ``None`` when it is not above.
     above_range_since: datetime | None = None
+    # Net P&L of leaving now over the capital, by the accounting of the fills (fees, slippage,
+    # network and priority fees, the sale of the returned base token); ``None``: unknown.
+    net_pnl_fraction: Decimal | None = None
+    # A fresh GMGN reading says the developer sold (``developer_sold``).
+    developer_sold: bool = False
 
     _reject_float = field_validator(
         "current_fee_tvl",
         "baseline_fee_tvl",
         "competing_tvl_growth",
         "normalized_range_position",
+        "net_pnl_fraction",
         mode="before",
     )(_exact_decimal)
 

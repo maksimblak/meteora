@@ -15,9 +15,15 @@ any new action) -> lease-guarded scheduler. Jobs, by priority:
 GMGN (G18, G20): with ``GMGN_API_KEY`` the candidate pipeline's token risk carries the
 reading of the official GMGN OpenAPI (``GmgnOpenApiProvider``); without a key but with
 ``GMGN_URL``, that of the internal browser service ``gmgn`` (``GmgnProvider``). Positions
-keep the plain provider, so requests stay with candidates. Without either nothing is asked
-and nothing changes, except that the loaded guide-v1 rules keep LIVE closed until
-``GMGN_REQUIRED_FOR_LIVE=false``.
+keep the plain token-risk provider; with the key (only) the position job also watches the
+developer through the same OpenAPI source every 5 minutes (``DEV_SOLD``, T19). Without
+either nothing is asked and nothing changes, except that the loaded guide-v1 rules keep
+LIVE closed until ``GMGN_REQUIRED_FOR_LIVE=false``.
+
+Open positions (T19, spec 6.8): the position job rereads each position's pool from the
+Data API every ``WORKER_POSITION_SNAPSHOT_SECONDS`` (30) through the universe adapter, so
+under its rate limit. The sale after an exit (``SWAP_*``) is read here with the other
+settings and handed to the SHADOW exits and the gateway's position manager.
 
 The default stack is SHADOW-only: without an execution gateway, APPROVAL/LIVE
 entries are cancelled as ``EXECUTION_GATEWAY_NOT_CONFIGURED`` and nothing is sent.
@@ -40,6 +46,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
+from src.accounting.models import ExitSaleModel
 from src.core.clock import Clock, SystemClock
 from src.core.config import AppConfig
 from src.core.logging import configure_logging
@@ -55,7 +62,7 @@ from src.execution.service import (
     HmacApprovalVerifier,
     ReceiptLookup,
 )
-from src.execution.settings import ExecutorSettings
+from src.execution.settings import ExecutorSettings, SwapSettings
 from src.gmgn import GmgnOpenApiProvider, GmgnProvider, OpenApiSettings
 from src.gmgn.enrichment import EnhancedSignalSource, EnrichedOnChainProvider
 from src.gmgn.openapi import openapi_client
@@ -106,7 +113,7 @@ from src.worker.execution import (
 from src.worker.pipeline import CandidatePipeline, QuoteSource, ScreenedPool
 from src.worker.policy import PipelinePolicy, load_pipeline_policy, universe_interval
 from src.worker.portfolio import RiskDayKeeper, ShadowPortfolio
-from src.worker.positions import PositionCycle
+from src.worker.positions import DEFAULT_SNAPSHOT_INTERVAL, PoolSnapshotSource, PositionCycle
 from src.worker.scheduler import JobContext, JobSpec, Scheduler
 
 # Entries execute only inside this job; recovery treats its lease as "an executor
@@ -121,6 +128,7 @@ QUOTES_URL_ENV = "EXECUTOR_QUOTES_URL"
 GMGN_URL_ENV = "GMGN_URL"
 GMGN_TIMEOUT_ENV = "GMGN_TIMEOUT_SECONDS"
 GMGN_STALE_AFTER_ENV = "GMGN_STALE_AFTER_SECONDS"
+POSITION_SNAPSHOT_INTERVAL_ENV = "WORKER_POSITION_SNAPSHOT_SECONDS"
 
 _UNKNOWN_SIGNALS = (
     "blacklisted",
@@ -148,6 +156,8 @@ def _integer(environ: Mapping[str, str], name: str, default: int) -> int:
 @dataclass(frozen=True, slots=True)
 class WorkerSettings:
     position_interval: timedelta = timedelta(seconds=15)
+    # How often the position job rereads an open position's pool (spec 6.8).
+    position_snapshot_interval: timedelta = DEFAULT_SNAPSHOT_INTERVAL
     candidate_interval: timedelta = timedelta(seconds=60)
     universe_interval: timedelta = timedelta(minutes=5)
     recovery_interval: timedelta = timedelta(minutes=1)
@@ -169,6 +179,11 @@ class WorkerSettings:
         port = environ.get("WORKER_METRICS_PORT")
         return cls(
             position_interval=_seconds(environ, "WORKER_POSITION_INTERVAL_SECONDS", 15),
+            position_snapshot_interval=_seconds(
+                environ,
+                POSITION_SNAPSHOT_INTERVAL_ENV,
+                int(DEFAULT_SNAPSHOT_INTERVAL.total_seconds()),
+            ),
             candidate_interval=_seconds(environ, "WORKER_CANDIDATE_INTERVAL_SECONDS", 60),
             # The same reading the policy's observation gap is derived from.
             universe_interval=universe_interval(environ),
@@ -274,11 +289,16 @@ class WorkerRuntime:
         quotes: QuoteSource | None = None,
         warmup: VolumeHistorySource | None = None,
         gmgn: EnhancedSignalSource | None = None,
+        pool_snapshots: PoolSnapshotSource | None = None,
+        developer: EnhancedSignalSource | None = None,
+        swap: SwapSettings | None = None,
     ) -> None:
         """``pool_states`` re-reads the active bin before a non-SHADOW entry, ``quotes``
         measures candidates' depth (``POST /v1/quotes``) and ``warmup`` serves a new
         candidate's volume history (D07); each is optional and its absence fails closed.
-        ``gmgn`` attaches GMGN metrics to candidates' token risk (G18)."""
+        ``gmgn`` attaches GMGN metrics to candidates' token risk (G18). ``pool_snapshots``
+        rereads open positions' pools and ``developer`` watches their developers (T19);
+        ``swap``: the sale after an exit (``SWAP_*``; the defaults without it)."""
 
         self.settings = settings
         self.policy = policy
@@ -289,6 +309,8 @@ class WorkerRuntime:
         self._market = market
         self._onchain = onchain
         self.gmgn = gmgn
+        self.developer = developer
+        self.swap = swap if swap is not None else SwapSettings()
         self._log = get_logger("worker.runtime")
         repos = repositories
         self.alerts = CriticalAlertReporter(
@@ -348,6 +370,7 @@ class WorkerRuntime:
                 cleared=self.cleared,
                 clock=clock,
                 metrics=self.metrics,
+                swap=self.swap,
             )
         wallet = wallet_address or shadow_address("meteora-volume-bot:shadow-wallet")
         self.entries = EntryExecutor(
@@ -411,6 +434,10 @@ class WorkerRuntime:
             decisions=repos.decisions,
             evidence=self.evidence,
             gateway_mode=None if gateway is None else gateway.allowed_mode,
+            snapshots=pool_snapshots,
+            snapshot_interval=settings.position_snapshot_interval,
+            developer=developer,
+            exit_sale=ExitSaleModel(enabled=self.swap.enabled),
         )
         self.recovery = RecoveryService(
             modes=repos.mode,
@@ -775,6 +802,7 @@ def build_runtime(
     policy = load_pipeline_policy(environ)
     clock = clock or SystemClock()
     settings = WorkerSettings.from_environment(environ)
+    swap = SwapSettings.from_environment(environ)
     metrics = WorkerMetrics()
     repositories = open_repositories(config, environ=environ, clock=clock)
     clients: list[httpx.AsyncClient] = []
@@ -791,6 +819,7 @@ def build_runtime(
         onchain = InstrumentedOnChainProvider(rpc, metrics, name="solana")
     market: MarketDataProvider | None = None
     warmup: VolumeHistorySource | None = None
+    pool_snapshots: PoolSnapshotSource | None = None
     if config.meteora_data_api_base_url:
         from src.providers.meteora import MeteoraDataApiProvider
         from src.providers.resilience import ResilientHttpClient
@@ -806,6 +835,7 @@ def build_runtime(
             pool_states=pool_states,
         )
         warmup = data_api
+        pool_snapshots = data_api  # the positions' rereads share the sweep's rate limit
         market = InstrumentedMarketDataProvider(data_api, metrics, name="meteora")
     gateway, executor_client = build_gateway(
         config, environ, repositories, transport=executor_transport
@@ -832,6 +862,10 @@ def build_runtime(
         quotes=quotes,
         warmup=warmup,
         gmgn=gmgn,
+        pool_snapshots=pool_snapshots,
+        # The developer watch needs the key (spec 6.8): the browser service is not polled.
+        developer=gmgn if isinstance(gmgn, GmgnOpenApiProvider) else None,
+        swap=swap,
     )
     return runtime, clients
 

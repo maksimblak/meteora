@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import os
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, time, timedelta
@@ -32,11 +31,9 @@ from src.execution.contracts import (
     GatewayState,
     canonical_command_digest,
 )
-from src.execution.settings import SwapSettings
 from src.market.models import DataQuality, Freshness, PoolSnapshot
 from src.market.windows import WINDOW_MINUTES
 from src.modes.models import DailyPromotionObservation
-from src.observability.logging import get_logger
 from src.portfolio.models import (
     LiquidityTranche,
     PerformanceGroup,
@@ -313,28 +310,30 @@ class AccountingService:
         )
 
 
-def default_exit_sale() -> ExitSaleModel:
-    """``SWAP_AFTER_EXIT`` of this process for the SHADOW model of the sale (G22).
+WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112"
 
-    Read here because SHADOW exits construct the broker without the worker's settings; an
-    unreadable value keeps the sale modeled (the setting's default) and is logged, so a
-    typo never blocks a SHADOW exit."""
 
-    try:
-        enabled = SwapSettings.from_environment(os.environ).enabled
-    except ValueError as error:
-        get_logger("accounting.shadow").error("swap_settings_unreadable", error=str(error))
-        enabled = True
-    return ExitSaleModel(enabled=enabled)
+def priority_fee_base_units(cost_model: CostModel, market: PoolSnapshot) -> Decimal:
+    """The modeled priority fee of one transaction in the pool's quote base units.
+
+    Lamports are quote base units in a pool quoted in wrapped SOL; another quote token has
+    no SOL price here, so nothing is booked for it (the cost model's tip still is)."""
+
+    if market.pool.quote_mint.root != WRAPPED_SOL_MINT:
+        return Decimal(0)
+    return Decimal(cost_model.priority_fee_lamports)
 
 
 class ShadowBroker:
     """Executes SHADOW commands without an executor, wallet or network access.
 
     Every fill after the open also books the LP fees the position earned since its last
-    fill (``shadow_fee_income``) on top of the cost model's own accrual. With the sale
-    after an exit on (``exit_sale``, ``SWAP_AFTER_EXIT``), a REMOVE/CLOSE also books the
-    modeled sale of the base token it returns, in the same commit (G22).
+    fill (``shadow_fee_income``) on top of the cost model's own accrual, and every
+    transaction - the fill and the modeled sale - its priority fee (``priority_fee_base_units``)
+    with the tip. With the sale after an exit on (``exit_sale``, mirroring ``SWAP_AFTER_EXIT``
+    the worker passes in), a REMOVE/CLOSE also books the modeled sale of the base token it
+    returns, in the same commit (G22). ``preview_close`` is the same booking of a full exit
+    now, without committing it (the take profit, spec 6.8).
     """
 
     def __init__(
@@ -346,7 +345,7 @@ class ShadowBroker:
         self._repository = repository
         self._clock = clock
         self._accounting = AccountingService()
-        self._exit_sale = exit_sale if exit_sale is not None else default_exit_sale()
+        self._exit_sale = exit_sale if exit_sale is not None else ExitSaleModel()
 
     def apply(
         self,
@@ -380,25 +379,7 @@ class ShadowBroker:
             raise ValueError("shadow command requires position_address")
 
         current = self._repository.position_for(position_id)
-        fee_income = cost_model.fee_income_base_units
-        if current is not None and command.operation is not DlmmOperation.OPEN:
-            fee_income += shadow_fee_income(current, command, market, now)
-        fill = Fill(
-            filled_at=now,
-            price=market.price,
-            slippage_bps=cost_model.slippage_bps,
-            network_fee_base_units=cost_model.network_fee_base_units,
-            jito_tip_base_units=cost_model.jito_tip_base_units,
-            fee_income_base_units=fee_income,
-        )
-        step = self._accounting.apply_fill(current, command, fill)
-        position = step.position
-        sale_entries: tuple[LedgerEntry, ...] = ()
-        sale = self._modeled_sale(current, command, market, cost_model, fill)
-        if sale is not None:
-            position, sale_entries = self._accounting.apply_sales(
-                position, (sale,), str(command.correlation_id)
-            )
+        fill, step, position, sale_entries = self._book(current, command, market, cost_model, now)
         valuation = self._accounting.value_at(position, fill.price, now)
         entry = _ledger_entry(command, step, fill)
         events = _lifecycle_events(command, step, valuation, now)
@@ -440,6 +421,76 @@ class ShadowBroker:
             expected_version=None if current is None else current.version,
         )
 
+    def preview_close(
+        self,
+        position: ShadowPosition,
+        market: PoolSnapshot,
+        cost_model: CostModel,
+        *,
+        bins: tuple[int, int],
+        at: datetime,
+    ) -> PositionValuation:
+        """The valuation after a full exit at ``market`` now, booked as ``apply`` would book a
+        CLOSE - LP fees since the last fill, exit slippage, network and priority fees, the
+        modeled sale of the returned base token - but never committed.
+
+        ``bins``: the position's range in bins relative to its entry price (which bins earn
+        the pool's fees). Any mode: a gateway position is estimated by the same model."""
+
+        if market.pool.address.root != position.pool_address:
+            raise ValueError("market snapshot does not match position pool")
+        key = f"preview:{position.position_id}:{position.version}"
+        command = DlmmCommandV1(
+            command_id=uuid5(NAMESPACE_URL, f"meteora-volume-bot:{key}"),
+            idempotency_key=key,
+            correlation_id=uuid5(NAMESPACE_URL, f"correlation:{position.correlation_id}"),
+            ruleset_version=position.ruleset_version,
+            mode=position.mode,
+            operation=DlmmOperation.CLOSE,
+            pool_address=position.pool_address,
+            wallet_address=position.pool_address,
+            position_address=position.position_id,
+            expires_at=at + timedelta(minutes=2),
+            max_slippage_bps=cost_model.slippage_bps,
+            min_bin_id=bins[0],
+            max_bin_id=bins[1],
+            remove_bps=10_000,
+        )
+        fill, _, closed, _ = self._book(position, command, market, cost_model, at)
+        return self._accounting.value_at(closed, fill.price, at)
+
+    def _book(
+        self,
+        current: ShadowPosition | None,
+        command: DlmmCommandV1,
+        market: PoolSnapshot,
+        cost_model: CostModel,
+        now: datetime,
+    ) -> tuple[Fill, LifecycleStep, ShadowPosition, tuple[LedgerEntry, ...]]:
+        """The fill of ``command`` at ``market`` and the position after it and its sale."""
+
+        fee_income = cost_model.fee_income_base_units
+        if current is not None and command.operation is not DlmmOperation.OPEN:
+            fee_income += shadow_fee_income(current, command, market, now)
+        fill = Fill(
+            filled_at=now,
+            price=market.price,
+            slippage_bps=cost_model.slippage_bps,
+            network_fee_base_units=cost_model.network_fee_base_units,
+            jito_tip_base_units=cost_model.jito_tip_base_units
+            + priority_fee_base_units(cost_model, market),
+            fee_income_base_units=fee_income,
+        )
+        step = self._accounting.apply_fill(current, command, fill)
+        position = step.position
+        sale_entries: tuple[LedgerEntry, ...] = ()
+        sale = self._modeled_sale(current, command, market, cost_model, fill)
+        if sale is not None:
+            position, sale_entries = self._accounting.apply_sales(
+                position, (sale,), str(command.correlation_id)
+            )
+        return fill, step, position, sale_entries
+
     def _modeled_sale(
         self,
         current: ShadowPosition | None,
@@ -448,7 +499,8 @@ class ShadowBroker:
         cost_model: CostModel,
         fill: Fill,
     ) -> SaleFill | None:
-        """The sale of the X this exit returns by the conservative valuation, or ``None``."""
+        """The sale of the X this exit returns by the conservative valuation, or ``None``;
+        one more transaction, so one more network fee, tip and priority fee."""
 
         if (
             not self._exit_sale.enabled
@@ -473,7 +525,8 @@ class ShadowBroker:
             proceeds_base_units=max(value - cost, Decimal(0)),
             mark_price=fill.price,
             network_fee_base_units=cost_model.network_fee_base_units,
-            priority_fee_base_units=cost_model.jito_tip_base_units,
+            priority_fee_base_units=cost_model.jito_tip_base_units
+            + priority_fee_base_units(cost_model, market),
         )
 
 

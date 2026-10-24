@@ -41,6 +41,9 @@ RULESET_OVERRIDES_ENV = "RULESET_OVERRIDES_FILE"
 UNIVERSE_INTERVAL_ENV = "WORKER_UNIVERSE_INTERVAL_SECONDS"
 # G18: LIVE needs fresh GMGN data unless this is switched off explicitly ("false").
 GMGN_REQUIRED_FOR_LIVE_ENV = "GMGN_REQUIRED_FOR_LIVE"
+# The executor's priority fee ceiling per transaction (T17, No 49); SHADOW pays it (T19).
+PRIORITY_FEE_MAX_ENV = "PRIORITY_FEE_MAX_LAMPORTS"
+DEFAULT_PRIORITY_FEE_LAMPORTS = 15_000_000
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
 DEFAULT_UNIVERSE_INTERVAL = timedelta(minutes=5)
@@ -126,6 +129,18 @@ class PipelinePolicy:
     # G24: a cycle's candidates are ranked by their token's hourly volume and only this many
     # are checked in depth (token risk, GMGN, quote); ``None`` checks every candidate.
     deep_candidate_limit: int | None = None
+    # Liquidity slippage (spec 6.8, No 50): the active bin may move this share of the
+    # position's bins before the entry counts as stale; ``None``: ``active_bin_tolerance``.
+    liquidity_slippage: Decimal | None = None
+
+    def active_bin_tolerance_for(self, lower_bin_offset: int, upper_bin_offset: int) -> int:
+        """Bins the active bin may move for a range of relative bins (``ACTIVE_BIN_DRIFT``):
+        ``liquidity_slippage`` of its width, rounded down, at least one."""
+
+        if self.liquidity_slippage is None:
+            return self.active_bin_tolerance
+        width = Decimal(upper_bin_offset - lower_bin_offset + 1)
+        return max(int(width * self.liquidity_slippage), 1)
 
     def __post_init__(self) -> None:
         versions = {
@@ -155,6 +170,10 @@ class PipelinePolicy:
             raise ValueError("wallet_native_reserve_lamports must not be negative")
         if self.deep_candidate_limit is not None and self.deep_candidate_limit < 1:
             raise ValueError("deep_candidate_limit must be at least one")
+        if self.liquidity_slippage is not None and not (
+            Decimal(0) < self.liquidity_slippage <= Decimal(1)
+        ):
+            raise ValueError("liquidity_slippage must be a share of the range in (0, 1]")
 
     @property
     def ruleset_version(self) -> str:
@@ -187,12 +206,15 @@ def hypothesis_policy(
     max_slippage_bps: int = 100,
     kill_switch_policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT,
     universe_interval: timedelta = DEFAULT_UNIVERSE_INTERVAL,
+    priority_fee_lamports: int = 0,
 ) -> PipelinePolicy:
-    """``shadow-hypothesis-v1``: volume-spike rules of spec 6.2-6.4 without guide signals."""
+    """``shadow-hypothesis-v1``: volume-spike rules of spec 6.2-6.4 without guide signals.
+
+    ``priority_fee_lamports``: the priority fee SHADOW books per transaction (spec 6.8)."""
 
     return PipelinePolicy(
         short_window=_short_window_rules(universe_interval),
-        conservative_costs=_shadow_costs(max_slippage_bps),
+        conservative_costs=_shadow_costs(max_slippage_bps, priority_fee_lamports),
         features=VolumeFeatureRules(
             ruleset_version=ruleset_version,
             config_version=config_version,
@@ -214,7 +236,7 @@ def hypothesis_policy(
         ),
         strategy=StrategyPolicy(ruleset_version=ruleset_version, config_version=config_version),
         risk=RiskPolicy(ruleset_version=ruleset_version, config_version=config_version),
-        shadow_costs=_shadow_costs(),
+        shadow_costs=_shadow_costs(priority_fee_lamports=priority_fee_lamports),
         entry_notional_quote=entry_notional_quote,
         quote_base_units_per_unit=quote_base_units_per_unit,
         max_slippage_bps=max_slippage_bps,
@@ -281,13 +303,26 @@ class GuidePolicySettings(BaseModel):
     # Without a quote, SHADOW fills pay the full slippage tolerance (``max_slippage_bps``).
     conservative_slippage_bps: int = 100
     conservative_depth_fraction: Decimal = Decimal("0.05")
-    holding_horizon: timedelta = timedelta(hours=4)
+    # Strategy and exits as the author does them (spec 6.8, T19): Bid-Ask held up to a day
+    # (``holding_horizon``), from at least 90% of the hour's high, 70..80% deep in one SDK
+    # position; one-sided Spot 60% deep, on an ATH only at a cap of 1M; take profit on net
+    # P&L of 5% (Bid-Ask, Spot on ATH) or 3% (overvolume Spot); Spot on ATH held up to 3 h.
+    holding_horizon: timedelta = timedelta(hours=24)
     bid_ask_minimum_depth: Decimal = Decimal("0.70")
     bid_ask_target_depth: Decimal = Decimal("0.75")
     bid_ask_maximum_depth: Decimal = Decimal("0.80")
     maximum_position_bins: int = 70
+    bid_ask_local_high_fraction: Decimal = Decimal("0.90")
+    spot_depth: Decimal = Decimal("0.60")
+    spot_ath_minimum_market_cap: Decimal = Decimal("1000000")
+    bid_ask_take_profit: Decimal = Decimal("0.05")
+    spot_ath_take_profit: Decimal = Decimal("0.05")
+    overvolume_take_profit: Decimal = Decimal("0.03")
+    # The active bin may move this share of the position's bins between the plan and the
+    # chain (``ACTIVE_BIN_DRIFT``, the SDK's bin slippage); ``None``: ``active_bin_tolerance``.
+    liquidity_slippage: Decimal | None = Decimal("0.30")
     ath_breakout_margin: Decimal = Decimal("0")
-    spot_holding_horizon: timedelta = timedelta(hours=1)
+    spot_holding_horizon: timedelta = timedelta(hours=3)
     overvolume_maximum_holding_period: timedelta = timedelta(minutes=30)
     overvolume_volume_decay_ratio: Decimal = Decimal("1")
     volume_decay_ratio: Decimal = Decimal("0.50")
@@ -324,6 +359,7 @@ def guide_policy(
     kill_switch_policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT,
     universe_interval: timedelta = DEFAULT_UNIVERSE_INTERVAL,
     gmgn_required_for_live: bool | None = None,
+    priority_fee_lamports: int = 0,
 ) -> PipelinePolicy:
     """``guide-v1``: spec 6.2-6.4 plus the LexDollar thresholds and strategy choice (6.6).
 
@@ -331,6 +367,7 @@ def guide_policy(
     observation gap of the ATH proof follows ``universe_interval``. ``gmgn_required_for_live``
     adds the GMGN rules of spec 6.7 with that LIVE requirement; ``None`` builds the bundle
     without them (the worker and the API always load them through ``load_pipeline_policy``).
+    ``priority_fee_lamports``: the priority fee SHADOW books per transaction (spec 6.8).
     """
 
     values = settings or GuidePolicySettings()
@@ -355,7 +392,7 @@ def guide_policy(
             counter_reset_after=values.short_window_counter_reset_after,
         ),
         active_bin_tolerance=values.active_bin_tolerance,
-        conservative_costs=_shadow_costs(values.conservative_slippage_bps),
+        conservative_costs=_shadow_costs(values.conservative_slippage_bps, priority_fee_lamports),
         conservative_depth_fraction=values.conservative_depth_fraction,
         features=VolumeFeatureRules(
             ruleset_version=ruleset_version,
@@ -414,24 +451,31 @@ def guide_policy(
                 bid_ask_target_depth=values.bid_ask_target_depth,
                 bid_ask_maximum_depth=values.bid_ask_maximum_depth,
                 maximum_position_bins=values.maximum_position_bins,
+                bid_ask_local_high_fraction=values.bid_ask_local_high_fraction,
+                spot_depth=values.spot_depth,
                 spot_minimum_volume_per_minute=values.minimum_volume_per_minute,
                 spot_minimum_fee_efficiency=values.minimum_fee_efficiency,
+                spot_ath_minimum_market_cap=values.spot_ath_minimum_market_cap,
                 overvolume_volume_per_minute=values.overvolume_volume_per_minute,
                 ath_breakout_margin=values.ath_breakout_margin,
                 spot_holding_horizon=values.spot_holding_horizon,
                 overvolume_maximum_holding_period=values.overvolume_maximum_holding_period,
                 overvolume_volume_decay_ratio=values.overvolume_volume_decay_ratio,
+                bid_ask_take_profit=values.bid_ask_take_profit,
+                spot_ath_take_profit=values.spot_ath_take_profit,
+                overvolume_take_profit=values.overvolume_take_profit,
                 bid_only_upside_grace=values.bid_only_upside_grace,
                 bid_only_upside_exit=values.bid_only_upside_exit,
             ),
         ),
         risk=RiskPolicy(ruleset_version=ruleset_version, config_version=config_version),
-        shadow_costs=_shadow_costs(),
+        shadow_costs=_shadow_costs(priority_fee_lamports=priority_fee_lamports),
         entry_notional_quote=values.entry_notional_quote,
         quote_base_units_per_unit=values.quote_base_units_per_unit,
         max_slippage_bps=values.max_slippage_bps,
         kill_switch_policy=kill_switch_policy,
         deep_candidate_limit=values.maximum_deep_candidates,
+        liquidity_slippage=values.liquidity_slippage,
     )
 
 
@@ -446,21 +490,27 @@ def load_pipeline_policy(environ: Mapping[str, str]) -> PipelinePolicy:
     ``RULESET_OVERRIDES_FILE`` points to YAML with ``config_version`` and a ``thresholds``
     mapping of ``GuidePolicySettings`` fields; tuned numbers must carry their own version.
     ``guide-v1`` always carries the GMGN rules (G18); ``GMGN_REQUIRED_FOR_LIVE=false``
-    is the only way to let LIVE enter without fresh GMGN data.
+    is the only way to let LIVE enter without fresh GMGN data. ``PRIORITY_FEE_MAX_LAMPORTS``
+    (the executor's ceiling) is the priority fee SHADOW books per transaction, any ruleset.
     """
 
     version = environ.get(RULESET_VERSION_ENV) or DEFAULT_RULESET_VERSION
     overrides_path = environ.get(RULESET_OVERRIDES_ENV)
     interval = universe_interval(environ)
+    priority = priority_fee_lamports(environ)
     if version == LEGACY_RULESET_VERSION:
         if overrides_path:
             raise ValueError("threshold overrides apply to guide-v1 only")
-        return hypothesis_policy(universe_interval=interval)
+        return hypothesis_policy(universe_interval=interval, priority_fee_lamports=priority)
     if version != GUIDE_RULESET_VERSION:
         raise ValueError(f"unknown ruleset version {version!r}")
     required = gmgn_required_for_live(environ)
     if not overrides_path:
-        return guide_policy(universe_interval=interval, gmgn_required_for_live=required)
+        return guide_policy(
+            universe_interval=interval,
+            gmgn_required_for_live=required,
+            priority_fee_lamports=priority,
+        )
     document = yaml.safe_load(Path(overrides_path).read_text(encoding="utf-8")) or {}
     if not isinstance(document, dict):
         raise ValueError("ruleset overrides must be a mapping")
@@ -484,7 +534,20 @@ def load_pipeline_policy(environ: Mapping[str, str]) -> PipelinePolicy:
         config_version=config_version,
         universe_interval=interval,
         gmgn_required_for_live=required,
+        priority_fee_lamports=priority,
     )
+
+
+def priority_fee_lamports(environ: Mapping[str, str]) -> int:
+    """``PRIORITY_FEE_MAX_LAMPORTS``: empty means the executor's default (0.015 SOL); like the
+    executor, anything but a whole number refuses to start."""
+
+    raw = (environ.get(PRIORITY_FEE_MAX_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_PRIORITY_FEE_LAMPORTS
+    if not raw.isdigit():
+        raise ValueError(f"{PRIORITY_FEE_MAX_ENV} must be a whole number of lamports")
+    return int(raw)
 
 
 def gmgn_required_for_live(environ: Mapping[str, str]) -> bool:
@@ -498,9 +561,10 @@ def gmgn_required_for_live(environ: Mapping[str, str]) -> bool:
     raise ValueError(f"{GMGN_REQUIRED_FOR_LIVE_ENV} must be true or false")
 
 
-def _shadow_costs(slippage_bps: int = 50) -> CostModel:
+def _shadow_costs(slippage_bps: int = 50, priority_fee_lamports: int = 0) -> CostModel:
     return CostModel(
         slippage_bps=slippage_bps,
         network_fee_base_units=Decimal(0),
         jito_tip_base_units=Decimal(0),
+        priority_fee_lamports=priority_fee_lamports,
     )

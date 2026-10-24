@@ -52,7 +52,7 @@ export interface ExecutableSwapQuote extends SwapQuote {
 /** The part of the official `DLMM` pool object this executor relies on. */
 export interface MeteoraPoolClient {
   pubkey: PublicKey;
-  lbPair: { activeId: number };
+  lbPair: { activeId: number; binStep?: number };
   tokenX: { publicKey: PublicKey; mint: { decimals: number } };
   tokenY: { publicKey: PublicKey; mint: { decimals: number } };
   getBinArrayForSwap(swapForY: boolean, count?: number): Promise<unknown[]>;
@@ -157,6 +157,27 @@ function wholeUnits(value: string): bigint {
   return shift >= 0 ? BigInt(digits) * 10n ** BigInt(shift) : BigInt(digits.slice(0, shift) || "0");
 }
 
+/**
+ * The `slippage` (percent) handed to the SDK's liquidity calls. The SDK turns it into the
+ * bins the active bin may move before the chain refuses the deposit, as
+ * `ceil(slippage / (binStep / 100))`. A command anchored on an active bin carries its
+ * liquidity slippage in bins (`active_bin_tolerance`, spec 6.8 - a share of the range): the
+ * percent is chosen half a bin short of it, so the SDK's ceiling is exactly that many bins
+ * (0 included). Without an anchor or a known bin step, the price-based limit as before.
+ */
+export function liquiditySlippage(command: DlmmCommandV2, binStep: number | undefined): number {
+  const tolerance = command.active_bin_tolerance;
+  if (
+    tolerance === undefined ||
+    binStep === undefined ||
+    !Number.isInteger(binStep) ||
+    binStep <= 0
+  ) {
+    return command.max_slippage_bps / 100;
+  }
+  return (tolerance * binStep - 0.5) / 100;
+}
+
 async function quoted(measure: () => QuotedImpact | Promise<QuotedImpact>): Promise<number> {
   let quote: QuotedImpact;
   try {
@@ -235,7 +256,7 @@ export class OfficialMeteoraDlmmBoundary implements SdkBoundary {
           ? this.factory.StrategyType.BidAsk
           : this.factory.StrategyType.Spot,
     };
-    const slippage = command.max_slippage_bps / 100;
+    const slippage = liquiditySlippage(command, pool.lbPair.binStep);
 
     if (command.operation === "OPEN") {
       const positionKey = this.newPositionKey();

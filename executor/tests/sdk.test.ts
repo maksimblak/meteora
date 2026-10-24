@@ -90,7 +90,7 @@ class FakePool implements MeteoraPoolClient {
   readonly calls: Call[] = [];
   readonly quotes: Array<{ kind: string; amount: string; swapForY: boolean; slippage: string }> = [];
   pubkey = new PublicKey(POOL);
-  lbPair = { activeId: 8001 };
+  lbPair: { activeId: number; binStep?: number } = { activeId: 8001 };
   tokenX = { publicKey: new PublicKey("SysvarC1ock11111111111111111111111111111111"), mint: { decimals: 6 } };
   tokenY = { publicKey: new PublicKey("So11111111111111111111111111111111111111112"), mint: { decimals: 9 } };
   quoteFailure: Error | undefined;
@@ -270,6 +270,62 @@ describe("official Meteora SDK boundary", () => {
       [wallet],
       [wallet],
     ]);
+  });
+
+  it("opens the author's one-sided Spot from Y alone with the command's bin tolerance", async () => {
+    // T19 (spec 6.8): Spot evenly from the active bin down, quote token only; the SDK's
+    // active-bin slippage is the command's liquidity slippage in bins, not 1% of price.
+    const wallet = Keypair.generate();
+    const pool = new FakePool(wallet);
+    pool.lbPair = { activeId: 8001, binStep: 80 };
+    const boundary = new OfficialMeteoraDlmmBoundary(
+      {} as Connection,
+      walletSigners(wallet),
+      factoryFor(pool),
+    );
+    const spot = (tolerance: number): DlmmCommandV2 =>
+      parseDlmmCommandV2({
+        ...command(wallet, "OPEN", "0"),
+        min_bin_id: 7963,
+        max_bin_id: 8001,
+        active_bin_id: 8001,
+        active_bin_tolerance: tolerance,
+      });
+
+    const built = await boundary.build(spot(21));
+    await boundary.build(spot(0));
+
+    const [wide, none] = pool.calls.map(
+      (call) =>
+        call.parameters as {
+          totalXAmount: { toString(): string };
+          totalYAmount: { toString(): string };
+          strategy: { minBinId: number; maxBinId: number; strategyType: number };
+          slippage: number;
+        },
+    );
+    expect(wide?.strategy).toEqual({ minBinId: 7963, maxBinId: 8001, strategyType: 11 });
+    expect(wide?.totalXAmount.toString()).toBe("0");
+    expect(wide?.totalYAmount.toString()).toBe("2000");
+    expect(built.market.priceImpactBps).toBe(0);
+    // The SDK turns `slippage` (percent) into bins as ceil(slippage / (binStep / 100)).
+    const sdkBins = (slippage: number): number => Math.ceil(slippage / (80 / 100)) + 0;
+    expect(sdkBins(wide?.slippage ?? Number.NaN)).toBe(21);
+    expect(sdkBins(none?.slippage ?? Number.NaN)).toBe(0);
+  });
+
+  it("keeps the price-based slippage when the pool's bin step is unknown", async () => {
+    const wallet = Keypair.generate();
+    const pool = new FakePool(wallet);
+    const boundary = new OfficialMeteoraDlmmBoundary(
+      {} as Connection,
+      walletSigners(wallet),
+      factoryFor(pool),
+    );
+
+    await boundary.build(command(wallet, "OPEN", "0"));
+
+    expect((pool.calls[0]?.parameters as { slippage: number }).slippage).toBe(0.5);
   });
 
   it("has no swap leg for an entry without X", async () => {

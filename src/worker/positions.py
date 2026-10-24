@@ -11,15 +11,24 @@ spec 7.3) decides: ``ORDERLY_EXIT`` turns every review into an EXIT - each posit
 leaves through a fresh simulation even without another reason - and ``HOLD_AND_ALERT``
 keeps every position. Non-SHADOW exits of the mode the execution gateway serves are
 carried out by ``GatewayPositionManager`` in the same job.
+
+As the author follows a position (spec 6.8, T19): its pool is reread on its own every
+``snapshot_interval`` (30 s) instead of waiting for the universe sweep (5 min) - the short
+window summed over those rereads by the F1 rules, nothing of them stored with the
+universe's history; its net P&L of leaving now (the fills' accounting: fees, slippage,
+priority fees, the sale) is checked against the plan's take profit; and with a GMGN source
+the developer's status and share are read every ``developer_interval`` (5 min).
 """
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from decimal import ROUND_CEILING, Decimal
+from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+from src.accounting.models import ExitSaleModel
 from src.accounting.repository import AccountingRepository
-from src.accounting.service import AccountingService, ShadowBroker
+from src.accounting.service import AccountingService, ShadowBroker, priority_fee_base_units
 from src.core.clock import Clock
 from src.domain.models.events import EventType
 from src.domain.models.primitives import PublicKey
@@ -33,10 +42,21 @@ from src.domain.strategy import (
     PositionReason,
     PositionSignals,
     PositionState,
+    developer_sold,
 )
 from src.execution.contracts import DlmmCommandV1, DlmmOperation
+from src.gmgn.enrichment import EnhancedSignalSource
 from src.market.contracts import OnChainProvider
-from src.market.models import AuthorityStatus, PoolSnapshot, RiskSignal, TokenRiskSnapshot
+from src.market.models import (
+    AuthorityStatus,
+    EnhancedTokenSignals,
+    Freshness,
+    PoolRef,
+    PoolSnapshot,
+    RiskSignal,
+    TokenRiskSnapshot,
+)
+from src.market.windows import derive_short_window
 from src.modes.alerts import alert_subject
 from src.modes.models import KillSwitchPolicy, RiskDayState
 from src.modes.repository import ModeRepository
@@ -59,6 +79,14 @@ from src.worker.policy import PipelinePolicy
 from src.worker.portfolio import RiskDayKeeper, ShadowPortfolio
 
 _BPS = Decimal(10_000)
+DEFAULT_SNAPSHOT_INTERVAL = timedelta(seconds=30)
+DEFAULT_DEVELOPER_INTERVAL = timedelta(minutes=5)
+
+
+class PoolSnapshotSource(Protocol):
+    """One pool as the market data source serves it now (``current_snapshot``)."""
+
+    async def current_snapshot(self, pool: PoolRef) -> PoolSnapshot: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,11 +126,22 @@ class PositionCycle:
         decisions: DecisionStore | None = None,
         evidence: DailyEvidence | None = None,
         gateway_mode: TradingMode | None = None,
+        snapshots: PoolSnapshotSource | None = None,
+        snapshot_interval: timedelta = DEFAULT_SNAPSHOT_INTERVAL,
+        developer: EnhancedSignalSource | None = None,
+        developer_interval: timedelta = DEFAULT_DEVELOPER_INTERVAL,
+        exit_sale: ExitSaleModel | None = None,
     ) -> None:
         """``decisions``: the plan records whose own exit rules (the volume-decay ratio of
-        an overvolume Spot) the monitor applies; ``evidence`` counts invariant breaches;
-        ``gateway_mode``: the mode the wired execution gateway exits positions of."""
+        an overvolume Spot, the take profit) the monitor applies; ``evidence`` counts
+        invariant breaches; ``gateway_mode``: the mode the wired execution gateway exits
+        positions of. ``snapshots`` rereads a position's pool every ``snapshot_interval``;
+        without it the monitor sees the universe's snapshots only. ``developer`` (GMGN with
+        a key) is asked for the developer's status every ``developer_interval``.
+        ``exit_sale``: the SHADOW sale after an exit (``SWAP_AFTER_EXIT``)."""
 
+        if snapshot_interval <= timedelta(0) or developer_interval <= timedelta(0):
+            raise ValueError("reread intervals must be positive")
         self._modes = modes
         self._accounting = accounting
         self._contexts = contexts
@@ -118,6 +157,18 @@ class PositionCycle:
         self._decisions = decisions
         self._evidence = evidence
         self._gateway_mode = gateway_mode
+        self._snapshots = snapshots
+        self._snapshot_interval = snapshot_interval
+        self._developer = developer
+        self._developer_interval = developer_interval
+        self._exit_sale = exit_sale if exit_sale is not None else ExitSaleModel()
+        # In memory only: the latest reread of each pool (whose counter marks the next one
+        # continues) and when it was asked for; the developer watch of each position.
+        self._fresh: dict[str, PoolSnapshot] = {}
+        self._fetched_at: dict[str, datetime] = {}
+        self._pools: dict[str, str] = {}
+        self._above_from: dict[str, datetime] = {}
+        self._developer_watch: dict[str, _DeveloperWatch] = {}
         self._plan_exits: dict[str, _PlanExit] = {}
         self._monitor = PositionMonitor(
             volume_decay_ratio=policy.strategy.volume_decay_ratio,
@@ -133,7 +184,9 @@ class PositionCycle:
             now = self._clock.now()
             reviews: list[PositionReview] = []
             valuations: dict[str, PositionValuation] = {}
-            for position_id in self._modes.open_positions():
+            open_ids = self._modes.open_positions()
+            self._forget_closed(set(open_ids))
+            for position_id in open_ids:
                 review, valuation = await self._review(position_id, now, correlation)
                 reviews.append(review)
                 if valuation is not None and not review.closed:
@@ -208,24 +261,29 @@ class PositionCycle:
             return PositionReview(
                 position_id, PositionActionKind.ALERT, ("MARKET_DATA_UNSAFE",), None
             ), None
-        market = history[-1]
+        self._pools[position_id] = context.pool_address
+        market = await self._market(history[-1], now)
         valuation = AccountingService().mark(position, market)
         risk = self._daily.risk_state()
         if risk is None:  # pragma: no cover - ensure_open ran first
             return PositionReview(
                 position_id, PositionActionKind.ALERT, ("RISK_DAY_NOT_OPENED",), None
             ), valuation
-        state = _state(context, await self._plan_exit(context))
+        plan_exit = await self._plan_exit(context)
+        state = _state(context, plan_exit)
+        close_cost = self._cost(valuation, market)
         signals = PositionSignals(
             current_fee_tvl=_fee_tvl(market),
             baseline_fee_tvl=context.baseline_fee_tvl,
             competing_tvl_growth=_growth(context.entry_tvl, market.tvl),
             normalized_range_position=_range_position(context, market.price),
             token_risk=_token_signal(await self._token(context, now)),
-            estimated_rebalance_cost_base_units=self._cost(valuation) * 2,
-            estimated_close_cost_base_units=self._cost(valuation),
+            estimated_rebalance_cost_base_units=close_cost * 2,
+            estimated_close_cost_base_units=close_cost,
             expected_remaining_fee_income_base_units=0,
             above_range_since=await self._above_since(state, context, market, now),
+            net_pnl_fraction=self._net_pnl_fraction(position, plan_exit, market, now),
+            developer_sold=await self._developer_sold(context, now),
         )
         policy = self._modes.mode_state().active_kill_switch_policy
         action = _under_kill_switch(self._monitor.evaluate(state, market, risk, signals), policy)
@@ -294,7 +352,7 @@ class PositionCycle:
             remove_bps=10_000,
         )
         try:
-            receipt = ShadowBroker(self._accounting, self._clock).apply(
+            receipt = ShadowBroker(self._accounting, self._clock, self._exit_sale).apply(
                 command, market, self._policy.shadow_costs
             )
         except ValueError as error:
@@ -332,9 +390,131 @@ class PositionCycle:
                     volume_decay_ratio=plan.invalidation.volume_decay_ratio,
                     upside_breach_grace=plan.exit_policy.upside_breach_grace,
                     upside_breach_fraction=plan.exit_policy.upside_breach_fraction,
+                    take_profit_fraction=plan.exit_policy.take_profit_fraction,
+                    bins=(plan.lower_bin_offset, plan.upper_bin_offset),
                 )
         self._plan_exits[context.position_id] = found
         return found
+
+    async def _market(self, stored: PoolSnapshot, now: datetime) -> PoolSnapshot:
+        """The newest view of the pool: the universe's snapshot, or the position's own
+        reread of it once ``snapshot_interval`` has passed since the last one.
+
+        A reread's short window is derived from the previous reread, whose counter marks
+        hold the 30-second readings, so readings closer than the window are summed (F1) -
+        a newer universe snapshot (marks at the sweep's cadence only) does not restart
+        that chain. Only when the rereads' chain makes no window (the first reread, a gap
+        after failures, a counter reset) is the newer universe snapshot tried instead.
+        Rereads never enter the universe's history. A failed reread leaves the universe's
+        snapshot (a stale one alerts as before) and waits for the next interval.
+        """
+
+        pool = stored.pool.address.root
+        fresh = self._fresh.get(pool)
+        latest = stored if fresh is None or fresh.source_at <= stored.source_at else fresh
+        source = self._snapshots
+        fetched = self._fetched_at.get(pool)
+        if source is None or (fetched is not None and now - fetched < self._snapshot_interval):
+            return latest
+        self._fetched_at[pool] = now
+        try:
+            current = await source.current_snapshot(stored.pool)
+        except Exception as error:
+            self._log.warning("position_snapshot_unavailable", pool=pool, **error_fields(error))
+            return latest
+        if current.pool != stored.pool or current.source_at <= latest.source_at:
+            return latest
+        rules = self._policy.short_window
+        derived = derive_short_window(current, fresh or stored, rules)
+        if fresh is not None and latest is stored and not _has_window(derived, rules.window):
+            derived = derive_short_window(current, stored, rules)
+        self._fresh[pool] = derived
+        return derived
+
+    def _net_pnl_fraction(
+        self,
+        position: ShadowPosition,
+        plan: "_PlanExit",
+        market: PoolSnapshot,
+        now: datetime,
+    ) -> Decimal | None:
+        """Net P&L of leaving now over the capital, as the SHADOW exit would book it (fees
+        earned, slippage, network and priority fees, the sale of the returned base token);
+        only for a plan with a take profit."""
+
+        if plan.take_profit_fraction is None or plan.bins is None:
+            return None
+        try:
+            preview = ShadowBroker(self._accounting, self._clock, self._exit_sale).preview_close(
+                position,
+                market,
+                self._policy.shadow_costs,
+                bins=plan.bins,
+                at=max(now, position.updated_at),
+            )
+        except ValueError as error:
+            self._log.warning("take_profit_unmeasured", **error_fields(error))
+            return None
+        if preview.invested_base_units <= 0:
+            return None
+        return preview.net_pnl_base_units / preview.invested_base_units
+
+    async def _developer_sold(self, context: PositionContext, now: datetime) -> bool:
+        """GMGN says the developer sold since the entry (``developer_sold``), asked at most
+        every ``developer_interval``; the entry's reading is the decision's, else the first
+        fresh one here. Once sold, the position keeps the reason until it is closed."""
+
+        source = self._developer
+        if source is None:
+            return False
+        watch = self._developer_watch.get(context.position_id)
+        if watch is not None and (watch.sold or now - watch.checked_at < self._developer_interval):
+            return watch.sold
+        baseline = watch.baseline if watch is not None else await self._entry_developer(context)
+        try:
+            reading = await source.get_token_signals(PublicKey(context.base_mint))
+        except Exception as error:
+            self._log.warning("developer_status_unavailable", **error_fields(error))
+            self._developer_watch[context.position_id] = _DeveloperWatch(now, False, baseline)
+            return False
+        sold = developer_sold(baseline, reading)
+        if baseline is None and reading.freshness is Freshness.FRESH:
+            baseline = reading
+        self._developer_watch[context.position_id] = _DeveloperWatch(now, sold, baseline)
+        if sold:
+            self._log.warning("developer_sold", position_id=context.position_id)
+        return sold
+
+    async def _entry_developer(self, context: PositionContext) -> EnhancedTokenSignals | None:
+        """The fresh GMGN reading the entry decision was made with, if any."""
+
+        if self._decisions is None:
+            return None
+        try:
+            record = await self._decisions.decision(context.decision_id)
+        except Exception as error:
+            self._log.warning("decision_record_unavailable", **error_fields(error))
+            return None
+        reading = None if record is None else record.token.enhanced
+        if reading is None or reading.freshness is not Freshness.FRESH:
+            return None
+        return reading
+
+    def _forget_closed(self, open_ids: set[str]) -> None:
+        """Drop the in-memory state of positions that are no longer open."""
+
+        for position_id in set(self._developer_watch) - open_ids:
+            del self._developer_watch[position_id]
+        for position_id in set(self._plan_exits) - open_ids:
+            del self._plan_exits[position_id]
+        for position_id in set(self._above_from) - open_ids:
+            del self._above_from[position_id]
+        pools ={pool for position_id, pool in self._pools.items() if position_id in open_ids}
+        self._pools = {key: value for key, value in self._pools.items() if key in open_ids}
+        for pool in set(self._fresh) - pools:
+            del self._fresh[pool]
+        for pool in set(self._fetched_at) - pools:
+            del self._fetched_at[pool]
 
     async def _above_since(
         self,
@@ -343,10 +523,19 @@ class PositionCycle:
         market: PoolSnapshot,
         now: datetime,
     ) -> datetime | None:
-        """Start of the unbroken run of snapshots above a bid-only range, from history."""
+        """Start of the unbroken run above a bid-only range.
 
+        Found in the stored history when the review first sees the price above, then kept
+        while every review's market (rereads included) stays above; one below ends it.
+        """
+
+        position_id = context.position_id
         if state.upside_breach_grace is None or not PositionMonitor.above_range(state, market):
+            self._above_from.pop(position_id, None)
             return None
+        known = self._above_from.get(position_id)
+        if known is not None:
+            return known
         history = await self._history.history(
             context.pool_address, until=now, limit=self._policy.features.maximum_history_points
         )
@@ -357,6 +546,7 @@ class PositionCycle:
             if not PositionMonitor.above_range(state, snapshot):
                 break
             since = min(since, snapshot.observed_at)
+        self._above_from[position_id] = since
         return since
 
     async def _token(self, context: PositionContext, now: datetime) -> TokenRiskSnapshot | None:
@@ -366,12 +556,13 @@ class PositionCycle:
             self._log.warning("token_risk_unavailable", **error_fields(error))
             return None
 
-    def _cost(self, valuation: PositionValuation) -> int:
+    def _cost(self, valuation: PositionValuation, market: PoolSnapshot) -> int:
         costs = self._policy.shadow_costs
         value = (
             valuation.liquidity_value_base_units * Decimal(costs.slippage_bps) / _BPS
             + costs.network_fee_base_units
             + costs.jito_tip_base_units
+            + priority_fee_base_units(costs, market)
         )
         return int(value.to_integral_value(rounding=ROUND_CEILING))
 
@@ -426,6 +617,16 @@ class _PlanExit:
     volume_decay_ratio: Decimal | None = None
     upside_breach_grace: timedelta | None = None
     upside_breach_fraction: Decimal | None = None
+    take_profit_fraction: Decimal | None = None
+    # The plan's range in bins relative to the entry price.
+    bins: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _DeveloperWatch:
+    checked_at: datetime
+    sold: bool
+    baseline: EnhancedTokenSignals | None
 
 
 def _state(context: PositionContext, plan: _PlanExit | None = None) -> PositionState:
@@ -441,7 +642,12 @@ def _state(context: PositionContext, plan: _PlanExit | None = None) -> PositionS
         volume_decay_ratio=rules.volume_decay_ratio,
         upside_breach_grace=rules.upside_breach_grace,
         upside_breach_fraction=rules.upside_breach_fraction,
+        take_profit_fraction=rules.take_profit_fraction,
     )
+
+
+def _has_window(snapshot: PoolSnapshot, window: str) -> bool:
+    return window in snapshot.windows
 
 
 def _fee_tvl(market: PoolSnapshot) -> Decimal | None:

@@ -232,6 +232,11 @@ ADMISSION = {
     "BALANCE_CAP": "ограничено балансом",
     "SIZED_PLAN_INVARIANT_BREACH": "размер нарушил инвариант риска — вход отклонён",
     "PLAN_ALREADY_ADMITTED": "план уже допущен в этом цикле",
+    # The strategy refused the plan (spec 6.8, T19).
+    "NOT_NEAR_LOCAL_HIGH": "цена ниже 90% локального хая за час — бид-аск не с хаёв, плана нет",
+    "RANGE_TOO_NARROW": (
+        "bin step пула не даёт бид-аску глубины 70% в одной позиции SDK — пул не годится"
+    ),
 }
 
 # ``depth_source`` detail: why depth and price impact were not measured by a quote (D07, F1).
