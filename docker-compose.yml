@@ -15,8 +15,9 @@ x-policy-environment: &policy-environment
   RULESET_OVERRIDES_FILE: ${RULESET_OVERRIDES_FILE:-}
   WORKER_UNIVERSE_INTERVAL_SECONDS: ${WORKER_UNIVERSE_INTERVAL_SECONDS:-}
   GMGN_REQUIRED_FOR_LIVE: ${GMGN_REQUIRED_FOR_LIVE:-}
-  # The executor's priority fee ceiling per transaction; SHADOW books it on every entry,
-  # exit and sale (the money executor below reads the same variable).
+  # The executor's priority fee ceiling per transaction (the money executor below reads the
+  # same variable). SHADOW books its own estimate on every entry, exit and sale - guide-v1
+  # ``shadow_priority_fee_lamports`` - never more than this ceiling.
   PRIORITY_FEE_MAX_LAMPORTS: ${PRIORITY_FEE_MAX_LAMPORTS:-}
 
 x-python-service: &python-service
@@ -224,17 +225,23 @@ services:
     expose:
       - "3000"
 
+  # The canonical check. It may run while the bot runs: it works in its own database
+  # ``meteora_check`` on the same postgres (created when missing, then migrated and handed to
+  # the tests), so it writes nothing into ``meteora`` and never contends with the worker for
+  # its leases. Nothing needs cleaning in the working database afterwards.
   check:
     <<: *python-service
     profiles: ["test"]
     environment:
       <<: *python-environment
-      TEST_DATABASE_URL: postgresql+asyncpg://meteora@postgres:5432/meteora
+      DATABASE_URL: &check-database postgresql+asyncpg://meteora@postgres:5432/meteora_check
+      TEST_DATABASE_URL: *check-database
     command:
       - sh
       - -ec
       - |
         umask 077
+        uv run python -m tests.check_database
         printf '%s' "$${DATABASE_URL}" > /tmp/database-url
         export DATABASE_URL_FILE=/tmp/database-url
         unset DATABASE_URL

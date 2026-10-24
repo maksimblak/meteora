@@ -120,6 +120,7 @@ EXECUTOR_INTERNAL_TOKEN=<ещё одна случайная строка>
 
 - Канонический набор (миграции, линтер, типы, тесты Python и executor), всё в Docker:
   `docker compose --profile test run --rm --build check`
+  - его можно запускать при работающем боте: проверка работает в своей базе `meteora_check` того же postgres, рабочую `meteora` и аренды worker не трогает; после неё в рабочей базе ничего чистить не нужно.
 - Приёмочный прогон стека на записанных данных, без денег и внешней сети (около 10 минут, нужен uv):
   `powershell -ExecutionPolicy Bypass -File scripts\acceptance-smoke.ps1`
 - Проверка папки поставки (всё на месте, нет `.env`, ключей, кэшей, `.git`):

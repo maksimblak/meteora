@@ -279,3 +279,4 @@ docker compose up -d
 3. `docker compose up -d --build` — сервис `migrate` применит миграции до запуска api и worker.
 4. Смена порогов или версии правил = новая `config_version` / `RULESET_VERSION`; evidence, собранный для старой версии, для новой не годится.
 5. Проверка поставки без запуска: `powershell -ExecutionPolicy Bypass -File scripts\verify-delivery.ps1 -Path <папка>`; приёмочный прогон стека: `scripts\acceptance-smoke.ps1`.
+6. Канонический набор проверок `docker compose --profile test run --rm --build check` можно запускать, не останавливая бота (в том числе в дни SHADOW): он работает в своей базе `meteora_check` того же postgres и не пишет в рабочую `meteora`, поэтому evidence не портит и чистить после него ничего не нужно.

@@ -1,5 +1,4 @@
 import asyncio
-import os
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -10,11 +9,13 @@ from src.core.clock import FrozenClock
 from src.domain.models.events import AuditEvent, EventType
 from src.persistence.database import create_engine, create_session_factory
 from src.persistence.models import OutboxEventRecord, PoolRecord
+from src.persistence.testing import integration_database_url
 from src.persistence.uow import SqlAlchemyUnitOfWork
 
 
 def _database_url() -> str:
-    value = os.getenv("TEST_DATABASE_URL") or os.getenv("DATABASE_URL")
+    # Only the test database: these tests write into its shared schema, never the working one.
+    value = integration_database_url()
     if not value:
         pytest.skip("PostgreSQL integration URL is not configured")
     return value
