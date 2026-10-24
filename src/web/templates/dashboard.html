@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_alerts.html" import alert_list %}
 {% block title %}Обзор{% endblock %}
 {% block content %}
 <h1>Обзор</h1>
@@ -75,16 +76,7 @@
 
 <section class="card">
   <h2>Critical alerts</h2>
-  {% if status.alerts %}
-    <table>
-      <tr><th>Время</th><th>Код</th><th>Сообщение</th></tr>
-      {% for alert in status.alerts %}
-        <tr><td>{{ alert.created_at | dt }}</td><td><code>{{ alert.code }}</code></td><td>{{ alert.message }}</td></tr>
-      {% endfor %}
-    </table>
-  {% else %}
-    <p class="muted">Открытых критических событий нет.</p>
-  {% endif %}
+  {{ alert_list(status.alerts, logged_in, csrf_field, csrf_token) }}
   <p>Ждут подтверждения: {{ status.approvals_pending }} · <a href="/approvals">Подтверждения →</a> · <a href="/settings">Журнал и настройки →</a></p>
 </section>
 

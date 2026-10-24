@@ -9,7 +9,7 @@
 """
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
@@ -28,6 +28,7 @@ from src.modes.models import CriticalAlert, KillSwitchPositionAction, ModeTransi
 from src.modes.repository import ModeRepository, SqliteModeRepository
 from src.persistence.contracts import (
     AuditLog,
+    DecisionJournal,
     DecisionStore,
     EventSink,
     JobLeases,
@@ -124,10 +125,19 @@ class Repositories:
     positions: PositionContextStore
     database: PostgresDatabase | None = None
     closers: tuple[Callable[[], None], ...] = ()
+    retention_policy: RetentionPolicy = field(default_factory=RetentionPolicy)
     _closed: bool = field(default=False, repr=False)
 
+    @property
+    def journal(self) -> DecisionJournal:
+        """The read side of the decision records (pages, plans, standing decisions)."""
+
+        if isinstance(self.decisions, DecisionJournal):
+            return self.decisions
+        raise PersistenceConfigurationError("this decision store offers no decision journal")
+
     def outbox_relay(
-        self, sink: EventSink, clock: Clock, *, owner: str, batch_size: int = 100
+        self, sink: EventSink, clock: Clock, *, owner: str, batch_size: int = 500
     ) -> OutboxRelay | None:
         if self.database is None:
             return None
@@ -137,9 +147,9 @@ class Repositories:
         if self.database is None:
             return None
         policy = (
-            RetentionPolicy()
+            self.retention_policy
             if published_outbox_age is None
-            else RetentionPolicy(published_outbox_age)
+            else replace(self.retention_policy, published_outbox_age=published_outbox_age)
         )
         return PostgresRetention(self.database, policy)
 
@@ -173,7 +183,13 @@ def open_repositories(
     clock = clock or SystemClock()
     dsn = config.database_dsn()
     if dsn:
-        return _postgres(dsn, clock, schema=schema, pool_size=pool_size)
+        repositories = _postgres(dsn, clock, schema=schema, pool_size=pool_size)
+        try:
+            repositories.retention_policy = RetentionPolicy.from_environment(environ or {})
+        except BaseException:
+            repositories.close()
+            raise
+        return repositories
     sqlite_path = (environ or {}).get(LOCAL_SQLITE_PATH)
     if not sqlite_path:
         raise PersistenceConfigurationError(
@@ -188,13 +204,10 @@ def open_repositories(
 
 def _postgres(dsn: str, clock: Clock, *, schema: str | None, pool_size: int) -> Repositories:
     from src.persistence.accounting_repository import PostgresAccountingRepository
+    from src.persistence.decisions import PostgresDecisionStore
     from src.persistence.execution_store import PostgresExecutionStore
     from src.persistence.leases import PostgresJobLeases
-    from src.persistence.market_store import (
-        PostgresDecisionStore,
-        PostgresPositionContexts,
-        PostgresUniverseStore,
-    )
+    from src.persistence.market_store import PostgresPositionContexts, PostgresUniverseStore
     from src.persistence.mode_repository import PostgresModeRepository
     from src.persistence.outbox import PostgresAuditLog
 

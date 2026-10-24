@@ -4,7 +4,9 @@ Every evaluation is recorded *before* any money step: the decision record (facts
 features, thresholds, reasons, versions, correlation ID) and its audit event must
 persist, otherwise the cycle stops with a critical alert. Identifiers are
 deterministic per (pool, decision time, ruleset, config), so a retried cycle
-returns the same decision and never admits a second plan.
+returns the same decision and never admits a second plan. A pool whose outcome did not
+change keeps its earlier record and audit event (R29i.2): storage grows with changes,
+not with pools x cycles; an accepted candidate is recorded every time.
 
 Live data (D07): a pool is a *candidate* only after the cheap filters - every hard
 filter the snapshot and features alone can decide, run with the token not yet checked.
@@ -236,25 +238,41 @@ class CandidatePipeline:
             thresholds=policy.screening,
             recorded_at=self._clock.now(),
         )
-        evaluated_event = audit_event(
-            EventType.CANDIDATE_EVALUATED,
-            self._clock.now(),
-            decision_id,
-            correlation,
-            causation_id,
-            {
-                "decision_id": str(decision_id),
-                "pool_address": pool_address,
-                "status": decision.status.value,
-                "score": None if decision.score is None else str(decision.score),
-                "reasons": [reason.value for reason in decision.reasons],
-                "missing_signals": list(decision.missing_signals),
-                "ruleset_version": decision.ruleset_version,
-                "config_version": decision.config_version,
-            },
-        )
-        await self._persist("DECISION_PERSISTENCE_FAILED", self._decisions.record_decision(record))
-        await self._persist("AUDIT_PERSISTENCE_FAILED", self._audit.append(evaluated_event))
+        # R29i.2: records grow with changes, not with pools x cycles. An unchanged outcome
+        # keeps its earlier record (and audit event); an accepted candidate is always
+        # recorded, because its plan and money step need the facts of this evaluation.
+        if decision.status is CandidateStatus.ACCEPT:
+            decision_id = await self._persist(
+                "DECISION_PERSISTENCE_FAILED",
+                self._decisions.record_decision(record, evaluated_at=decision_at),
+            )
+            recorded = True
+        else:
+            stored = await self._persist(
+                "DECISION_PERSISTENCE_FAILED",
+                self._decisions.record_evaluation(record, evaluated_at=decision_at),
+            )
+            decision_id, recorded = stored.decision_id, stored.recorded
+        evaluated_event = None
+        if recorded:
+            evaluated_event = audit_event(
+                EventType.CANDIDATE_EVALUATED,
+                self._clock.now(),
+                decision_id,
+                correlation,
+                causation_id,
+                {
+                    "decision_id": str(decision_id),
+                    "pool_address": pool_address,
+                    "status": decision.status.value,
+                    "score": None if decision.score is None else str(decision.score),
+                    "reasons": [reason.value for reason in decision.reasons],
+                    "missing_signals": list(decision.missing_signals),
+                    "ruleset_version": decision.ruleset_version,
+                    "config_version": decision.config_version,
+                },
+            )
+            await self._persist("AUDIT_PERSISTENCE_FAILED", self._audit.append(evaluated_event))
         self._metrics.candidate(
             decision.status.value, (reason.value for reason in decision.reasons)
         )
@@ -265,6 +283,7 @@ class CandidatePipeline:
         )
         if decision.status is not CandidateStatus.ACCEPT:
             return outcome
+        assert evaluated_event is not None  # an accepted candidate is always recorded
         return await self._plan_and_enter(
             outcome, decision, market, correlation, evaluated_event.event_id, depth
         )
@@ -459,9 +478,9 @@ class CandidatePipeline:
         reasons = () if result.reason is None else (result.reason,)
         return replace(outcome, plan_id=plan_id, entry=result, reasons=reasons)
 
-    async def _persist(self, code: str, write: Awaitable[object]) -> None:
+    async def _persist[T](self, code: str, write: Awaitable[T]) -> T:
         try:
-            await write
+            return await write
         except Exception as error:
             self._log.critical("persistence_failed", code=code, **error_fields(error))
             self._alerts.raise_alert(code, "a pre-execution record could not be persisted")

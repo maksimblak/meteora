@@ -22,8 +22,9 @@ from pydantic import ValidationError
 
 from src.api import labels
 from src.api.errors import ApiError, install_error_handlers
-from src.api.routes import CURSOR_PATTERN, OperatorServices
+from src.api.routes import CURSOR_PATTERN, OperatorServices, current_status
 from src.api.schemas import (
+    AlertResolveRequest,
     ApprovalRequest,
     KillSwitchActivateRequest,
     KillSwitchReleaseRequest,
@@ -43,6 +44,7 @@ DONE_MESSAGES = {
     "evidence": "Promotion evidence собран",
     "kill_switch_activated": "Kill switch включён",
     "kill_switch_released": "Kill switch снят",
+    "alert_resolved": "Критическое событие закрыто, запись в аудите",
 }
 
 NAVIGATION = (
@@ -191,10 +193,7 @@ def install_web(app: FastAPI) -> None:
 
     @router.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request) -> Response:
-        services = _services(request)
-        status = await services.reads.status(
-            approval_blockers=await services.approvals.global_blockers()
-        )
+        status = await current_status(_services(request))
         return await render(request, "dashboard.html", status=status)
 
     @router.get("/pools", response_class=HTMLResponse)
@@ -267,9 +266,7 @@ def install_web(app: FastAPI) -> None:
         services = _services(request)
         config = await services.reads.effective_config()
         journal = await services.reads.mode_journal()
-        status = await services.reads.status(
-            approval_blockers=await services.approvals.global_blockers()
-        )
+        status = await current_status(services)
         return await render(
             request, "settings.html", config=config, journal=journal, alerts=status.alerts
         )
@@ -368,6 +365,19 @@ def install_web(app: FastAPI) -> None:
         await services.actions.release_kill_switch(body, principal)
         return _redirect("/mode", "kill_switch_released")
 
+    @router.post("/alerts/{alert_id}/resolve")
+    async def alert_resolve(request: Request, alert_id: UUID) -> Response:
+        services, form, principal = await _authenticated(request)
+        body = _validated(
+            lambda: AlertResolveRequest(
+                reason=form.get("reason", ""),
+                operator_token=form.get("operator_token") or None,
+                confirm=_checked(form, "confirm"),
+            )
+        )
+        await services.actions.resolve_alert(alert_id, body, principal)
+        return _redirect("/settings", "alert_resolved")
+
     @router.get("/login", response_class=HTMLResponse)
     async def login_page(request: Request) -> Response:
         target = _safe_next(request.query_params.get("next"))
@@ -412,11 +422,15 @@ def install_web(app: FastAPI) -> None:
 
 
 def _back_link(request: Request) -> str:
-    path = request.url.path
+    """Where an error page leads back: always a path of this panel (``//host`` is not)."""
+
+    path = _safe_next(request.url.path)
     if request.method == "GET":
         return path
     if path.startswith(("/mode", "/kill-switch")):
         return "/mode"
+    if path.startswith("/alerts/"):
+        return "/settings"
     if path.startswith("/approvals/"):
         return path
     return "/"

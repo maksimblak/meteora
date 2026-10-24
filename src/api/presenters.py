@@ -11,6 +11,7 @@ from src.api.schemas import (
     DecisionSummary,
     EvidenceView,
     FactsView,
+    KillSwitchStateView,
     LifecycleStepView,
     MetricView,
     ModeTransitionView,
@@ -49,6 +50,13 @@ _TRIGGERS: dict[str, frozenset[str]] = {
     "depth": frozenset({"LOW_DEPTH"}),
     "price_impact": frozenset({"PRICE_IMPACT_HIGH"}),
     "volume_integrity": frozenset({"ARTIFICIAL_VOLUME_CONFIRMED", "VOLUME_INTEGRITY_UNKNOWN"}),
+    # GMGN holder structure (spec 6.7): each metric row is marked by its own code only.
+    "insiders_share": frozenset({"INSIDERS_SHARE_HIGH"}),
+    "bundling_share": frozenset({"BUNDLING_SHARE_HIGH"}),
+    "phishing_share": frozenset({"PHISHING_SHARE_HIGH"}),
+    "gmgn_top10_holder_share": frozenset({"GMGN_TOP10_HOLDER_SHARE_HIGH"}),
+    "gmgn_status": frozenset({"GMGN_UNAVAILABLE"}),
+    "depth_source": frozenset({"DEPTH_UNAVAILABLE"}),
 }
 # Several minimums share one code; the row that fell short of its own threshold is marked.
 _SPIKE_MINIMUMS = frozenset({"short_ratio", "long_ratio", "robust_z_score", "fee_tvl"})
@@ -81,10 +89,20 @@ def mode_view(state: ModeState) -> ModeView:
     )
 
 
+def kill_switch_view(state: ModeState) -> KillSwitchStateView:
+    policy = state.active_kill_switch_policy
+    if policy is None:
+        text = "выключен; политику открытых позиций оператор выбирает при включении"
+    else:
+        text = f"активен: {labels.label(labels.KILL_SWITCH_POLICY, policy.value)}"
+    return KillSwitchStateView(active=state.kill_switch_active, policy=policy, label=text)
+
+
 def alert_view(alert: CriticalAlert) -> AlertView:
     return AlertView(
         alert_id=alert.alert_id,
         code=alert.code,
+        label=labels.alert_label(alert.code),
         message=alert.message,
         created_at=alert.created_at,
         open=alert.open,
@@ -161,6 +179,7 @@ def evidence_views(items: Sequence[EvidenceItem], reasons: Iterable[str]) -> lis
             value=item.value,
             threshold=item.threshold,
             triggered=_triggered(item, fired),
+            note=labels.evidence_note(item.name, item.value, item.threshold),
         )
         for item in items
     ]
@@ -253,8 +272,16 @@ def strategy_view(record: PlanRecord) -> StrategyView:
         size_base_units=sized.size_base_units,
         estimated_loss_base_units=sized.estimated_loss_base_units,
         binding_caps=[cap.value for cap in sized.binding_caps],
+        binding_cap_notices=[
+            Notice(code=cap.value, message=labels.admission_label(cap.value))
+            for cap in sized.binding_caps
+        ],
         admitted=record.admitted,
         admission_reasons=list(record.admission_reasons),
+        admission_notices=[
+            Notice(code=code, message=labels.admission_label(code))
+            for code in record.admission_reasons
+        ],
     )
 
 

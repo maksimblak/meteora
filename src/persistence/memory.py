@@ -6,8 +6,8 @@ backend. They are never selected by the factory for API/worker production use.
 """
 
 import asyncio
-from collections.abc import Sequence
-from dataclasses import replace
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -19,10 +19,15 @@ from src.execution.service import ExecutionBlocked, ExecutionRecord
 from src.market.models import PoolSnapshot
 from src.market.universe import InMemoryUniverseStore
 from src.persistence.contracts import (
+    DecisionOutcome,
+    DecisionPage,
+    DecisionQuery,
     DecisionRecord,
     JobLease,
     PlanRecord,
     PositionContext,
+    RecordedDecision,
+    outcome_key,
 )
 
 
@@ -132,17 +137,58 @@ class InMemorySnapshotHistory:
         return None if current is None else current.observed_at
 
 
+@dataclass(frozen=True, slots=True)
+class _Head:
+    """The decision standing for a pool, the last cycle that confirmed it and the cycle
+    before that (so the journal knows the previous cycle even of an unchanged pool)."""
+
+    decision_id: UUID
+    outcome: str
+    evaluated_at: datetime
+    previous_evaluated_at: datetime | None = None
+
+    def evaluated(self, at: datetime) -> "_Head":
+        if at <= self.evaluated_at:
+            return self
+        return replace(self, evaluated_at=at, previous_evaluated_at=self.evaluated_at)
+
+
 class InMemoryDecisionStore:
+    """``DecisionStore`` and ``DecisionJournal`` with the PostgreSQL semantics: records in
+    insertion order (the page cursor is an offset), one head per pool."""
+
     def __init__(self) -> None:
         self.decisions: dict[UUID, DecisionRecord] = {}
         self.plans: dict[UUID, PlanRecord] = {}
+        self.heads: dict[str, _Head] = {}
         self.fail_with: Exception | None = None
 
-    async def record_decision(self, record: DecisionRecord) -> UUID:
+    async def record_decision(
+        self, record: DecisionRecord, *, evaluated_at: datetime | None = None
+    ) -> UUID:
+        cycle = evaluated_at or record.decision.decision_at
+        return (await self._record(record, cycle, force=True)).decision_id
+
+    async def record_evaluation(
+        self, record: DecisionRecord, *, evaluated_at: datetime
+    ) -> RecordedDecision:
+        return await self._record(record, evaluated_at, force=False)
+
+    async def _record(
+        self, record: DecisionRecord, evaluated_at: datetime, *, force: bool
+    ) -> RecordedDecision:
         if self.fail_with is not None:
             raise self.fail_with
+        address = record.decision.pool_address.root
+        key = outcome_key(record.decision)
+        head = self.heads.get(address)
+        if not force and head is not None and head.outcome == key:
+            self.heads[address] = head.evaluated(evaluated_at)
+            return RecordedDecision(head.decision_id, recorded=False)
         self.decisions.setdefault(record.decision_id, record)
-        return record.decision_id
+        previous = None if head is None else head.evaluated(evaluated_at).previous_evaluated_at
+        self.heads[address] = _Head(record.decision_id, key, evaluated_at, previous)
+        return RecordedDecision(record.decision_id, recorded=True)
 
     async def record_plan(self, record: PlanRecord) -> UUID:
         if self.fail_with is not None:
@@ -155,6 +201,75 @@ class InMemoryDecisionStore:
 
     async def plan(self, plan_id: UUID) -> PlanRecord | None:
         return self.plans.get(plan_id)
+
+    # --- DecisionJournal ------------------------------------------------------------------
+
+    async def page(self, query: DecisionQuery) -> DecisionPage:
+        records = [
+            record
+            for record in reversed(tuple(self.decisions.values()))
+            if (query.status is None or record.decision.status is query.status)
+            and (
+                query.pool_address is None
+                or record.decision.pool_address.root == query.pool_address
+            )
+        ]
+        start = query.cursor or 0
+        items = tuple(records[start : start + query.limit])
+        following = start + query.limit
+        return DecisionPage(items, following if following < len(records) else None)
+
+    async def plan_for(self, decision_id: UUID) -> PlanRecord | None:
+        plans = [plan for plan in self.plans.values() if plan.decision_id == decision_id]
+        return plans[-1] if plans else None
+
+    async def latest_by_pool(self, addresses: Sequence[str]) -> dict[str, DecisionRecord]:
+        latest: dict[str, DecisionRecord] = {}
+        for address in addresses:
+            head = self.heads.get(address)
+            record = None if head is None else self.decisions.get(head.decision_id)
+            if record is not None:
+                latest[address] = record
+        return latest
+
+    async def latest_outcomes(self) -> tuple[DecisionOutcome, ...]:
+        floor = recent_cycle_floor(
+            (head.evaluated_at, head.previous_evaluated_at) for head in self.heads.values()
+        )
+        outcomes = []
+        for address, head in self.heads.items():
+            record = self.decisions.get(head.decision_id)
+            if record is None or floor is None or head.evaluated_at < floor:
+                continue
+            outcomes.append(
+                DecisionOutcome(
+                    pool_address=address,
+                    status=record.decision.status,
+                    reasons=tuple(reason.value for reason in record.decision.reasons),
+                    decided_at=record.decision.decision_at,
+                )
+            )
+        return tuple(outcomes)
+
+
+def recent_cycle_floor(
+    heads: Iterable[tuple[datetime, datetime | None]],
+) -> datetime | None:
+    """The instant of the last complete candidate cycle: the newest cycle any pool saw
+    before the latest one (a cycle in progress has evaluated only part of the pools), or
+    the latest one when there was none before it."""
+
+    pairs = list(heads)
+    if not pairs:
+        return None
+    latest = max(evaluated for evaluated, _ in pairs)
+    earlier = [
+        moment
+        for pair in pairs
+        for moment in pair
+        if moment is not None and moment < latest
+    ]
+    return max(earlier, default=latest)
 
 
 class InMemoryPositionContexts:

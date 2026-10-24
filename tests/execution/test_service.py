@@ -822,7 +822,6 @@ def live_service(
         allowed_mode=TradingMode.LIVE,
         live_promotion=live_promotion(),
         kill_switch=kill_switch,
-        kill_switch_policy=policy,
     )
 
 

@@ -1,11 +1,10 @@
-"""PostgreSQL universe history, decision records and position context.
+"""PostgreSQL universe history and position context.
 
 * ``PostgresUniverseStore`` implements the T02 ``UniverseSnapshotStore``: a sync is
   staged in memory and published in one transaction (a partial sync never replaces
   the last complete universe), snapshots are immutable and idempotent per
   ``(pool, observed_at)``.
-* ``PostgresDecisionStore`` writes immutable decision and plan records with
-  deterministic identifiers, so a retried cycle never duplicates them.
+* Decision records, their heads and the decision journal: ``src.persistence.decisions``.
 """
 
 from datetime import datetime
@@ -13,19 +12,16 @@ from decimal import Decimal
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import ScalarResult, insert, select
+from sqlalchemy import ScalarResult, and_, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.market.models import PoolRef, PoolSnapshot
-from src.persistence.contracts import DecisionRecord, PlanRecord, PositionContext
+from src.persistence.contracts import PositionContext, UniverseSummary
 from src.persistence.models import (
-    CandidateDecisionRecord,
-    FeatureVectorRecord,
     PoolRecord,
     PoolSnapshotRecord,
     PositionContextRecord,
-    StrategyPlanRecord,
     UniverseMemberRecord,
     UniverseSyncRecord,
 )
@@ -77,7 +73,7 @@ def _window_total(snapshot: PoolSnapshot, field: str) -> Decimal:
     return value if value is not None else Decimal(0)
 
 
-async def _ensure_snapshot(session: AsyncSession, snapshot: PoolSnapshot) -> tuple[UUID, bool]:
+async def ensure_snapshot(session: AsyncSession, snapshot: PoolSnapshot) -> tuple[UUID, bool]:
     """Insert an immutable snapshot; returns ``(id, inserted)``."""
 
     pool_id = await _ensure_pool(session, snapshot.pool)
@@ -141,7 +137,7 @@ class _PostgresUniverseStage:
             duplicates = 0
             members: list[UUID] = []
             for snapshot in snapshots:
-                snapshot_id, inserted = await _ensure_snapshot(session, snapshot)
+                snapshot_id, inserted = await ensure_snapshot(session, snapshot)
                 duplicates += 0 if inserted else 1
                 members.append(snapshot_id)
             await session.execute(
@@ -227,6 +223,50 @@ class PostgresUniverseStore:
         result: tuple[PoolSnapshot, ...] = await self._db.run_async(work)
         return result
 
+    async def latest_universe_summary(self) -> UniverseSummary:
+        """Addresses and the D06 anchor flag of the newest universe, read from JSONB keys
+        in the database instead of decoding every snapshot."""
+
+        raw = PoolSnapshotRecord.raw_snapshot
+
+        async def work(session: AsyncSession) -> UniverseSummary:
+            latest = (
+                await session.execute(
+                    select(UniverseSyncRecord.sync_id, UniverseSyncRecord.observed_at)
+                    .order_by(
+                        UniverseSyncRecord.observed_at.desc(),
+                        UniverseSyncRecord.committed_at.desc(),
+                    )
+                    .limit(1)
+                )
+            ).one_or_none()
+            if latest is None:
+                return UniverseSummary(observed_at=None, addresses=frozenset(), anchored=False)
+            anchored = and_(
+                raw["active_bin_id"].astext.is_not(None),
+                raw["base_decimals"].astext.is_not(None),
+                raw["quote_decimals"].astext.is_not(None),
+            )
+            rows = (
+                await session.execute(
+                    select(PoolRecord.address, anchored.label("anchored"))
+                    .join(PoolSnapshotRecord, PoolSnapshotRecord.pool_id == PoolRecord.id)
+                    .join(
+                        UniverseMemberRecord,
+                        UniverseMemberRecord.pool_snapshot_id == PoolSnapshotRecord.id,
+                    )
+                    .where(UniverseMemberRecord.sync_id == latest.sync_id)
+                )
+            ).all()
+            return UniverseSummary(
+                observed_at=latest.observed_at,
+                addresses=frozenset(row.address for row in rows),
+                anchored=any(bool(row.anchored) for row in rows),
+            )
+
+        result: UniverseSummary = await self._db.run_async(work)
+        return result
+
     async def latest_sync_at(self) -> datetime | None:
         async def work(session: AsyncSession) -> datetime | None:
             return await session.scalar(
@@ -236,102 +276,6 @@ class PostgresUniverseStore:
             )
 
         result: datetime | None = await self._db.run_async(work)
-        return result
-
-
-class PostgresDecisionStore:
-    def __init__(self, database: PostgresDatabase) -> None:
-        self._db = database
-
-    async def record_decision(self, record: DecisionRecord) -> UUID:
-        decision = record.decision
-
-        async def work(session: AsyncSession) -> UUID:
-            snapshot_id, _ = await _ensure_snapshot(session, record.market)
-            await session.execute(
-                pg_insert(FeatureVectorRecord)
-                .values(
-                    id=uuid5(
-                        NAMESPACE_URL, f"feature-vector:{snapshot_id}:{decision.ruleset_version}"
-                    ),
-                    pool_snapshot_id=snapshot_id,
-                    ruleset_version=decision.ruleset_version,
-                    values=to_payload(decision.features),
-                )
-                .on_conflict_do_nothing()
-            )
-            feature_id = await session.scalar(
-                select(FeatureVectorRecord.id).where(
-                    FeatureVectorRecord.pool_snapshot_id == snapshot_id,
-                    FeatureVectorRecord.ruleset_version == decision.ruleset_version,
-                )
-            )
-            await session.execute(
-                pg_insert(CandidateDecisionRecord)
-                .values(
-                    id=record.decision_id,
-                    pool_id=pool_id_for(decision.pool_address.root),
-                    feature_vector_id=feature_id,
-                    status=decision.status.value,
-                    score=decision.score,
-                    reasons=[reason.value for reason in decision.reasons],
-                    missing_signals=list(decision.missing_signals),
-                    evidence=to_payload(record),
-                    ruleset_version=decision.ruleset_version,
-                    correlation_id=as_uuid(decision.correlation_id),
-                    decided_at=decision.decision_at,
-                    mode=decision.mode.value,
-                    config_version=decision.config_version,
-                )
-                .on_conflict_do_nothing(index_elements=[CandidateDecisionRecord.id])
-            )
-            return record.decision_id
-
-        result: UUID = await self._db.run_async(work)
-        return result
-
-    async def record_plan(self, record: PlanRecord) -> UUID:
-        plan = record.sized_plan.plan
-
-        async def work(session: AsyncSession) -> UUID:
-            await session.execute(
-                pg_insert(StrategyPlanRecord)
-                .values(
-                    id=record.plan_id,
-                    decision_id=record.decision_id,
-                    strategy=plan.strategy.value,
-                    parameters=to_payload(record),
-                    ruleset_version=plan.ruleset_version,
-                    correlation_id=as_uuid(plan.correlation_id),
-                    created_at=record.recorded_at,
-                )
-                .on_conflict_do_nothing(index_elements=[StrategyPlanRecord.id])
-            )
-            return record.plan_id
-
-        result: UUID = await self._db.run_async(work)
-        return result
-
-    async def decision(self, decision_id: UUID) -> DecisionRecord | None:
-        async def work(session: AsyncSession) -> DecisionRecord | None:
-            payload = await session.scalar(
-                select(CandidateDecisionRecord.evidence).where(
-                    CandidateDecisionRecord.id == decision_id
-                )
-            )
-            return None if payload is None else from_payload(DecisionRecord, payload)
-
-        result: DecisionRecord | None = await self._db.run_async(work)
-        return result
-
-    async def plan(self, plan_id: UUID) -> PlanRecord | None:
-        async def work(session: AsyncSession) -> PlanRecord | None:
-            payload = await session.scalar(
-                select(StrategyPlanRecord.parameters).where(StrategyPlanRecord.id == plan_id)
-            )
-            return None if payload is None else from_payload(PlanRecord, payload)
-
-        result: PlanRecord | None = await self._db.run_async(work)
         return result
 
 

@@ -115,6 +115,26 @@ class CandidateDecisionRecord(Base):
     seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
 
 
+class CandidateDecisionHeadRecord(Base):
+    """Per pool: the decision that stands and the last cycle that confirmed it (0004)."""
+
+    __tablename__ = "candidate_decision_heads"
+
+    pool_id: Mapped[UUID] = mapped_column(ForeignKey("pools.id"), primary_key=True)
+    decision_id: Mapped[UUID] = mapped_column(
+        ForeignKey("candidate_decisions.id"), nullable=False, index=True
+    )
+    outcome_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reasons: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evaluated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    # The cycle before ``evaluated_at``: the journal finds the last complete cycle with it.
+    previous_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class StrategyPlanRecord(Base):
     __tablename__ = "strategy_plans"
 

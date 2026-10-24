@@ -74,8 +74,10 @@ RATE_LIMIT_FALLBACK = timedelta(seconds=60)
 RESET_BUFFER = timedelta(seconds=1)
 PLAN_UPGRADE_REQUIRED = "PLAN_UPGRADE_REQUIRED"
 
-# An API error string is passed on only when it looks like an error code.
+# An API error string is passed on only when it looks like an error code and carries no
+# piece of the key (a server may echo the key it refused, in any letter case).
 _ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+_KEY_FRAGMENT = 8
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -431,7 +433,7 @@ class GmgnOpenApiProvider:
 
     def _answer(self, route: str, response: httpx.Response) -> dict[str, Any] | _Refused:
         body = _json(response.content)
-        code = _error_code(body)
+        code = _error_code(body, self._api_key)
         status = response.status_code
         if status == 429:
             reason = code or "RATE_LIMITED"
@@ -512,13 +514,33 @@ def _json(content: bytes) -> Any:
         return None
 
 
-def _error_code(body: object) -> str | None:
+def _error_code(body: object, api_key: SecretStr) -> str | None:
+    """The server's ``error`` when it is a code; never one that echoes the key (A4)."""
+
     if not isinstance(body, dict):
         return None
     value = body.get("error")
-    if isinstance(value, str) and _ERROR_CODE.fullmatch(value):
+    if (
+        isinstance(value, str)
+        and _ERROR_CODE.fullmatch(value)
+        and not _echoes_key(value, api_key.get_secret_value())
+    ):
         return value
     return None
+
+
+def _echoes_key(code: str, key: str) -> bool:
+    """``code`` is the key, contains it, or contains any ``_KEY_FRAGMENT`` characters of it."""
+
+    text, secret = code.casefold(), key.casefold()
+    if not secret:
+        return False
+    if secret in text:
+        return True
+    return any(
+        secret[start : start + _KEY_FRAGMENT] in text
+        for start in range(len(secret) - _KEY_FRAGMENT + 1)
+    )
 
 
 def _unix(value: object) -> datetime | None:

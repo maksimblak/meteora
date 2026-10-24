@@ -28,8 +28,9 @@
       <p class="big">{{ s.strategy }}</p>
       <p>Причина выбора: <strong>{{ s.selection_label or 'не записана' }}</strong>{% if s.selection_reason %} <code>{{ s.selection_reason }}</code>{% endif %}</p>
       <p>Направление {{ s.direction }} · бины {{ s.lower_bin_offset }}..{{ s.upper_bin_offset }} · горизонт {{ s.holding_horizon_seconds }} с · истекает {{ s.expires_at | dt }}</p>
-      <p>Размер {{ s.size_base_units }} · расчётный убыток {{ s.estimated_loss_base_units }} · ограничили: {{ s.binding_caps | join(', ') or '—' }}</p>
-      <p>Допуск: {% if s.admitted %}<span class="ok">допущен</span>{% else %}<span class="bad">не допущен</span> {{ s.admission_reasons | join(', ') }}{% endif %}</p>
+      <p>Размер {{ s.size_base_units }} · расчётный убыток {{ s.estimated_loss_base_units }} · ограничили: {% for cap in s.binding_cap_notices %}{{ cap.message }} <code>{{ cap.code }}</code>{% if not loop.last %}; {% endif %}{% else %}—{% endfor %}</p>
+      <p>Допуск: {% if s.admitted %}<span class="ok">допущен</span>{% else %}<span class="bad">не допущен</span>{% endif %}</p>
+      {% if s.admission_notices %}<ul>{% for item in s.admission_notices %}<li>{{ item.message }} <code>{{ item.code }}</code></li>{% endfor %}</ul>{% endif %}
       {% if s.selection_evidence %}
         <table><tr><th>Признак выбора</th><th>Значение</th><th>Порог</th></tr>
         {% for item in s.selection_evidence %}<tr><td>{{ item.name }}</td><td>{{ item.value }}</td><td>{{ item.threshold or '—' }}</td></tr>{% endfor %}
@@ -46,7 +47,7 @@
   <table>
     <tr><th>Признак</th><th>Значение</th><th>Порог</th><th></th></tr>
     {% for item in detail.evidence %}
-      <tr class="{% if item.triggered %}triggered{% endif %}"><td>{{ item.name }}</td><td>{{ item.value }}</td><td>{{ item.threshold or '—' }}</td><td>{% if item.triggered %}<strong class="bad">сработал</strong>{% endif %}</td></tr>
+      <tr class="{% if item.triggered %}triggered{% endif %}"><td>{{ item.name }}</td><td>{{ item.value }}{% if item.note %}<div class="muted small">{{ item.note }}</div>{% endif %}</td><td>{{ item.threshold or '—' }}</td><td>{% if item.triggered %}<strong class="bad">сработал</strong>{% endif %}</td></tr>
     {% endfor %}
   </table>
   {% if detail.volume_window_source %}<p class="muted">Объём в минуту посчитан из окна {{ detail.volume_window_source }}.</p>{% endif %}

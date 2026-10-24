@@ -43,7 +43,10 @@ services:
       GMGN_API_KEY: ""
       GMGN_API_KEY_FILE: ""
       GMGN_URL: ""
-      # 61 s keeps adjacent sweeps inside the short-window interval (60 s .. 91 s).
+      # F1 short window: the 5m window comes only from an interval of 4m30 .. 6m01 at a
+      # 61 s cadence (sooner sweeps are summed). Five steps (305 s) of the six recorded
+      # sweeps served before the freeze make one full window of recorded counters; after
+      # the freeze the windows fall to zero and the volume decay closes the positions.
       WORKER_UNIVERSE_INTERVAL_SECONDS: "61"
       WORKER_CANDIDATE_INTERVAL_SECONDS: "15"
       WORKER_POSITION_INTERVAL_SECONDS: "10"

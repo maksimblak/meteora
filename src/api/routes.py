@@ -13,6 +13,8 @@ from src.api.context import OperatorContext
 from src.api.errors import ERROR_RESPONSES
 from src.api.reads import OperatorReads
 from src.api.schemas import (
+    AlertResolveRequest,
+    AlertView,
     ApprovalPreview,
     ApprovalQueue,
     ApprovalRequest,
@@ -76,8 +78,16 @@ router = APIRouter(prefix="/api/v1", responses=ERROR_RESPONSES)
 
 @router.get("/system/status", response_model=SystemStatus, tags=["status"])
 async def system_status(services: Services) -> SystemStatus:
+    return await current_status(services)
+
+
+async def current_status(services: OperatorServices) -> SystemStatus:
+    """The dashboard status with the universe summary read once for the whole request."""
+
+    universe = await services.context.universe()
     return await services.reads.status(
-        approval_blockers=await services.approvals.global_blockers()
+        approval_blockers=await services.approvals.global_blockers(universe=universe),
+        universe=universe,
     )
 
 
@@ -188,6 +198,13 @@ async def release_kill_switch(
     services: Services, principal: Principal, body: KillSwitchReleaseRequest
 ) -> ModeView:
     return await services.actions.release_kill_switch(body, principal)
+
+
+@router.post("/alerts/{alert_id}/resolve", response_model=AlertView, tags=["mode"])
+async def resolve_alert(
+    services: Services, principal: Principal, alert_id: UUID, body: AlertResolveRequest
+) -> AlertView:
+    return await services.actions.resolve_alert(alert_id, body, principal)
 
 
 @router.get("/promotion", response_model=PromotionView, tags=["promotion"])

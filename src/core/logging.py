@@ -1,4 +1,10 @@
-"""Structured JSON logging with value- and key-based secret redaction."""
+"""Structured JSON logging with value- and key-based secret redaction.
+
+Every record - structlog's own and foreign stdlib ones (uvicorn's "Exception in ASGI
+application" included) - passes one chain: a traceback is first formatted into the
+``exception`` text, then the redactor removes every secret value of the registry
+(``AppConfig.secret_values``) from all strings. Nothing is rendered before that.
+"""
 
 import logging
 import sys
@@ -6,21 +12,11 @@ from collections.abc import Mapping, Sequence
 from typing import Any, TextIO
 
 import structlog
-from pydantic import SecretStr
 from structlog.typing import EventDict, Processor, WrappedLogger
 
 from src.core.config import AppConfig
 
 _REDACTED = "[REDACTED]"
-_SECRET_FIELDS = (
-    "database_url",
-    "wallet_keypair_file",
-    "operator_token",
-    "session_secret",
-    "helius_api_key",
-    "executor_internal_token",
-    "telegram_bot_token",
-)
 _SENSITIVE_KEY_PARTS = (
     "api_key",
     "database_url",
@@ -66,27 +62,25 @@ class _SecretRedactor:
             return [self._redact_value(item) for item in value]
         if isinstance(value, tuple):
             return tuple(self._redact_value(item) for item in value)
+        if isinstance(value, BaseException):
+            # An exception object outside ``exc_info`` is rendered by its text, redacted.
+            return self._redact_value(f"{type(value).__name__}: {value}")
         return value
-
-
-def _secret_values(settings: AppConfig) -> tuple[str, ...]:
-    values: list[str] = []
-    for field_name in _SECRET_FIELDS:
-        value = getattr(settings, field_name)
-        if isinstance(value, SecretStr):
-            values.append(value.get_secret_value())
-    return tuple(values)
 
 
 def configure_logging(settings: AppConfig, *, stream: TextIO | None = None) -> None:
     """Route structlog, stdlib and uvicorn records through one redacting JSON formatter."""
 
-    redactor = _SecretRedactor(_secret_values(settings))
+    redactor = _SecretRedactor(settings.secret_values())
     timestamp = structlog.processors.TimeStamper(fmt="iso", utc=True)
+    # ``exc_info`` becomes the ``exception`` text here, so the redactor sees the traceback;
+    # a raw exception tuple would otherwise be rendered with ``repr`` past it.
+    traceback = structlog.processors.format_exc_info
     foreign_processors: list[Processor] = [
         structlog.stdlib.add_log_level,
         structlog.stdlib.ExtraAdder(),
         timestamp,
+        traceback,
         redactor,
     ]
     formatter = structlog.stdlib.ProcessorFormatter(
@@ -112,6 +106,7 @@ def configure_logging(settings: AppConfig, *, stream: TextIO | None = None) -> N
             structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,
             timestamp,
+            traceback,
             redactor,
             structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],

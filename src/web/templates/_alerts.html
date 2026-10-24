@@ -1,0 +1,33 @@
+{# Open critical alerts with their IDs and, for a logged-in operator, the closing form. #}
+{% macro alert_list(alerts, logged_in, csrf_field, csrf_token) %}
+  {% if alerts %}
+    <table>
+      <tr><th>Время</th><th>Событие</th><th>Сообщение</th><th>ID</th></tr>
+      {% for alert in alerts %}
+        <tr>
+          <td>{{ alert.created_at | dt }}</td>
+          <td>{{ alert.label or alert.code }} <code>{{ alert.code }}</code></td>
+          <td>{{ alert.message }}</td>
+          <td><code>{{ alert.alert_id }}</code></td>
+        </tr>
+        {% if logged_in %}
+        <tr><td colspan="4">
+          <details>
+            <summary>Закрыть событие</summary>
+            <form method="post" action="/alerts/{{ alert.alert_id }}/resolve" data-confirm="Закрыть критическое событие? Причина попадёт в аудит.">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <label>Причина (в аудит) <input name="reason" required maxlength="500"></label>
+              <label>Токен оператора (повторно) <input type="password" name="operator_token" autocomplete="off" required></label>
+              <label class="check"><input type="checkbox" name="confirm" required> Подтверждаю: причина события разобрана</label>
+              <button type="submit">Закрыть</button>
+            </form>
+            <p class="muted small">Открытое критическое событие закрывает допуск в APPROVAL. Событие kill switch закрывается снятием kill switch.</p>
+          </details>
+        </td></tr>
+        {% endif %}
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">Открытых критических событий нет.</p>
+  {% endif %}
+{% endmacro %}

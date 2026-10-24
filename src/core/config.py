@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator
 
+from src.core.secrets import CREDENTIAL_URL_FIELDS, SECRETS, distinct, url_credentials
 from src.domain.models.trading import TradingMode
 
 
@@ -32,6 +33,9 @@ class AppConfig(BaseModel):
     session_secret: SecretStr | None = None
     helius_api_key: SecretStr | None = None
     executor_internal_token: SecretStr | None = None
+    executor_mode_token: SecretStr | None = None
+    executor_approval_secret: SecretStr | None = None
+    gmgn_api_key: SecretStr | None = None
     telegram_bot_token: SecretStr | None = None
 
     _ENV_FIELDS: ClassVar[dict[str, str]] = {
@@ -47,24 +51,12 @@ class AppConfig(BaseModel):
         "TELEGRAM_CHAT_ID": "telegram_chat_id",
         "TRADING_MODE": "requested_mode",
     }
+    # The secret registry (``src.core.secrets``) is the only list of secret settings.
     _SECRET_ENV_FIELDS: ClassVar[dict[str, str]] = {
-        "DATABASE_URL": "database_url",
-        "APP_OPERATOR_TOKEN": "operator_token",
-        "APP_SESSION_SECRET": "session_secret",
-        "HELIUS_API_KEY": "helius_api_key",
-        "EXECUTOR_INTERNAL_TOKEN": "executor_internal_token",
-        "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
+        setting.env: setting.field for setting in SECRETS if setting.file_variant
     }
     _SECRET_FIELD_NAMES: ClassVar[frozenset[str]] = frozenset(
-        {
-            "database_url",
-            "wallet_keypair_file",
-            "operator_token",
-            "session_secret",
-            "helius_api_key",
-            "executor_internal_token",
-            "telegram_bot_token",
-        }
+        setting.field for setting in SECRETS
     )
 
     @field_validator("app_timezone")
@@ -131,6 +123,24 @@ class AppConfig(BaseModel):
             if output.get(field_name) is not None:
                 output[field_name] = "[REDACTED]"
         return output
+
+    def secret_values(self) -> tuple[str, ...]:
+        """Every value the logs must never contain: each registry secret, the password of
+        ``DATABASE_URL`` and the key-like parts of provider URLs."""
+
+        values: list[str] = []
+        for setting in SECRETS:
+            secret = getattr(self, setting.field)
+            if isinstance(secret, SecretStr):
+                values.append(secret.get_secret_value())
+        database = self.database_dsn()
+        if database:
+            values.extend(url_credentials(database))
+        for field_name in CREDENTIAL_URL_FIELDS:
+            url = getattr(self, field_name)
+            if url:
+                values.extend(url_credentials(url))
+        return distinct(values)
 
     def database_dsn(self) -> str | None:
         return self.database_url.get_secret_value() if self.database_url else None

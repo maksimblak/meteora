@@ -1,18 +1,21 @@
 {% extends "base.html" %}
+{% from "_alerts.html" import alert_list %}
 {% block title %}Настройки{% endblock %}
 {% block content %}
 <h1>Действующая конфигурация</h1>
 <p>Правила <strong>{{ config.ruleset_version }}</strong> · конфигурация {{ config.config_version }}</p>
+<p>Kill switch: {% if config.kill_switch.active %}<strong class="bad">{{ config.kill_switch.label }}</strong>{% else %}{{ config.kill_switch.label }}{% endif %}</p>
 
 <section class="grid">
   <div class="card">
     <h2>Секреты (только наличие)</h2>
     <table>
+      <tr><th>Имя</th><th>В этом api</th><th>Нужен сервису</th></tr>
       {% for item in config.secrets %}
-        <tr><td><code>{{ item.name }}</code></td><td>{% if item.configured %}<span class="ok">задан</span>{% else %}<span class="muted">не задан</span>{% endif %}</td></tr>
+        <tr><td><code>{{ item.name }}</code></td><td>{% if item.configured %}<span class="ok">задан</span>{% else %}<span class="muted">не задан</span>{% endif %}</td><td class="muted small">{{ item.used_by | join(', ') or 'пока не используется' }}</td></tr>
       {% endfor %}
     </table>
-    <p class="muted small">Значения секретов не показываются нигде: ни здесь, ни в API, ни в логах.</p>
+    <p class="muted small">Значения секретов не показываются нигде: ни здесь, ни в API, ни в логах (и в трассах ошибок). Секрет сервиса, которому api его не передаёт (например, GMGN_API_KEY — только worker), здесь всегда «не задан»: проверяйте его в логах и статусе worker.</p>
   </div>
   <div class="card">
     <h2>Готовность режимов</h2>
@@ -54,8 +57,6 @@
 
 <section class="card">
   <h2>Открытые critical alerts</h2>
-  {% if alerts %}
-    <ul>{% for alert in alerts %}<li>{{ alert.created_at | dt }} <code>{{ alert.code }}</code> {{ alert.message }}</li>{% endfor %}</ul>
-  {% else %}<p class="muted">Нет.</p>{% endif %}
+  {{ alert_list(alerts, logged_in, csrf_field, csrf_token) }}
 </section>
 {% endblock %}

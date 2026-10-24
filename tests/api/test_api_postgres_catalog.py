@@ -8,10 +8,10 @@ from collections.abc import Iterator
 
 import pytest
 
-from src.api.catalog import DecisionQuery, PostgresDecisionCatalog
 from src.core.clock import FrozenClock
 from src.domain.screening import CandidateStatus
-from src.persistence.market_store import PostgresDecisionStore
+from src.persistence.contracts import DecisionJournal, DecisionQuery
+from src.persistence.decisions import PostgresDecisionStore
 from src.persistence.postgres import PostgresDatabase
 from src.persistence.testing import integration_database_url, migrated_schema
 from tests.api.support import POOL_B, POOL_C, Scenario, populated
@@ -46,7 +46,7 @@ def copy_records(scenario: Scenario, database: PostgresDatabase) -> None:
 def test_postgres_catalog_pages_newest_first_and_finds_plans(database: PostgresDatabase) -> None:
     scenario = populated(Harness(clock=FrozenClock(NOW)))
     copy_records(scenario, database)
-    catalog = PostgresDecisionCatalog(database)
+    catalog: DecisionJournal = PostgresDecisionStore(database)
     accepted, warming, rejected = (
         scenario.accepted.decision_id,
         scenario.others[0].decision_id,

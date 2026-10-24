@@ -30,7 +30,6 @@ from src.api import labels, presenters
 from src.api.context import OperatorContext
 from src.api.errors import ApiError
 from src.api.probes import GatewayReadiness
-from src.api.reads import anchor_available
 from src.api.schemas import (
     ApprovalPreview,
     ApprovalQueue,
@@ -63,7 +62,7 @@ from src.execution.service import (
 )
 from src.modes.models import KillSwitchPolicy
 from src.observability.logging import error_fields, get_logger
-from src.persistence.contracts import DecisionRecord, PlanRecord
+from src.persistence.contracts import DecisionRecord, PlanRecord, UniverseSummary
 from src.worker.execution import entry_idempotency_key, position_action_key
 
 DEFAULT_SIMULATION_TTL = timedelta(minutes=2)
@@ -127,7 +126,7 @@ class ApprovalDesk:
             reasons.insert(0, "OPERATOR_AUTH_NOT_CONFIGURED")
         return tuple(dict.fromkeys(reasons))
 
-    async def global_blockers(self) -> list[str]:
+    async def global_blockers(self, *, universe: UniverseSummary | None = None) -> list[str]:
         state = await self._ctx.mode_state()
         blockers = list(self.unavailable())
         if state.mode is not TradingMode.APPROVAL:
@@ -136,19 +135,13 @@ class ApprovalDesk:
             blockers.append("KILL_SWITCH_ACTIVE")
         if state.daily_stop_active_on(self._ctx.today()):
             blockers.append("DAILY_STOP_ACTIVE")
-        if not anchor_available(await self._ctx.repositories.history.latest_universe()):
+        if not (universe or await self._ctx.universe()).anchored:
             blockers.append("ENTRY_ANCHOR_UNAVAILABLE")
         return blockers
 
     async def queue(self) -> ApprovalQueue:
         store = self._ctx.repositories.execution
-        now = self._ctx.clock.now()
-        # An expired request can no longer be approved; the worker renews an exit's preview.
-        pending = [
-            item
-            for item in await store.in_phases((ExecutionPhase.AWAITING_APPROVAL,))
-            if item.command.expires_at > now
-        ]
+        pending = await self._ctx.pending_approvals()
         recent = await store.in_phases(_RECENT_PHASES)
         newest = sorted(recent, key=lambda item: item.simulation.simulated_at, reverse=True)
         return ApprovalQueue(
@@ -194,7 +187,8 @@ class ApprovalDesk:
                 if name not in _HIDDEN_SIMULATION_FIELDS
             ],
             simulation_errors=[
-                Notice(code=error.code, message=error.message) for error in simulation.errors
+                Notice(code=error.code, message=_refusal_text(error.code, error.message))
+                for error in simulation.errors
             ],
             costs=CostView(
                 network_fee_lamports=simulation.network_fee_lamports,
@@ -593,6 +587,13 @@ def _anchor_rows(record: ExecutionRecord) -> list[PlanDiffRow]:
 
 def _expiry(record: ExecutionRecord) -> datetime:
     return record.command.expires_at
+
+
+def _refusal_text(code: str, message: str) -> str:
+    """The executor's refusal in Russian; its own (English) text only for an unknown code."""
+
+    text = labels.executor_label(code)
+    return message if text == code else text
 
 
 def _text(value: object) -> str:

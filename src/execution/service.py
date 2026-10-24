@@ -379,15 +379,11 @@ class ExecutionService:
         live_promotion: LivePromotionEvidence | None = None,
         receipts: ReceiptLookup | None = None,
         kill_switch: KillSwitchProbe | None = None,
-        kill_switch_policy: KillSwitchPolicy | None = None,
     ) -> None:
         """``kill_switch`` is re-read immediately before every submit, together with the
-        policy the operator chose when activating it; without it nothing is ever
-        submitted. ``receipts`` reconciles by command id (including a submit that timed
-        out before any signature was known).
-
-        ``kill_switch_policy`` is accepted for existing callers and ignored: a configured
-        policy never overrides the one recorded at activation (spec 7.3)."""
+        policy the operator chose when activating it (spec 7.3; no configured policy can
+        override it); without it nothing is ever submitted. ``receipts`` reconciles by
+        command id (including a submit that timed out before any signature was known)."""
 
         if simulation_ttl <= timedelta(0):
             raise ValueError("simulation_ttl must be positive")
@@ -401,7 +397,6 @@ class ExecutionService:
         self._live_promotion = live_promotion
         self._receipts = receipts
         self._kill_switch = kill_switch
-        del kill_switch_policy
 
     async def prepare(self, plan_id: UUID) -> ExecutionPreview:
         command = await self._plans.resolve(plan_id)

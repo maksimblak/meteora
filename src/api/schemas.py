@@ -78,6 +78,7 @@ class RiskUtilization(ApiModel):
 class AlertView(ApiModel):
     alert_id: UUID
     code: str
+    label: str = ""
     message: str
     created_at: datetime
     open: bool
@@ -145,6 +146,8 @@ class EvidenceView(ApiModel):
     value: str
     threshold: str | None
     triggered: bool
+    # Russian explanation of a code in the row (GMGN status, why depth was not measured).
+    note: str | None = None
 
 
 class MetricView(ApiModel):
@@ -235,8 +238,10 @@ class StrategyView(ApiModel):
     size_base_units: int
     estimated_loss_base_units: int
     binding_caps: list[str]
+    binding_cap_notices: list[Notice] = []
     admitted: bool
     admission_reasons: list[str]
+    admission_notices: list[Notice] = []
 
 
 class DecisionDetail(ApiModel):
@@ -350,6 +355,8 @@ class PerformanceView(ApiModel):
 class SecretStatus(ApiModel):
     name: str
     configured: bool
+    # Services whose container receives the secret; ``configured`` is what this api sees.
+    used_by: list[str] = []
 
 
 class ModeReadinessView(ApiModel):
@@ -359,6 +366,15 @@ class ModeReadinessView(ApiModel):
     notes: list[Notice]
 
 
+class KillSwitchStateView(ApiModel):
+    """The kill switch as the mode state records it (spec 7.3): its policy is the one the
+    operator chose at activation, not a configured default."""
+
+    active: bool
+    policy: KillSwitchPolicy | None
+    label: str
+
+
 class EffectiveConfig(ApiModel):
     settings: dict[str, Any]
     secrets: list[SecretStatus]
@@ -366,6 +382,7 @@ class EffectiveConfig(ApiModel):
     ruleset_version: str
     config_version: str
     thresholds: dict[str, Any]
+    kill_switch: KillSwitchStateView
 
 
 # --- approvals ------------------------------------------------------------------------
@@ -510,6 +527,14 @@ class KillSwitchActivateRequest(ApiModel):
 
 
 class KillSwitchReleaseRequest(ApiModel):
+    reason: Reason
+    operator_token: Token | None = None
+    confirm: bool = False
+
+
+class AlertResolveRequest(ApiModel):
+    """Closing a critical alert: a reason for the audit trail and re-authentication (G13.2)."""
+
     reason: Reason
     operator_token: Token | None = None
     confirm: bool = False

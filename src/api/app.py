@@ -17,7 +17,6 @@ from starlette.concurrency import run_in_threadpool
 
 from src.api.actions import OperatorActions
 from src.api.approvals import ApprovalDesk, ApprovalWiring
-from src.api.catalog import DecisionCatalog, decision_catalog
 from src.api.context import OperatorContext
 from src.api.metrics import RequestMetrics
 from src.api.probes import GatewayProbe, ServiceProbe, WorkerHealthProbe
@@ -31,6 +30,7 @@ from src.core.config import AppConfig
 from src.domain.models.trading import TradingMode
 from src.execution.service import ExecutionService
 from src.execution.settings import ExecutorSettings
+from src.persistence.contracts import DecisionJournal
 from src.persistence.factory import PersistenceBackend, Repositories, open_repositories
 from src.web.routes import install_web
 from src.worker.execution import CommandResolver, ModeKillSwitch
@@ -50,11 +50,13 @@ def build_approval_setup(
     environ: Mapping[str, str],
     repositories: Repositories,
     clock: Clock,
-    policy: PipelinePolicy,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> ApprovalSetup:
-    """The same gateway the worker uses (``TRADING_MODE``), plus the approval secret."""
+    """The same gateway the worker uses (``TRADING_MODE``), plus the approval secret.
+
+    The kill-switch policy is not configuration here: the service reads the one the
+    operator chose at activation from the mode state (spec 7.3, F2)."""
 
     reasons: list[str] = []
     if config.requested_mode is TradingMode.SHADOW:
@@ -82,7 +84,6 @@ def build_approval_setup(
         live_promotion=gateway.live_promotion,
         receipts=gateway.receipts,
         kill_switch=ModeKillSwitch(repositories.mode),
-        kill_switch_policy=policy.kill_switch_policy,
     )
     wiring = ApprovalWiring(
         service=service,
@@ -102,7 +103,7 @@ def create_operator_app(
     policy: PipelinePolicy | None = None,
     settings: OperatorSettings | None = None,
     approvals: ApprovalSetup | None = None,
-    catalog: DecisionCatalog | None = None,
+    catalog: DecisionJournal | None = None,
     probes: tuple[ServiceProbe, ...] | None = None,
 ) -> FastAPI:
     environment = os.environ if environ is None else environ
@@ -113,9 +114,7 @@ def create_operator_app(
     owns_repositories = repositories is None
     stores = repositories or open_repositories(app_config, environ=environment, clock=clock)
     try:
-        setup = approvals or build_approval_setup(
-            app_config, environment, stores, clock, policy
-        )
+        setup = approvals or build_approval_setup(app_config, environment, stores, clock)
         wiring = setup.wiring
 
         async def current_mode() -> TradingMode:
@@ -126,7 +125,7 @@ def create_operator_app(
             environ=environment,
             settings=operator_settings,
             repositories=stores,
-            catalog=catalog or decision_catalog(stores),
+            catalog=catalog or stores.journal,
             policy=policy,
             clock=clock,
             probes=probes

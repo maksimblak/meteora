@@ -14,7 +14,6 @@ from fastapi.responses import StreamingResponse
 from src.api import metrics, presenters
 from src.api.context import OperatorContext
 from src.api.schemas import StatusPulse
-from src.execution.contracts import ExecutionPhase
 
 _RETRY_MILLISECONDS = 5000
 
@@ -22,7 +21,7 @@ _RETRY_MILLISECONDS = 5000
 async def status_pulse(ctx: OperatorContext) -> StatusPulse:
     state = await ctx.mode_state()
     alerts = await ctx.sync(ctx.repositories.mode.open_alert_count)
-    pending = await ctx.repositories.execution.in_phases((ExecutionPhase.AWAITING_APPROVAL,))
+    pending = await ctx.pending_approvals()
     last_sync = await ctx.repositories.history.latest_sync_at()
     now = ctx.clock.now()
     universe: Literal["NOT_SYNCED", "STALE", "FRESH"]

@@ -7,7 +7,7 @@
 1. `docker compose` читает `.env` из корня проекта **только для подстановки** `${ИМЯ:-}` в `docker-compose.yml`. Директивы `env_file` нет: в контейнер попадает лишь то, что явно перечислено у сервиса.
 2. Поэтому у каждой переменной ниже есть колонка «compose»: **да** — достаточно вписать значение в `.env`; **нет** — переменная читается кодом, но `docker-compose.yml` её не передаёт; чтобы её задать, нужен свой `docker-compose.override.yml` (Compose подхватывает его автоматически рядом с основным файлом; в Git его не кладите, если там пути к секретам).
 3. Пустое значение = «не задано». Подстановка `${X:-}` превращает отсутствующую переменную в пустую строку, и код считает её отсутствующей.
-4. Секреты задаются **либо** `ИМЯ`, **либо** `ИМЯ_FILE` (путь к файлу **внутри контейнера**; файл монтируется через override). Python отказывается стартовать, если заданы оба; executor при обоих берёт прямое значение. Пустой файл секрета — ошибка.
+4. Секреты (их единый список — реестр `src/core/secrets.py`: `DATABASE_URL`, `APP_OPERATOR_TOKEN`, `APP_SESSION_SECRET`, `HELIUS_API_KEY`, `EXECUTOR_INTERNAL_TOKEN`, `EXECUTOR_MODE_TOKEN`, `EXECUTOR_APPROVAL_SECRET`, `GMGN_API_KEY`, `TELEGRAM_BOT_TOKEN`, `WALLET_KEYPAIR_FILE`) задаются **либо** `ИМЯ`, **либо** `ИМЯ_FILE` (путь к файлу **внутри контейнера**; файл монтируется через override). Python отказывается стартовать, если заданы оба; executor при обоих берёт прямое значение. Пустой файл секрета — ошибка.
 5. `DATABASE_URL` и `APP_ENV` для Python-сервисов зашиты в `docker-compose.yml` (`postgresql+asyncpg://meteora@postgres:5432/meteora`, `development`); значения из `.env` для них не используются.
 
 Пример override для настроек, которых нет в compose (впишите свои значения):
@@ -66,17 +66,18 @@ services:
 
 | Переменная | По умолчанию | compose | Что делает |
 |---|---|---|---|
-| `WORKER_UNIVERSE_INTERVAL_SECONDS` | 300 | да | шаг sweep universe. От него же зависят окно производных коротких окон (от 60 с до шага + max(30 с, 10%)) и допуск разрыва наблюдений. Меньше 60 с не ставьте: короткие окна перестанут считаться |
+| `WORKER_UNIVERSE_INTERVAL_SECONDS` | 300 | да (worker и api) | шаг sweep universe. От него зависят производное окно 5m (берётся только из интервала не короче 4 мин 30 с; более частые свипы суммируются; самый длинный допустимый интервал — шаг + max(30 с, 10%), а при шаге короче 4 мин 30 с — ещё + 4 мин 30 с), допуск разрыва наблюдений и нижняя граница окна хранения истории (300 шагов) |
 | `WORKER_CANDIDATE_INTERVAL_SECONDS` | 60 | нет | как часто оцениваются все пулы последнего snapshot |
 | `WORKER_POSITION_INTERVAL_SECONDS` | 15 | нет | как часто переоцениваются открытые позиции |
 | `WORKER_MAX_CONCURRENCY` | 2 | нет | сколько задач scheduler запускает одновременно |
 | `SHADOW_EQUITY_BASE_UNITS` | 1 000 000 000 | нет | стартовый капитал SHADOW в base units quote-токена (от него считаются 10% / 1% / 4%) |
 | `WORKER_METRICS_HOST` / `WORKER_METRICS_PORT` | `127.0.0.1` / 9100 (`0` — выключить) | host зашит `0.0.0.0` | health и метрики worker внутри сети compose |
-| `RULESET_VERSION` | `guide-v1` | да (только worker) | `guide-v1` или прежняя `shadow-hypothesis-v1`; другое значение — отказ старта |
-| `RULESET_OVERRIDES_FILE` | — | нет | YAML с настроенными порогами `guide-v1`, см. ниже |
+| `RULESET_VERSION` | `guide-v1` | да (worker и api) | `guide-v1` или прежняя `shadow-hypothesis-v1`; другое значение — отказ старта |
+| `RULESET_OVERRIDES_FILE` | — | да (worker и api; путь внутри контейнера, сам файл монтируется override) | YAML с настроенными порогами `guide-v1`, см. ниже |
+| `HISTORY_RETENTION_HOURS` | 36 | да (worker) | окно хранения телеметрии: снимки пулов, версии universe, векторы признаков и решения без плана старше окна удаляет задача `retention` (раз в час, пачками). Не короче 300 шагов universe. Остаются всегда: последняя версия universe, последний снимок каждого пула, действующее решение пула, решения с планом и весь журнал аудита |
 | `TRADING_MODE` | `SHADOW` | да | для какого режима подключить шлюз исполнения (`APPROVAL`/`LIVE`). **Режим не включает**: режим хранится в БД и повышается только через panel/API с gates |
 
-Задавайте `RULESET_VERSION` и `RULESET_OVERRIDES_FILE` **и worker, и api** одинаково: api по своей копии правил показывает пороги в `/settings` и собирает promotion evidence. Compose передаёт `RULESET_VERSION` только worker, поэтому при смене версии нужен override и для api.
+Всё, что читает политика конвейера (`RULESET_VERSION`, `RULESET_OVERRIDES_FILE`, `WORKER_UNIVERSE_INTERVAL_SECONDS`, `GMGN_REQUIRED_FOR_LIVE`), compose передаёт **и worker, и api** из одного блока: api по той же политике показывает пороги в `/settings` и собирает promotion evidence, поэтому дни наблюдений и пороги в панели совпадают с теми, по которым работает worker. Если задаёте эти переменные в своём override, задавайте их обоим сервисам одинаково.
 
 ## Шлюз исполнения: Python-сторона (worker, api)
 
@@ -85,7 +86,7 @@ services:
 | `EXECUTOR_URL` | worker, api | — | да (оба) | адрес денежного executor, например `http://executor:3000`; без него шлюз APPROVAL/LIVE не собирается |
 | `EXECUTOR_QUOTES_URL` | worker | в compose `http://executor-quotes:3000`, иначе `EXECUTOR_URL` | да | read-only котировки глубины в любом режиме; без URL или внутреннего токена — флаг `DEPTH_UNAVAILABLE` |
 | `EXECUTOR_INTERNAL_TOKEN` / `_FILE` | worker, api (только `_FILE`) | — | worker: оба; api: только `_FILE` | заголовок `x-internal-token` к executor |
-| `EXECUTOR_MODE_TOKEN` / `_FILE` | worker | — | нет | заголовок `x-mode-token` при отправке команды |
+| `EXECUTOR_MODE_TOKEN` / `_FILE` | worker (api и worker читают его в реестр секретов: значение вырезается из логов) | — | нет | заголовок `x-mode-token` при отправке команды |
 | `EXECUTOR_APPROVAL_SECRET` / `_FILE` | api, worker | — | api: только `_FILE`; worker: нет | HMAC-секрет подписи approval (32+ байт); без него approvals в панели «не настроены» |
 | `EXECUTOR_TIMEOUT_SECONDS` | worker, api | 30 | нет | таймаут HTTP к executor |
 | `LIVE_PROMOTION_FILE` | worker, api, executor | — | нет | JSON с LIVE promotion evidence, см. `docs/runbook.md` |
@@ -157,12 +158,12 @@ thresholds:                     # только поля GuidePolicySettings; н�
 |---|---|---|
 | `minimum_market_cap` / `preferred_market_cap` | 500 000 / 1 000 000 USD | капа токена; статья §4, видео 2 |
 | `minimum_token_age` | 2 ч (`PT2H`) | чеклист статьи; без RPC оценивается снизу по возрасту пула |
-| `maximum_holder_concentration` | 0.30 | top-10 без pool vaults и известных программ; чеклист статьи (нужен RPC) |
+| `maximum_holder_concentration` | 0.30 | top-10 без pool vaults и известных программ; чеклист статьи (нужен RPC). Порог включительный: ровно 30% — уже отказ `HOLDER_CONCENTRATION_HIGH` |
 | `minimum_volume_per_minute` / `overvolume_volume_per_minute` | 14 000 / 100 000 USD | рабочий объём и сверхобъём в минуту; видео 1 и 2. Окно — производное короткое окно из `cumulative_metrics` (D07) |
 | `minimum_volume_to_liquidity` | 0.5 | объём короткого окна к ликвидности; чеклист статьи |
 | `minimum_fee_efficiency` | 0.5 | органичность: `fees + protocol_fees` против base fee пула; ниже — `ARTIFICIAL_VOLUME_SUSPECTED`; видео 2 |
 | `minimum_total_fees_sol` | 30 SOL | total fees токена (есть только у GMGN); **условный** (D03): нет значения — флаг `TOTAL_FEES_UNAVAILABLE` и строка в карточке подтверждения |
-| `maximum_insiders_share` / `maximum_bundling_share` / `maximum_phishing_share` / `maximum_gmgn_top10_holder_share` | 0.10 / 0.70 / 0.30 / 0.30 | метрики GMGN (§6.7); без свежих данных GMGN не применяются, вместо них флаг `GMGN_UNAVAILABLE` |
+| `maximum_insiders_share` / `maximum_bundling_share` / `maximum_phishing_share` / `maximum_gmgn_top10_holder_share` | 0.10 / 0.70 / 0.30 / 0.30 | метрики GMGN (§6.7); порог включительный (равное порогу значение уже отклоняет); без свежих данных GMGN не применяются, вместо них флаг `GMGN_UNAVAILABLE` |
 | `minimum_tvl` / `minimum_depth` / `maximum_price_impact` | 10 000 / 5 000 / 0.01 | ликвидность и глубина; глубина — из котировки `executor-quotes` (D07), без неё `DEPTH_UNAVAILABLE` |
 | `minimum_pool_age` | 30 мин | только прогрев истории пула |
 | `minimum_short_ratio` / `minimum_long_ratio` / `minimum_robust_z_score` / `minimum_fee_tvl` / `minimum_score` | 3 / 1.5 / 4 / 0.002 / 0.5 | всплеск объёма (§6.2) и итоговый score |
@@ -173,6 +174,7 @@ thresholds:                     # только поля GuidePolicySettings; н�
 | `bid_only_upside_grace` / `bid_only_upside_exit` | 30 мин / 0.05 | выход Bid-Ask по верху: цена над диапазоном дольше 30 мин или ушла выше на 5% |
 | `volume_decay_ratio` | 0.50 | выход при падении объёма вдвое против входа |
 | `price_shock_fraction` | 0.80 | ценовой шок, равный глубине самого широкого Bid-Ask |
-| `entry_notional_quote` / `max_slippage_bps` | 100 / 100 | эталонный размер входа в quote-единицах и допустимое проскальзывание |
+| `entry_notional_quote` / `max_slippage_bps` | 100 / 100 | эталонный размер входа **в USD** и допустимое проскальзывание. Размер в токене = USD × 10^decimals / цена quote-токена в USD (`quote_price_usd` из Data API); глубина тоже в USD. Нет цены quote-токена — `depth_source` с причиной `QUOTE_PRICE_UNKNOWN`, вход закрыт. `quote_base_units_per_unit` используется только для фикстур, которые сами меряют глубину |
+| `short_window_interval_tolerance` | 30 с (`PT30S`) | насколько интервал между снимками может быть короче окна 5m и всё ещё дать его (4 мин 30 с); возврат счётчика к уровню до сброса считается от метки до сброса |
 
-Лимиты риска (`RiskPolicy`, файлом не меняются): позиция до 10% капитала, расчётный риск до 1%, не больше трёх позиций, дневной стоп 4% (realized + conservative unrealized от капитала на начало UTC-суток), не больше 10% ликвидности пула. Политика kill switch для worker — `HOLD_AND_ALERT` (см. ограничение в `docs/runbook.md`).
+Лимиты риска (`RiskPolicy`, файлом не меняются): позиция до 10% капитала, расчётный риск до 1%, не больше трёх позиций, дневной стоп 4% (realized + conservative unrealized от капитала на начало UTC-суток), не больше 10% ликвидности пула. Политику kill switch для открытых позиций (`HOLD_AND_ALERT` или `ORDERLY_EXIT`) оператор выбирает при включении kill switch; она хранится в `mode_state` (миграция 0003) и одна для worker, `ExecutionService` и экрана подтверждений (`docs/runbook.md`, §9). Конфигурацией она не задаётся.

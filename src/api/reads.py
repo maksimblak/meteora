@@ -16,7 +16,6 @@ from pydantic import ValidationError
 
 from src.accounting.service import AccountingService, PerformanceService
 from src.api import labels, presenters
-from src.api.catalog import DecisionQuery
 from src.api.context import OperatorContext
 from src.api.errors import ApiError
 from src.api.schemas import (
@@ -41,12 +40,13 @@ from src.api.schemas import (
     UniverseStatus,
     WarmupView,
 )
+from src.core.secrets import SECRETS
 from src.domain.features.models import SignalReadiness
 from src.domain.models.primitives import PublicKey
 from src.domain.models.trading import TradingMode
 from src.domain.screening import CandidateStatus
-from src.execution.contracts import ExecutionPhase
 from src.market.models import PoolSnapshot
+from src.persistence.contracts import DecisionQuery, UniverseSummary
 from src.persistence.factory import PersistenceBackend
 from src.portfolio.models import PositionStatus, PositionValuation, ShadowPosition, TimeWindow
 
@@ -56,16 +56,6 @@ _URL_FIELDS = (
     "solana_ws_url",
     "jito_block_engine_url",
 )
-# Secret names are listed by presence only (``NAME`` or ``NAME_FILE``), never by value.
-_CONFIG_SECRETS = (
-    ("APP_OPERATOR_TOKEN", "operator_token"),
-    ("APP_SESSION_SECRET", "session_secret"),
-    ("DATABASE_URL", "database_url"),
-    ("HELIUS_API_KEY", "helius_api_key"),
-    ("EXECUTOR_INTERNAL_TOKEN", "executor_internal_token"),
-    ("TELEGRAM_BOT_TOKEN", "telegram_bot_token"),
-)
-_ENV_SECRETS = ("EXECUTOR_MODE_TOKEN", "EXECUTOR_APPROVAL_SECRET")
 _APPROVAL_REQUIRED = (
     "APP_OPERATOR_TOKEN",
     "EXECUTOR_URL",
@@ -90,14 +80,6 @@ def parse_public_key(value: str) -> str:
         ) from error
 
 
-def anchor_available(snapshots: Sequence[PoolSnapshot]) -> bool:
-    return any(
-        item.active_bin_id is not None
-        and item.base_decimals is not None
-        and item.quote_decimals is not None
-        for item in snapshots
-    )
-
 
 def anchor_notice() -> Notice:
     return presenters.readiness_notices((_ANCHOR_NOTE,))[0]
@@ -109,18 +91,26 @@ class OperatorReads:
 
     # --- dashboard --------------------------------------------------------------------
 
-    async def status(self, *, approval_blockers: Sequence[str] = ()) -> SystemStatus:
+    async def status(
+        self,
+        *,
+        approval_blockers: Sequence[str] = (),
+        universe: UniverseSummary | None = None,
+    ) -> SystemStatus:
+        """`universe`: the summary the caller already read for this request, if any."""
+
         ctx = self._ctx
         repositories = ctx.repositories
         now = ctx.clock.now()
+        summary = universe or await ctx.universe()
         state = await ctx.mode_state()
         alerts = await ctx.sync(repositories.mode.alerts)
         open_alerts = sorted(
             (alert for alert in alerts if alert.open), key=lambda alert: alert.created_at
         )
         services = await self.services()
-        universe = await self.universe_status()
-        pending = await repositories.execution.in_phases((ExecutionPhase.AWAITING_APPROVAL,))
+        universe_view = await self.universe_status(summary)
+        pending = await ctx.pending_approvals()
         readiness: list[str] = []
         for service in services:
             # SHADOW never uses the execution gateway: its absence is not a problem there.
@@ -133,16 +123,14 @@ class OperatorReads:
             readiness.append("KILL_SWITCH_ACTIVE")
         if state.mode is TradingMode.APPROVAL:
             readiness.extend(approval_blockers)
-        if state.mode is not TradingMode.SHADOW and not anchor_available(
-            await repositories.history.latest_universe()
-        ):
+        if state.mode is not TradingMode.SHADOW and not summary.anchored:
             readiness.append(_ANCHOR_NOTE)
         notices = presenters.readiness_notices(dict.fromkeys(readiness))
         return SystemStatus(
             generated_at=now,
             mode=presenters.mode_view(state),
             services=services,
-            universe=universe,
+            universe=universe_view,
             risk=await self.risk(state.daily_stop_active_on(ctx.today())),
             alerts=[presenters.alert_view(alert) for alert in reversed(open_alerts[-20:])],
             approvals_pending=len(pending),
@@ -175,13 +163,12 @@ class OperatorReads:
             )
         return services
 
-    async def universe_status(self) -> UniverseStatus:
+    async def universe_status(self, summary: UniverseSummary | None = None) -> UniverseStatus:
         ctx = self._ctx
-        history = ctx.repositories.history
-        snapshots = await history.latest_universe()
-        last_sync = await history.latest_sync_at()
+        universe = summary or await ctx.universe()
+        last_sync = universe.observed_at
         now = ctx.clock.now()
-        addresses = {item.pool.address.root for item in snapshots}
+        addresses = universe.addresses
         outcomes = [
             outcome
             for outcome in await ctx.catalog.latest_outcomes()
@@ -207,14 +194,14 @@ class OperatorReads:
             )
         else:
             state, message = "FRESH", "Universe синхронизирован"
-        if state != "NOT_SYNCED" and not snapshots:
+        if state != "NOT_SYNCED" and not addresses:
             message = "Синхронизация прошла, но пригодных пулов нет"
         elif state != "NOT_SYNCED" and not statuses.get(CandidateStatus.ACCEPT.value):
             message += "; принятых кандидатов нет — причины отсева ниже"
         return UniverseStatus(
             state=state,
             message=message,
-            pool_count=len(snapshots),
+            pool_count=len(addresses),
             last_sync_at=last_sync,
             sync_age_seconds=age,
             decision_counts=dict(sorted(statuses.items())),
@@ -297,8 +284,14 @@ class OperatorReads:
         required = ctx.policy.features.minimum_baseline_points
         if decision is not None:
             features = decision.decision.features
-            accumulated = features.baseline_points
             warming = features.readiness is SignalReadiness.WARMING_UP
+            # A warming-up pool keeps its decision while the outcome is unchanged (R29i.2),
+            # so the progress comes from the history accumulated since, not the old record.
+            accumulated = (
+                max(features.baseline_points, len(history) - 1)
+                if warming
+                else features.baseline_points
+            )
             state = "WARMING_UP" if warming else "READY"
         else:
             accumulated = max(len(history) - 1, 0)
@@ -460,11 +453,10 @@ class OperatorReads:
         settings["executor_url"] = mask_url(ctx.environ.get("EXECUTOR_URL"))
         settings["worker_health_url"] = mask_url(ctx.settings.worker_health_url)
         settings["persistence_backend"] = ctx.repositories.backend.value
+        # The secret registry: names by presence only (``NAME`` or ``NAME_FILE``), never values.
         configured = {
-            name: getattr(config, field) is not None for name, field in _CONFIG_SECRETS
+            setting.env: getattr(config, setting.field) is not None for setting in SECRETS
         }
-        for name in _ENV_SECRETS:
-            configured[name] = bool(ctx.environ.get(name) or ctx.environ.get(f"{name}_FILE"))
         present = {
             **configured,
             "EXECUTOR_URL": bool(ctx.environ.get("EXECUTOR_URL")),
@@ -487,7 +479,7 @@ class OperatorReads:
                     message="для APPROVAL/LIVE нужен PostgreSQL (DATABASE_URL)",
                 )
             )
-        if not anchor_available(await ctx.repositories.history.latest_universe()):
+        if not (await ctx.universe()).anchored:
             approval_notes.append(anchor_notice())
         live_notes = [
             *approval_notes,
@@ -505,8 +497,12 @@ class OperatorReads:
         return EffectiveConfig(
             settings=settings,
             secrets=[
-                SecretStatus(name=name, configured=value)
-                for name, value in sorted(configured.items())
+                SecretStatus(
+                    name=setting.env,
+                    configured=configured[setting.env],
+                    used_by=list(setting.used_by),
+                )
+                for setting in sorted(SECRETS, key=lambda item: item.env)
             ],
             readiness=readiness,
             ruleset_version=policy.ruleset_version,
@@ -517,8 +513,8 @@ class OperatorReads:
                 "risk": policy.risk.model_dump(mode="json"),
                 "features": policy.features.model_dump(mode="json"),
                 "max_slippage_bps": policy.max_slippage_bps,
-                "kill_switch_policy": policy.kill_switch_policy.value,
             },
+            kill_switch=presenters.kill_switch_view(await ctx.mode_state()),
         )
 
     async def mode_journal(self) -> ModeJournal:

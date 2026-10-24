@@ -1,17 +1,21 @@
-"""Mode transitions, kill switch and promotion evidence (G01, G03, spec 5.6-5.7, 7).
+"""Mode transitions, kill switch, critical alerts and promotion evidence (G01, G03).
 
 Downgrades and kill-switch activation apply immediately for an authenticated
-operator; promotions and kill-switch release also require re-authentication and an
-explicit confirmation. The gates themselves stay in ``ModeService`` (T04): this layer
-never decides a promotion, it only refuses to ask without the operator's consent.
+operator; promotions, kill-switch release and closing a critical alert also require
+re-authentication and an explicit confirmation. The gates themselves stay in
+``ModeService`` (T04): this layer never decides a promotion, it only refuses to ask
+without the operator's consent.
 """
 
-from uuid import UUID
+from datetime import datetime
+from uuid import UUID, uuid4
 
 from src.api import presenters
 from src.api.context import OperatorContext
 from src.api.errors import ApiError
 from src.api.schemas import (
+    AlertResolveRequest,
+    AlertView,
     KillSwitchActivateRequest,
     KillSwitchReleaseRequest,
     KillSwitchResultView,
@@ -25,16 +29,20 @@ from src.api.schemas import (
     ShadowReadinessView,
 )
 from src.api.security import OperatorAuth, OperatorPrincipal
+from src.domain.models.events import AuditEvent, EventType
 from src.domain.models.trading import TradingMode
 from src.execution.contracts import LivePromotionEvidence
 from src.execution.settings import ExecutorSettings
 from src.modes.models import (
     MINIMUM_SHADOW_DAYS,
     RECOMMENDED_SHADOW_DAYS,
+    CriticalAlert,
+    ModeState,
     PromotionEvidenceSnapshot,
 )
+from src.modes.repository import KILL_SWITCH_ALERT
 from src.modes.service import ModeService, ModeTransitionRejected, PromotionEvidenceService
-from src.observability.logging import get_logger
+from src.observability.logging import error_fields, get_logger
 
 _RANK = {TradingMode.SHADOW: 0, TradingMode.APPROVAL: 1, TradingMode.LIVE: 2}
 _LIVE_FLAGS = (
@@ -147,6 +155,62 @@ class OperatorActions:
             ) from error
         self._log.warning("kill_switch_released", operator=principal.confirmation_id)
         return presenters.mode_view(state)
+
+    async def resolve_alert(
+        self, alert_id: UUID, request: AlertResolveRequest, principal: OperatorPrincipal
+    ) -> AlertView:
+        """Close a critical alert (G13.2): re-authentication, a reason, an audit record first.
+
+        Any open critical alert blocks the promotion to APPROVAL (spec 7.1), so this is
+        guarded like the kill-switch release. The audit record precedes the state change;
+        a refusal after it is audited too, so the trail never shows a silent close.
+        """
+
+        self._auth.require_reauthentication(request.operator_token, request.confirm)
+        ctx = self._ctx
+        alerts = await ctx.sync(ctx.repositories.mode.alerts)
+        alert = next((item for item in alerts if item.alert_id == alert_id), None)
+        if alert is None:
+            raise ApiError(404, "ALERT_NOT_FOUND", "Критическое событие не найдено")
+        refusal = _resolve_refusal(alert, await ctx.mode_state())
+        if refusal is not None:
+            raise ApiError(
+                409, "ALERT_RESOLVE_REJECTED", "Событие не закрыто", {"reason": refusal}
+            )
+        resolved_event = _alert_event(
+            alert,
+            ctx.clock.now(),
+            {"stage": "resolved", "reason": request.reason, "operator": principal.confirmation_id},
+        )
+        try:
+            await ctx.repositories.audit.append(resolved_event)
+        except Exception as error:
+            self._log.critical("alert_resolve_audit_failed", **error_fields(error))
+            raise ApiError(
+                503, "AUDIT_UNAVAILABLE", "Аудит недоступен: событие не закрыто"
+            ) from error
+        try:
+            resolved = await ctx.sync(
+                self._modes().resolve_alert, alert_id, request.reason, principal.confirmation_id
+            )
+        except ValueError as error:
+            rejected = _alert_event(
+                alert, ctx.clock.now(), {"stage": "resolve_rejected", "reason": str(error)}
+            ).model_copy(update={"causation_id": resolved_event.event_id})
+            try:
+                await ctx.repositories.audit.append(rejected)
+            except Exception as audit_error:
+                self._log.error("alert_refusal_audit_failed", **error_fields(audit_error))
+            raise ApiError(
+                409, "ALERT_RESOLVE_REJECTED", "Событие не закрыто", {"reason": str(error)}
+            ) from error
+        self._log.warning(
+            "critical_alert_resolved",
+            alert_id=str(alert_id),
+            code=alert.code,
+            operator=principal.confirmation_id,
+        )
+        return presenters.alert_view(resolved)
 
     async def build_shadow_evidence(self, principal: OperatorPrincipal) -> ShadowReadinessView:
         ctx = self._ctx
@@ -265,3 +329,31 @@ class OperatorActions:
             open_critical_alerts=readiness.open_critical_alerts,
             consumed=evidence.consumed_at is not None,
         )
+
+
+def _resolve_refusal(alert: CriticalAlert, state: ModeState) -> str | None:
+    """Why an alert cannot be closed now (the repository applies the same rules)."""
+
+    if not alert.open:
+        return "alert already resolved"
+    if alert.code == KILL_SWITCH_ALERT and state.kill_switch_active:
+        return "release the kill switch to resolve its alert"
+    return None
+
+
+def _alert_event(
+    alert: CriticalAlert, occurred_at: datetime, payload: dict[str, object]
+) -> AuditEvent:
+    """The alert's audit stream: ``CriticalAlertRaised`` with ``stage`` (raised -> resolved),
+    as approvals use ``ApprovalRequested`` with ``stage=approved``."""
+
+    return AuditEvent(
+        event_id=uuid4(),
+        occurred_at=occurred_at,
+        aggregate_id=alert.alert_id,
+        correlation_id=uuid4(),
+        causation_id=None,
+        schema_version=1,
+        event_type=EventType.CRITICAL_ALERT_RAISED,
+        payload={"alert_id": str(alert.alert_id), "code": alert.code, **payload},
+    )

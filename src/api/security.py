@@ -55,9 +55,7 @@ class OperatorAuth:
         token = self._settings.operator_token
         if token is None or not candidate:
             return False
-        return hmac.compare_digest(
-            candidate.encode("utf-8"), token.get_secret_value().encode("utf-8")
-        )
+        return _same(candidate, token.get_secret_value())
 
     # --- web session ------------------------------------------------------------------
 
@@ -70,7 +68,7 @@ class OperatorAuth:
         if not cookie or cookie.count(".") != 2:
             return None
         session_id, issued, signature = cookie.split(".")
-        if not hmac.compare_digest(signature, self._sign("session", session_id, issued)):
+        if not _same(signature, self._sign("session", session_id, issued)):
             return None
         try:
             issued_at = int(issued)
@@ -111,7 +109,7 @@ class OperatorAuth:
         if session_id is None:
             raise ApiError(401, "UNAUTHORIZED", "Нужен вход оператора")
         supplied = csrf_token if csrf_token is not None else request.headers.get(CSRF_HEADER)
-        if not supplied or not hmac.compare_digest(supplied, self.csrf_token(session_id)):
+        if not supplied or not _same(supplied, self.csrf_token(session_id)):
             raise ApiError(403, "CSRF_FAILED", "CSRF-токен отсутствует или неверен")
         return OperatorPrincipal("session", session_id)
 
@@ -130,3 +128,9 @@ class OperatorAuth:
     def _sign(self, purpose: str, *parts: str) -> str:
         message = ":".join((purpose, *parts)).encode("utf-8")
         return hmac.new(self._settings.session_key, message, hashlib.sha256).hexdigest()
+
+
+def _same(supplied: str, expected: str) -> bool:
+    """Constant-time comparison of UTF-8 bytes: any client text compares, none raises."""
+
+    return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))

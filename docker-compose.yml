@@ -1,9 +1,26 @@
 name: meteora-volume-bot
 
+# Every container log is rotated: at most 3 files of 10 MB each per service, so a week of
+# SHADOW cannot fill the disk with logs (docker's default json-file grows without limit).
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Everything the worker's pipeline policy reads (load_pipeline_policy). The api gets the same
+# values, so its promotion evidence and /settings judge by the rules the worker applies.
+x-policy-environment: &policy-environment
+  RULESET_VERSION: ${RULESET_VERSION:-}
+  RULESET_OVERRIDES_FILE: ${RULESET_OVERRIDES_FILE:-}
+  WORKER_UNIVERSE_INTERVAL_SECONDS: ${WORKER_UNIVERSE_INTERVAL_SECONDS:-}
+  GMGN_REQUIRED_FOR_LIVE: ${GMGN_REQUIRED_FOR_LIVE:-}
+
 x-python-service: &python-service
   build:
     context: .
     dockerfile: Dockerfile
+  logging: *logging
   environment: &python-environment
     APP_ENV: development
     DATABASE_URL: postgresql+asyncpg://meteora@postgres:5432/meteora
@@ -11,6 +28,7 @@ x-python-service: &python-service
 services:
   postgres:
     image: postgres:16-bookworm
+    logging: *logging
     environment:
       POSTGRES_DB: meteora
       POSTGRES_USER: meteora
@@ -43,7 +61,7 @@ services:
       - --port
       - "8000"
     environment:
-      <<: *python-environment
+      <<: [*python-environment, *policy-environment]
       WORKER_HEALTH_URL: http://worker:9100
       # Operator login (writes, kill switch, downgrade) from .env: set the value or its
       # *_FILE, not both. Unset -> the stack still starts and the panel says login is off.
@@ -58,8 +76,6 @@ services:
       EXECUTOR_URL: ${EXECUTOR_URL:-}
       EXECUTOR_INTERNAL_TOKEN_FILE: ${EXECUTOR_INTERNAL_TOKEN_FILE:-}
       EXECUTOR_APPROVAL_SECRET_FILE: ${EXECUTOR_APPROVAL_SECRET_FILE:-}
-      # The same GMGN rule the worker applies, for the effective configuration (G18).
-      GMGN_REQUIRED_FOR_LIVE: ${GMGN_REQUIRED_FOR_LIVE:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,9 +99,12 @@ services:
     <<: *python-service
     command: ["uv", "run", "python", "-m", "src.worker"]
     environment:
-      <<: *python-environment
+      <<: [*python-environment, *policy-environment]
       # Health/metrics for the api on the internal compose network only (not published).
       WORKER_METRICS_HOST: 0.0.0.0
+      # Retention of telemetry history (snapshots, universe versions, feature vectors and
+      # decisions without a plan); empty = 36 h. The audit trail is never purged.
+      HISTORY_RETENTION_HOURS: ${HISTORY_RETENTION_HOURS:-}
       # Live data (D07): the public Data API, narrowed by METEORA_UNIVERSE_FILTER
       # (empty = pools that traded in 24 h, "all" = the full sweep). SOLANA_RPC_URL adds
       # token risk and LB pair reads; without it token risk stays UNKNOWN.
@@ -93,8 +112,6 @@ services:
       METEORA_UNIVERSE_FILTER: ${METEORA_UNIVERSE_FILTER:-}
       SOLANA_RPC_URL: ${SOLANA_RPC_URL:-}
       TRADING_MODE: ${TRADING_MODE:-}
-      RULESET_VERSION: ${RULESET_VERSION:-}
-      WORKER_UNIVERSE_INTERVAL_SECONDS: ${WORKER_UNIVERSE_INTERVAL_SECONDS:-}
       # Read-only quotes for candidates' depth (D07) from executor-quotes below, in every
       # mode. Set the internal token (or its *_FILE inside the container) for both; without
       # it there are no quotes and candidates carry DEPTH_UNAVAILABLE.
@@ -113,7 +130,6 @@ services:
       GMGN_API_PLAN: ${GMGN_API_PLAN:-}
       GMGN_API_CACHE_SECONDS: ${GMGN_API_CACHE_SECONDS:-}
       GMGN_URL: ${GMGN_URL:-}
-      GMGN_REQUIRED_FOR_LIVE: ${GMGN_REQUIRED_FOR_LIVE:-}
       GMGN_TIMEOUT_SECONDS: ${GMGN_TIMEOUT_SECONDS:-}
       GMGN_STALE_AFTER_SECONDS: ${GMGN_STALE_AFTER_SECONDS:-}
     expose:
@@ -129,6 +145,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.executor
+    logging: *logging
     environment:
       TRADING_MODE: SHADOW
       SOLANA_RPC_URL: ${SOLANA_RPC_URL:-}
@@ -158,6 +175,7 @@ services:
       context: .
       dockerfile: Dockerfile.gmgn
       target: runtime
+    logging: *logging
     init: true
     shm_size: "1gb"
     environment:
@@ -184,6 +202,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.executor
+    logging: *logging
     expose:
       - "3000"
 

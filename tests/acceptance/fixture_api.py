@@ -8,6 +8,11 @@ ingests a real-format universe without any external network:
   ``FIXTURE_FREEZE_AFTER`` on the last replayed sweep is served again and again, so the
   cumulative counters stop and the short windows derived from them fall to zero (a
   volume decay that closes the shadow positions);
+* every token carries its USD ``price`` as the live API sends it (F1: the entry size is
+  USD converted by the quote token's price). The series was cut before the adapter read
+  prices, so the prices come from the Data API answers recorded the same day
+  (``pool_single.json``, then ``pools_page1/2.json``), value for value; a token with no
+  recorded price (HYPE) stays unpriced and its pool fails closed, as live;
 * ``GET /pools/{address}`` - that pool from the sweep served last;
 * ``GET /pools/{address}/volume/history`` - the recorded 5m history of the two recorded
   pools, moved forward in whole 5-minute steps so it ends now; other pools get an
@@ -28,6 +33,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 SERIES = Path(__file__).resolve().parents[1] / "providers" / "fixtures" / "meteora_live" / "series"
+PRICE_SOURCES = ("pool_single.json", "pools_page1.json", "pools_page2.json")
 BUCKET_SECONDS = 300
 HISTORY_PATH = re.compile(r"^/pools/([1-9A-HJ-NP-Za-km-z]{32,44})/volume/history$")
 POOL_PATH = re.compile(r"^/pools/([1-9A-HJ-NP-Za-km-z]{32,44})$")
@@ -47,22 +53,36 @@ class Replay:
         recorded = (series / "history_at.txt").read_text(encoding="utf-8").strip()
         self._history_recorded_at = datetime.fromisoformat(recorded)
         self._series = series
+        self._prices = recorded_prices(series.parent)
 
     def next_sweep(self) -> bytes:
         with self._lock:
             index = min(self._requests, self._last_index)
             self._requests += 1
             self._served = self._sweeps[index]
-            return self._served.read_bytes()
+            served = self._served
+        return json.dumps(self._priced(json.loads(served.read_text(encoding="utf-8")))).encode()
 
     def pool(self, address: str) -> dict[str, Any] | None:
         with self._lock:
             served = self._served or self._sweeps[0]
-        document = json.loads(served.read_text(encoding="utf-8"))
+        document = self._priced(json.loads(served.read_text(encoding="utf-8")))
         for item in document.get("data", []):
             if item.get("address") == address:
                 return dict(item)
         return None
+
+    def _priced(self, document: dict[str, Any]) -> dict[str, Any]:
+        """Each token with its recorded price where the recorded sweep has none."""
+
+        for pool in document.get("data", []):
+            for side in ("token_x", "token_y"):
+                token = pool.get(side)
+                if isinstance(token, dict) and "price" not in token:
+                    price = self._prices.get(str(token.get("address")))
+                    if price is not None:
+                        token["price"] = price
+        return document
 
     def history(self, address: str, start: int | None, end: int | None) -> dict[str, Any]:
         recorded = self._series / f"history_{address}.json"
@@ -99,6 +119,22 @@ class Replay:
                 "frozen": self._requests > self._last_index,
                 "freeze_after": self._last_index + 1,
             }
+
+
+def recorded_prices(live: Path) -> dict[str, Any]:
+    """Token USD prices by mint from the Data API answers recorded the same day, as sent."""
+
+    pools: list[dict[str, Any]] = []
+    for name in PRICE_SOURCES:
+        document = json.loads((live / name).read_text(encoding="utf-8"))
+        pools.extend(document["data"] if "data" in document else [document])
+    prices: dict[str, Any] = {}
+    for pool in pools:
+        for side in ("token_x", "token_y"):
+            token = pool.get(side) or {}
+            if "price" in token:
+                prices.setdefault(str(token["address"]), token["price"])
+    return prices
 
 
 def _integer(values: dict[str, list[str]], name: str) -> int | None:
