@@ -21,12 +21,13 @@ from tests.worker.harness import NOW, POOL, Harness, safe_token, snapshot, spike
 
 
 def live(history: list[PoolSnapshot]) -> list[PoolSnapshot]:
-    """The same pool as the Data API reports it: no depth, quote mint decimals known."""
+    """The same pool as the Data API reports it: no depth, the quote token's decimals and
+    USD price known (1 USD, so the 10 USD reference size is 10 quote units)."""
 
     rebuilt = []
     for item in history:
         data = item.model_dump()
-        data.update(depth=None, base_decimals=9, quote_decimals=9)
+        data.update(depth=None, base_decimals=9, quote_decimals=9, quote_price_usd=Decimal(1))
         rebuilt.append(PoolSnapshot.model_validate(data))
     return rebuilt
 

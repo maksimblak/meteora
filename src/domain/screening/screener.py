@@ -684,10 +684,7 @@ class PoolScreener:
             reasons.append(RejectionCode.BLACKLISTED_TOKEN)
         if token.verified is RiskSignal.UNSAFE:
             reasons.append(RejectionCode.UNVERIFIED_TOKEN)
-        if (
-            token.holder_concentration is not None
-            and token.holder_concentration > policy.maximum_holder_concentration
-        ):
+        if _holder_concentration_high(token.holder_concentration, policy):
             reasons.append(RejectionCode.HOLDER_CONCENTRATION_HIGH)
         # D09: a token with no configured source carries no data that could be stale or
         # unresolved; it is the TOKEN_RISK_UNAVAILABLE flag instead (see ``evaluate``).
@@ -711,6 +708,18 @@ class PoolScreener:
         ):
             reasons.append(RejectionCode.VOLUME_SIGNAL_BELOW_THRESHOLD)
         return reasons
+
+
+def _holder_concentration_high(share: Decimal | None, policy: ScreeningPolicy) -> bool:
+    """The top-10 share fails its maximum. guide-v1 asks for a share *below* it (spec 6.6,
+    like the GMGN top-10 threshold), so the maximum itself fails; ``shadow-hypothesis-v1``
+    keeps its inclusive maximum so its decisions stay reproducible."""
+
+    if share is None:
+        return False
+    if policy.guide is not None:
+        return share >= policy.maximum_holder_concentration
+    return share > policy.maximum_holder_concentration
 
 
 def _token_resolved(token: TokenRiskSnapshot, policy: ScreeningPolicy) -> bool:

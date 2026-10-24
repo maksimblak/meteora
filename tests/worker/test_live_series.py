@@ -37,7 +37,8 @@ from src.providers.resilience import IntervalRateLimiter, ResilientHttpClient, R
 from src.worker.policy import GuidePolicySettings, PipelinePolicy, guide_policy
 from tests.worker.harness import Harness
 
-SERIES = Path(__file__).parents[1] / "providers" / "fixtures" / "meteora_live" / "series"
+LIVE = Path(__file__).parents[1] / "providers" / "fixtures" / "meteora_live"
+SERIES = LIVE / "series"
 ARRIVALS: dict[str, str] = json.loads((SERIES / "arrivals.json").read_text(encoding="utf-8"))
 SWEEPS = sorted(ARRIVALS)
 CADENCE = timedelta(seconds=90)
@@ -58,6 +59,41 @@ def at(sweep: str) -> datetime:
     return datetime.fromisoformat(ARRIVALS[sweep])
 
 
+def recorded_prices() -> dict[str, Any]:
+    """Token USD prices the Data API sent the same day (``pool_single.json`` first, then the
+    pages), by mint, as sent.
+
+    The series was cut to the fields the adapter read when it was recorded, before it read
+    the quote token's price (A3); these stand in for it. HYPE has no recorded price, so a
+    HYPE-quoted pool stays unpriced and fails closed.
+    """
+
+    prices: dict[str, Any] = {}
+    pools = [json.loads((LIVE / "pool_single.json").read_text(encoding="utf-8"))]
+    for page in ("pools_page1.json", "pools_page2.json"):
+        pools.extend(json.loads((LIVE / page).read_text(encoding="utf-8"))["data"])
+    for pool in pools:
+        for side in ("token_x", "token_y"):
+            token = pool[side]
+            prices.setdefault(token["address"], token["price"])
+    return prices
+
+
+PRICES = recorded_prices()
+
+
+def priced(body: bytes) -> bytes:
+    """The sweep with each token's recorded price where the series has none."""
+
+    sweep = json.loads(body)
+    for pool in sweep["data"]:
+        for side in ("token_x", "token_y"):
+            token = pool[side]
+            if "price" not in token and token["address"] in PRICES:
+                token["price"] = PRICES[token["address"]]
+    return json.dumps(sweep).encode()
+
+
 class SeriesApi:
     """Serves the current recorded sweep and the recorded volume histories."""
 
@@ -68,7 +104,7 @@ class SeriesApi:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path == "/pools":
-            body = (SERIES / f"{self.current}.json").read_bytes()
+            body = priced((SERIES / f"{self.current}.json").read_bytes())
         else:
             address = path.removeprefix("/pools/").removesuffix("/volume/history")
             self.history_requests.append(address)
@@ -243,15 +279,30 @@ def test_on_live_data_some_pools_become_candidates_and_shadow_accepts() -> None:
     assert len(accepted) < len(decisions)  # the hard filters still reject live pools
     assert quotes.requests  # depth was measured for the candidates only
     assert len(quotes.requests) < len(decisions)
+    quote_mints = {item.pool.address.root: item.pool.quote_mint.root for item in universe}
     for decision in accepted:
-        assert decision.depth is not None and decision.depth.source is DepthSource.QUOTE
+        depth = decision.depth
+        assert depth is not None
+        if quote_mints[decision.pool_address.root] in PRICES:
+            assert depth.source is DepthSource.QUOTE
+            assert depth.quote_price_usd == Decimal(
+                repr(PRICES[quote_mints[decision.pool_address.root]])
+            )
+        else:  # the HYPE-quoted pool: no USD price, so nothing to quote or size with
+            assert (depth.source, depth.detail) == (DepthSource.UNAVAILABLE, "QUOTE_PRICE_UNKNOWN")
+            assert DecisionFlag.DEPTH_UNAVAILABLE in decision.flags
         # The Data API has no participant counts or total fees: flagged, not UNKNOWN.
         assert DecisionFlag.VOLUME_PARTICIPANTS_UNAVAILABLE in decision.flags
         assert DecisionFlag.TOTAL_FEES_UNAVAILABLE in decision.flags
     # USDC keeps its freeze authority (``freeze_authority_disabled: false``).
     usdc_sol = "HRYEjwdo3bZ1TpXKWKcezqiwSV2Ywuh4LxMa2PzoCnG6"
     assert RejectionCode.FREEZE_AUTHORITY_PRESENT in decisions[usdc_sol].reasons
-    assert harness.modes.open_positions()
+    opened = harness.modes.open_positions()
+    assert opened
+    # Positions only where the quote token's price turned USD into its units.
+    for position_id in opened:
+        position = harness.accounting.position_for(position_id)
+        assert position is not None and quote_mints[position.pool_address] in PRICES
 
 
 def test_a_new_live_pool_is_decided_from_its_volume_history() -> None:

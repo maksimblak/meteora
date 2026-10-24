@@ -123,6 +123,10 @@ class DepthEvidence(BaseModel):
 
     ``QUOTE``: the executor's read-only quote; no ``depth`` means the pool could not fill
     the reference size. ``UNAVAILABLE``: nothing was measured, ``detail`` says why.
+
+    ``depth`` and ``reference_notional`` are USD, the unit of ``minimum_depth`` and the TVL;
+    ``quote_price_usd`` is the quote token's USD price that turned the reference size into
+    the quote-token amount the executor quoted (A3).
     """
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
@@ -133,16 +137,22 @@ class DepthEvidence(BaseModel):
     reference_notional: Decimal | None = None
     detail: str | None = None
     measured_at: datetime | None = None
+    quote_price_usd: Decimal | None = None
 
     _reject_float = field_validator(
-        "depth", "price_impact", "reference_notional", mode="before"
+        "depth", "price_impact", "reference_notional", "quote_price_usd", mode="before"
     )(_exact_decimal)
 
     @model_validator(mode="after")
     def validate_depth(self) -> "DepthEvidence":
         if any(
             value is not None and value < 0
-            for value in (self.depth, self.price_impact, self.reference_notional)
+            for value in (
+                self.depth,
+                self.price_impact,
+                self.reference_notional,
+                self.quote_price_usd,
+            )
         ):
             raise ValueError("depth evidence cannot be negative")
         if self.price_impact is not None and self.price_impact > 1:

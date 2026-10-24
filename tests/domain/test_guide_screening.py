@@ -147,6 +147,22 @@ def test_each_author_threshold_rejects_with_its_own_reason(
     assert expected in decision.reasons
 
 
+def test_a_top10_share_of_exactly_30_percent_fails_the_guide() -> None:
+    """Spec 6.6 asks for a top-10 share below 30%: the maximum itself already rejects, as
+    for the GMGN top-10 threshold. ``shadow-hypothesis-v1`` keeps its inclusive maximum."""
+
+    at_maximum = guide_token(holder_concentration="0.30")
+
+    guide = evaluate(guide_history(), at_maximum)
+    legacy = evaluate(guide_history(), at_maximum, policy=LEGACY)
+    below = evaluate(guide_history(), guide_token(holder_concentration="0.2999"))
+
+    assert guide.status is CandidateStatus.REJECT
+    assert RejectionCode.HOLDER_CONCENTRATION_HIGH in guide.reasons
+    assert RejectionCode.HOLDER_CONCENTRATION_HIGH not in legacy.reasons
+    assert RejectionCode.HOLDER_CONCENTRATION_HIGH not in below.reasons
+
+
 def test_longer_volume_window_does_not_weaken_the_volume_to_liquidity_threshold() -> None:
     history = guide_history(long="600000", tvl="250000")
 

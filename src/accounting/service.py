@@ -29,6 +29,7 @@ from src.execution.contracts import (
     canonical_command_digest,
 )
 from src.market.models import DataQuality, Freshness, PoolSnapshot
+from src.market.windows import WINDOW_MINUTES
 from src.modes.models import DailyPromotionObservation
 from src.portfolio.models import (
     LiquidityTranche,
@@ -248,7 +249,11 @@ class AccountingService:
 
 
 class ShadowBroker:
-    """Executes SHADOW commands without an executor, wallet or network access."""
+    """Executes SHADOW commands without an executor, wallet or network access.
+
+    Every fill after the open also books the LP fees the position earned since its last
+    fill (``shadow_fee_income``) on top of the cost model's own accrual.
+    """
 
     def __init__(self, repository: AccountingRepository, clock: Clock) -> None:
         self._repository = repository
@@ -287,13 +292,16 @@ class ShadowBroker:
             raise ValueError("shadow command requires position_address")
 
         current = self._repository.position_for(position_id)
+        fee_income = cost_model.fee_income_base_units
+        if current is not None and command.operation is not DlmmOperation.OPEN:
+            fee_income += shadow_fee_income(current, command, market, now)
         fill = Fill(
             filled_at=now,
             price=market.price,
             slippage_bps=cost_model.slippage_bps,
             network_fee_base_units=cost_model.network_fee_base_units,
             jito_tip_base_units=cost_model.jito_tip_base_units,
-            fee_income_base_units=cost_model.fee_income_base_units,
+            fee_income_base_units=fee_income,
         )
         step = self._accounting.apply_fill(current, command, fill)
         valuation = self._accounting.value_at(step.position, fill.price, now)
@@ -391,6 +399,57 @@ class PerformanceService:
             decision_count=decision_count,
             risk_invariant_breaches=risk_invariant_breaches,
         )
+
+
+def shadow_fee_income(
+    position: ShadowPosition, command: DlmmCommandV1, market: PoolSnapshot, at: datetime
+) -> Decimal:
+    """LP fees a SHADOW position earned since its last fill, in its own base units (B7).
+
+    The position takes the pool's LP fees (``WindowMetrics.fees``: the protocol's share is
+    not paid to liquidity providers) in proportion to its share of the pool's liquidity,
+    its liquidity value over the TVL: ``value * fees / tvl`` is in the position's base
+    units whatever the quote token, as fees and TVL share one unit (USD). The fees of the
+    holding interval come from the shortest window of ``market`` that covers it, pro rata;
+    beyond the longest window only that window's fees are known and nothing is
+    extrapolated. A tranche whose bins (``command``'s offsets around its entry price) do not
+    hold the price at this fill earns nothing for the interval: the position is reviewed
+    every cycle, and when it was in range in between is unknown.
+    """
+
+    interval = at - position.updated_at
+    if interval <= timedelta(0) or market.tvl <= 0 or market.price <= 0:
+        return Decimal(0)
+    pool_fees = _pool_fees(market, interval)
+    if pool_fees <= 0:
+        return Decimal(0)
+    step = Decimal(1) + Decimal(market.bin_step) / _BPS
+    earning = Decimal(0)
+    for tranche in position.tranches:
+        lower = tranche.entry_price * step**command.min_bin_id
+        upper = tranche.entry_price * step ** (command.max_bin_id + 1)
+        if lower <= market.price < upper:
+            earning += _tranche_values(tranche, market.price)[1]
+    return earning * pool_fees / market.tvl
+
+
+def _pool_fees(market: PoolSnapshot, interval: timedelta) -> Decimal:
+    """LP fees the pool earned over the last ``interval``: the shortest window covering it
+    pro rata, or the longest window's fees when none covers it."""
+
+    known = sorted(
+        (WINDOW_MINUTES[name], metrics.fees)
+        for name, metrics in market.windows.items()
+        if metrics.fees is not None
+    )
+    if not known:
+        return Decimal(0)
+    held = Decimal(interval // timedelta(microseconds=1))
+    for minutes, fees in known:
+        length = Decimal(minutes * 60_000_000)
+        if length >= held:
+            return fees * held / length
+    return known[-1][1]
 
 
 def _tranche_values(tranche: LiquidityTranche, price: Decimal) -> tuple[Decimal, Decimal]:

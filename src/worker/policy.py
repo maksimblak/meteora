@@ -9,7 +9,7 @@ is kept byte-for-byte so its decisions stay reproducible.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -46,6 +46,9 @@ DEFAULT_UNIVERSE_INTERVAL = timedelta(minutes=5)
 # Bins the pool may move between the snapshot an entry was planned on and the fresh read
 # (and the executor's simulation) before the planned range counts as stale.
 DEFAULT_ACTIVE_BIN_TOLERANCE = 3
+# How much shorter than the 5m window the counters' interval may be and still make it (the
+# sweeps' jitter, the slack of ``observation_gap``); a shorter increase is never stretched.
+DEFAULT_SHORT_WINDOW_TOLERANCE = timedelta(seconds=30)
 
 
 def universe_interval(environ: Mapping[str, str]) -> timedelta:
@@ -71,18 +74,26 @@ def observation_gap(interval: timedelta) -> timedelta:
 def _short_window_rules(
     interval: timedelta,
     *,
+    interval_tolerance: timedelta = DEFAULT_SHORT_WINDOW_TOLERANCE,
     negative_noise_absolute: Decimal = Decimal("10"),
     negative_noise_relative: Decimal = Decimal("0.0000001"),
     counter_reset_after: timedelta = timedelta(minutes=30),
 ) -> ShortWindowRules:
-    gap = observation_gap(interval)
-    return ShortWindowRules(
-        minimum_interval=min(timedelta(minutes=1), gap),
-        maximum_interval=gap,
+    """A window spans at least its length less ``interval_tolerance`` and starts no further
+    back than one cadence step (``observation_gap``). Sweeps that come sooner than the
+    window are summed, so the newest start old enough may lie one more step back: the limit
+    is then the shortest interval plus that gap."""
+
+    rules = ShortWindowRules(
+        interval_tolerance=interval_tolerance,
         negative_noise_absolute=negative_noise_absolute,
         negative_noise_relative=negative_noise_relative,
         counter_reset_after=counter_reset_after,
     )
+    gap = observation_gap(interval)
+    if interval < rules.minimum_interval:
+        gap += rules.minimum_interval
+    return replace(rules, maximum_interval=gap)
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +103,11 @@ class PipelinePolicy:
     strategy: StrategyPolicy
     risk: RiskPolicy
     shadow_costs: CostModel
+    # The reference size of the executor's depth quote, in USD like ``minimum_depth`` and the
+    # TVL; it is turned into the pool's quote token by that token's USD price and decimals.
     entry_notional_quote: Decimal
+    # Quote-token base units per USD for a source that measures depth itself and reports no
+    # quote price (fixtures); Data API pools use their quote token's price and decimals.
     quote_base_units_per_unit: Decimal
     max_slippage_bps: int = 100
     kill_switch_policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT
@@ -245,6 +260,7 @@ class GuidePolicySettings(BaseModel):
     ath_coverage_tolerance: timedelta = timedelta(minutes=15)
     # The ATH observation gap and the short-window interval follow the universe interval
     # (``WORKER_UNIVERSE_INTERVAL_SECONDS``); they are not thresholds of their own.
+    short_window_interval_tolerance: timedelta = DEFAULT_SHORT_WINDOW_TOLERANCE
     short_window_negative_noise: Decimal = Decimal("10")
     short_window_negative_noise_relative: Decimal = Decimal("0.0000001")
     short_window_counter_reset_after: timedelta = timedelta(minutes=30)
@@ -267,6 +283,7 @@ class GuidePolicySettings(BaseModel):
     overvolume_volume_decay_ratio: Decimal = Decimal("1")
     volume_decay_ratio: Decimal = Decimal("0.50")
     price_shock_fraction: Decimal = Decimal("0.80")
+    # USD reference size of the depth quote (A3); see ``PipelinePolicy``.
     entry_notional_quote: Decimal = Decimal("100")
     quote_base_units_per_unit: Decimal = Decimal(1_000_000)
     max_slippage_bps: int = 100
@@ -311,6 +328,7 @@ def guide_policy(
     return PipelinePolicy(
         short_window=_short_window_rules(
             universe_interval,
+            interval_tolerance=values.short_window_interval_tolerance,
             negative_noise_absolute=values.short_window_negative_noise,
             negative_noise_relative=values.short_window_negative_noise_relative,
             counter_reset_after=values.short_window_counter_reset_after,

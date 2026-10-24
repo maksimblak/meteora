@@ -82,18 +82,73 @@ def test_the_short_window_is_the_counter_increase_since_the_previous_snapshot() 
     assert derived.cumulative_volume == Decimal("1060000")
 
 
-def test_a_shorter_interval_is_rescaled_to_the_window_length() -> None:
+def test_a_delta_over_less_than_the_window_is_never_stretched_to_it() -> None:
+    """Review probe C096: after a restart the sweep runs a minute after the last one. A
+    20 000 trade in that minute is not a 100 000 window; the next sweep measures five
+    minutes from that reading."""
+
+    series = chain(
+        RULES,
+        (0, "1000000", "100"),
+        (1, "1020000", "102"),
+        (6, "1050000", "105"),
+    )
+
+    assert reasons(series) == ["NO_PREVIOUS", "INTERVAL_TOO_SHORT", None]
+    assert "5m" not in series[1].windows
+    assert all(
+        item.windows["5m"].volume != Decimal("100000") for item in series if "5m" in item.windows
+    )
+    # 1 050 000 - 1 020 000 over the five minutes since the reading at minute 1.
+    assert series[2].windows["5m"].volume == Decimal("30000")
+    assert series[2].windows["5m"].fees == Decimal("3")
+    assert series[2].short_window is not None
+    assert series[2].short_window.interval_seconds == Decimal("300")
+
+
+def test_the_shortest_interval_that_closes_a_window_is_the_window_less_the_tolerance() -> None:
+    assert RULES.interval_tolerance == timedelta(seconds=30)
+    assert RULES.minimum_interval == timedelta(minutes=4, seconds=30)
+    strict = ShortWindowRules(interval_tolerance=timedelta(0))
+    assert strict.minimum_interval == timedelta(minutes=5)
+    with pytest.raises(ValueError):
+        ShortWindowRules(interval_tolerance=timedelta(minutes=5))
+    with pytest.raises(ValueError):
+        ShortWindowRules(maximum_interval=timedelta(minutes=4))
+
     previous = live(T0, "1000000", "2500")
-    current = live(T0 + timedelta(seconds=150), "1030000", "2575")
+    just_short = derive_short_window(
+        live(T0 + timedelta(minutes=4, seconds=29), "1030000", "2575"), previous, RULES
+    )
+    closing = derive_short_window(
+        live(T0 + timedelta(minutes=4, seconds=30), "1030000", "2575"), previous, RULES
+    )
 
-    derived = derive_short_window(current, previous, RULES)
+    assert reasons([just_short]) == ["INTERVAL_TOO_SHORT"]
+    # 30 000 over 270 s is 33 333.3... per 300 s: a slightly short interval is rescaled.
+    assert closing.windows["5m"].volume == Decimal(30_000) * Decimal(300) / Decimal(270)
 
-    # 30 000 in 150 s is 60 000 per 300 s; 75 in fees is 150.
-    assert derived.windows["5m"].volume == Decimal("60000")
-    assert derived.windows["5m"].fees == Decimal("150")
-    assert derived.short_window is not None
-    assert derived.short_window.interval_seconds == Decimal("150")
-    assert derived.short_window.volume_delta == Decimal("30000")
+
+def test_a_fast_cadence_sums_adjacent_deltas_until_they_cover_the_window() -> None:
+    """Sweeps 90 s apart: the window starts at the newest reading at least 4.5 min old."""
+
+    rules = ShortWindowRules(maximum_interval=timedelta(minutes=6, seconds=30))
+    readings = [(0, "1000000"), (90, "1010000"), (180, "1020000"), (269, "1030000"),
+                (360, "1040000"), (450, "1050000")]
+    derived: list[PoolSnapshot] = []
+    for second, volume in readings:
+        current = live(T0 + timedelta(seconds=second), volume, "2500")
+        derived.append(derive_short_window(current, derived[-1] if derived else None, rules))
+
+    assert reasons(derived)[:4] == [
+        "NO_PREVIOUS", "INTERVAL_TOO_SHORT", "INTERVAL_TOO_SHORT", "INTERVAL_TOO_SHORT"
+    ]
+    # At 360 s the newest reading 270 s or older is the one at 90 s: 30 000 in 270 s.
+    assert derived[4].windows["5m"].volume == Decimal(30_000) * Decimal(300) / Decimal(270)
+    # At 450 s it is the reading at 180 s: 30 000 in 270 s again, never a 90 s delta x 3.3.
+    assert derived[5].windows["5m"].volume == Decimal(30_000) * Decimal(300) / Decimal(270)
+    assert derived[5].short_window is not None
+    assert derived[5].short_window.interval_seconds == Decimal("270")
 
 
 def test_a_small_negative_difference_is_noise_and_counts_as_zero() -> None:
@@ -222,6 +277,27 @@ def test_a_counter_that_stays_low_and_grows_is_a_reset_after_the_configured_time
     assert series[-1].short_window is not None
     assert series[-1].short_window.status is ShortWindowStatus.DERIVED
     assert series[-1].windows["5m"].volume == Decimal("1000")
+
+
+def test_a_counter_back_above_its_level_before_a_reset_is_not_measured_from_the_reset() -> None:
+    """Review probe C105: 1M@t0, 900k@t5..t35 (a reset after 30 minutes), 1.005M@t40.
+    Real growth is about 5 000 over forty minutes, not a 105 000 spike in five."""
+
+    series = chain(
+        RULES,
+        (0, "1000000", "100"),
+        *((minute, "900000", "100") for minute in range(5, 40, 5)),
+        (40, "1005000", "100"),
+        (45, "1010000", "100"),
+    )
+
+    assert reasons(series)[7] == "COUNTER_RESET"
+    resumed = series[8]
+    assert "5m" not in resumed.windows  # 5 000 over forty minutes is no 5m window
+    assert resumed.short_window is not None
+    assert resumed.short_window.reason == "INTERVAL_TOO_LONG"
+    # The old counter goes on: the next window is measured from 1 005 000.
+    assert series[9].windows["5m"].volume == Decimal("5000")
 
 
 def test_a_falling_low_counter_restarts_the_reset_clock() -> None:

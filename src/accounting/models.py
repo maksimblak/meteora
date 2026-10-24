@@ -18,7 +18,9 @@ def _exact_decimal(value: object) -> object:
 
 
 class CostModel(BaseModel):
-    """Conservative per-fill cost estimate; fee income is the accrual since the last fill."""
+    """Conservative per-fill cost estimate. ``fee_income_base_units`` is an accrual the caller
+    adds to a fill; the shadow broker books the position's share of the pool's LP fees
+    since its last fill on top of it (``shadow_fee_income``)."""
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 

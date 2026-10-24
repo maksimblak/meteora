@@ -148,3 +148,15 @@ def test_snapshot_carries_execution_anchor_and_short_window_source() -> None:
     ):
         with pytest.raises(ValidationError):
             _live_snapshot(**invalid)
+
+
+def test_snapshot_carries_the_quote_token_usd_price_exactly() -> None:
+    """A3: the quote token's USD price (``token_y.price``) converts USD into its units."""
+
+    priced = _live_snapshot(quote_decimals=9, quote_price_usd=Decimal("104.852744278943"))
+
+    assert priced.quote_price_usd == Decimal("104.852744278943")
+    assert _live_snapshot().quote_price_usd is None
+    for invalid in ({"quote_price_usd": 104.85}, {"quote_price_usd": Decimal("-1")}):
+        with pytest.raises(ValidationError):
+            _live_snapshot(**invalid)

@@ -323,16 +323,26 @@ class CandidatePipeline:
             return ()
 
     async def _depth(self, market: PoolSnapshot) -> DepthEvidence | None:
-        """Depth and price impact of the reference size from the executor's quote (D07)."""
+        """Depth and price impact of the reference size from the executor's quote (D07).
+
+        The reference size is USD (A3): the executor is asked for its quote-token amount at
+        the token's USD price and decimals, and the depth is USD like ``minimum_depth``.
+        Without that price or decimals nothing can be quoted, nor can the conservative model
+        size the entry, so the depth is unavailable for that reason first.
+        """
 
         measured = _snapshot_depth(market, "QUOTES_NOT_CONFIGURED")
-        if measured is None or self._quotes is None:
-            return measured
-        decimals = market.quote_decimals
-        if decimals is None:
+        if measured is None:
+            return None
+        if market.quote_decimals is None:
             return DepthEvidence(source=DepthSource.UNAVAILABLE, detail="QUOTE_DECIMALS_UNKNOWN")
+        price = _quote_price(market)
+        if price is None:
+            return DepthEvidence(source=DepthSource.UNAVAILABLE, detail="QUOTE_PRICE_UNKNOWN")
+        if self._quotes is None:
+            return measured
         notional = self._policy.entry_notional_quote
-        in_amount = _floor(notional * Decimal(10) ** decimals)
+        in_amount = _floor(notional * _quote_units_per_usd(market, price))
         if in_amount <= 0:
             return DepthEvidence(source=DepthSource.UNAVAILABLE, detail="REFERENCE_SIZE_ZERO")
         request = QuoteRequestV1(
@@ -354,6 +364,7 @@ class CandidatePipeline:
                 price_impact=impact,
                 reference_notional=notional,
                 measured_at=result.quoted_at,
+                quote_price_usd=price,
             )
         code = result.error.code if result.error is not None else "QUOTE_FAILED"
         if code == "INSUFFICIENT_LIQUIDITY":
@@ -363,6 +374,7 @@ class CandidatePipeline:
                 reference_notional=notional,
                 detail=code,
                 measured_at=result.quoted_at,
+                quote_price_usd=price,
             )
         return DepthEvidence(source=DepthSource.UNAVAILABLE, detail=code)
 
@@ -511,13 +523,27 @@ class CandidatePipeline:
         return min(Decimal(1), self._policy.entry_notional_quote / market.depth)
 
     def _liquidity(self, market: PoolSnapshot, depth: DepthEvidence | None) -> LiquidityState:
+        """The sizer's liquidity caps in quote-token base units, from USD depth (A3).
+
+        A snapshot that measured depth itself and describes no quote price (a fixture
+        source) is in the configured unit ``quote_base_units_per_unit``. A Data API pool is
+        converted by its quote token's price and decimals; without them nothing is absorbed
+        and the sizer refuses the entry (fail-closed).
+        """
+
         if depth is None:
             absorbed = market.depth if market.depth is not None else Decimal(0)
         elif depth.source is DepthSource.UNAVAILABLE:
             absorbed = market.tvl * self._policy.conservative_depth_fraction
         else:
             absorbed = depth.depth if depth.depth is not None else Decimal(0)
-        scale = self._policy.quote_base_units_per_unit
+        price = _quote_price(market)
+        if price is not None and market.quote_decimals is not None:
+            scale = _quote_units_per_usd(market, price)
+        elif depth is None:
+            scale = self._policy.quote_base_units_per_unit
+        else:
+            scale = Decimal(0)
         return LiquidityState(
             depth_base_units=_floor(absorbed * scale),
             price_impact_cap_base_units=_floor(
@@ -548,6 +574,20 @@ def _facts(
 
 def _floor(value: Decimal) -> int:
     return int(value.to_integral_value(rounding=ROUND_FLOOR))
+
+
+def _quote_price(market: PoolSnapshot) -> Decimal | None:
+    """The quote token's USD price; zero is a price the source did not know."""
+
+    price = market.quote_price_usd
+    return price if price is not None and price > 0 else None
+
+
+def _quote_units_per_usd(market: PoolSnapshot, price: Decimal) -> Decimal:
+    """Base units of the pool's quote token one USD buys: ``10**decimals / price``."""
+
+    assert market.quote_decimals is not None
+    return Decimal(10) ** market.quote_decimals / price
 
 
 def _window_minutes(name: str) -> int:

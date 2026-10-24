@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from src.domain.screening import VolumeIntegrityMode
+from src.market.windows import ShortWindowRules
 from src.worker.policy import hypothesis_policy, load_pipeline_policy
 
 
@@ -21,11 +22,36 @@ def test_the_ath_observation_gap_follows_the_configured_universe_interval() -> N
     assert default.features.guide.maximum_observation_gap == timedelta(minutes=5, seconds=30)
     assert fast.features.guide.maximum_observation_gap == timedelta(seconds=150)
     assert slow.features.guide.maximum_observation_gap == timedelta(seconds=990)
-    # Adjacent snapshots further apart than that give no short window either.
-    assert fast.short_window.maximum_interval == timedelta(seconds=150)
+    # A window starts no further back than one step; at the default cadence that is the gap.
+    assert default.short_window.maximum_interval == timedelta(minutes=5, seconds=30)
+    assert slow.short_window.maximum_interval == timedelta(seconds=990)
+    # Sweeps 2 minutes apart are summed until they cover 4.5 minutes, so the newest start
+    # that old lies up to one more gap back: 270 s + 150 s.
+    assert fast.short_window.minimum_interval == timedelta(minutes=4, seconds=30)
+    assert fast.short_window.maximum_interval == timedelta(seconds=420)
     assert hypothesis_policy(universe_interval=timedelta(seconds=120)).short_window == (
         fast.short_window
     )
+
+
+def test_the_default_short_window_rules_are_the_derivation_defaults() -> None:
+    assert load_pipeline_policy({}).short_window == ShortWindowRules()
+    assert hypothesis_policy().short_window == ShortWindowRules()
+
+
+def test_the_short_window_tolerance_is_a_versioned_guide_setting(tmp_path: Path) -> None:
+    overrides = tmp_path / "tolerance.yaml"
+    overrides.write_text(
+        'config_version: "owner-6"\nthresholds:\n  short_window_interval_tolerance: 0\n',
+        encoding="utf-8",
+    )
+
+    default = load_pipeline_policy({})
+    strict = load_pipeline_policy({"RULESET_OVERRIDES_FILE": str(overrides)})
+
+    assert default.short_window.interval_tolerance == timedelta(seconds=30)
+    assert strict.short_window.interval_tolerance == timedelta(0)
+    assert strict.short_window.minimum_interval == timedelta(minutes=5)
 
 
 def test_the_observation_gap_is_not_a_separate_threshold(tmp_path: Path) -> None:

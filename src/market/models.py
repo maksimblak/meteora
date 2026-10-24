@@ -169,9 +169,28 @@ class ShortWindowStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class CounterReading(BaseModel):
+    """One reading of a lifetime counter and when it was seen."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    value: Decimal
+    at: datetime
+
+    _reject_binary_float = field_validator("value", mode="before")(_exact_decimal)
+    _normalize_at = field_validator("at")(_utc)
+
+
 class CounterMark(BaseModel):
     """The highest reading of one lifetime counter, when it was seen, and the run of
-    lower readings since (``low_since``/``low_last``) that may turn out to be a reset."""
+    lower readings since (``low_since``/``low_last``) that may turn out to be a reset.
+
+    ``earlier``: older highs, oldest first, still close enough to start the next window -
+    a window spans at least the window length less its tolerance, so readings that came
+    sooner than that are summed until they cover it, never stretched (A1). ``reset_from``:
+    the highest reading before the last counter reset; a counter that climbs back to it
+    is the old counter going on, not growth since the reset (A2).
+    """
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
@@ -179,6 +198,8 @@ class CounterMark(BaseModel):
     at: datetime
     low_since: datetime | None = None
     low_last: Decimal | None = None
+    earlier: tuple[CounterReading, ...] = ()
+    reset_from: CounterReading | None = None
 
     _reject_binary_float = field_validator("value", "low_last", mode="before")(_exact_decimal)
     _normalize_at = field_validator("at")(_utc)
@@ -194,14 +215,24 @@ class CounterMark(BaseModel):
             raise ValueError("a run of low readings needs both its start and its last value")
         if self.low_last is not None and self.low_last >= self.value:
             raise ValueError("a low reading must be below the mark")
+        previous: CounterReading | None = None
+        for reading in (*self.earlier, CounterReading(value=self.value, at=self.at)):
+            if previous is not None and (
+                reading.at <= previous.at or reading.value < previous.value
+            ):
+                raise ValueError("earlier highs must precede the mark and never exceed it")
+            previous = reading
+        if self.reset_from is not None and self.reset_from.value <= self.value:
+            raise ValueError("the reading before a reset must be above the counter after it")
         return self
 
 
 class ShortWindowDerivation(BaseModel):
     """How the short window of one snapshot was derived from the previous snapshot (D07).
 
-    ``DERIVED``: the window holds the counters' increase over ``interval_seconds``,
-    rescaled to the window length. ``UNKNOWN``: the snapshot carries no such window and
+    ``DERIVED``: the window holds the counters' increase over ``interval_seconds`` (never
+    shorter than the window less its tolerance), rescaled to the window length.
+    ``UNKNOWN``: the snapshot carries no such window and
     ``reason`` says why (``NO_PREVIOUS``, ``COUNTER_MISSING``, ``INTERVAL_TOO_SHORT``,
     ``INTERVAL_TOO_LONG``, ``NEGATIVE_DELTA``, ``COUNTER_RESET``).
     """
@@ -304,6 +335,10 @@ class PoolSnapshot(BaseModel):
     active_bin_id: int | None = None
     base_decimals: int | None = None
     quote_decimals: int | None = None
+    # USD price of one whole quote token (Data API ``token_y.price``, by mint). With
+    # ``quote_decimals`` it turns the USD reference size and USD depth into quote-token base
+    # units (A3); ``None`` (or zero) when the source reports no price.
+    quote_price_usd: Decimal | None = None
     # The window standing in for the short 5m window when the source has none (D04),
     # e.g. ``"30m"`` from the live Data API; ``None`` when the source made no substitution.
     short_window_source: str | None = None
@@ -326,6 +361,7 @@ class PoolSnapshot(BaseModel):
         "price",
         "base_fee_rate",
         "base_token_market_cap",
+        "quote_price_usd",
         "cumulative_volume",
         "cumulative_fees",
         mode="before",
@@ -336,6 +372,8 @@ class PoolSnapshot(BaseModel):
     def validate_snapshot(self) -> "PoolSnapshot":
         if self.tvl < 0 or (self.depth is not None and self.depth < 0) or self.price < 0:
             raise ValueError("snapshot monetary values must not be negative")
+        if self.quote_price_usd is not None and self.quote_price_usd < 0:
+            raise ValueError("quote_price_usd must not be negative")
         if any(
             value is not None and value < 0
             for value in (self.cumulative_volume, self.cumulative_fees)

@@ -99,6 +99,7 @@ class _PoolQuote:
     market_cap: Decimal | None
     base_decimals: int | None
     quote_decimals: int | None
+    quote_price_usd: Decimal | None = None
     active_bin_id: int | None = None
     cumulative_volume: Decimal | None = None
     cumulative_fees: Decimal | None = None
@@ -522,6 +523,7 @@ class MeteoraDataApiProvider:
             active_bin_id=quote.active_bin_id,
             base_decimals=quote.base_decimals,
             quote_decimals=quote.quote_decimals,
+            quote_price_usd=quote.quote_price_usd,
             short_window_source=short_window,
             cumulative_volume=quote.cumulative_volume,
             cumulative_fees=quote.cumulative_fees,
@@ -659,6 +661,7 @@ def _quote(value: Any, arrived_at: datetime) -> _PoolQuote:
         market_cap=_token_value(tokens, pool.base_mint, "market_cap", _optional_amount),
         base_decimals=_token_value(tokens, pool.base_mint, "decimals", _optional_decimals),
         quote_decimals=_token_value(tokens, pool.quote_mint, "decimals", _optional_decimals),
+        quote_price_usd=_token_value(tokens, pool.quote_mint, "price", _optional_price),
         cumulative_volume=cumulative_volume,
         cumulative_fees=cumulative_fees,
         blacklisted=_flag(value.get("is_blacklisted")),
@@ -708,6 +711,14 @@ def _lenient_amount(value: Any) -> Decimal | None:
         return _optional_amount(value, "lenient")
     except _Rejected:
         return None
+
+
+def _optional_price(value: Any, label: str) -> Decimal | None:
+    """A token's USD price; zero, absent or unusable is unknown and never rejects the pool."""
+
+    del label
+    price = _lenient_amount(value)
+    return price if price is not None and price > 0 else None
 
 
 def _flag(value: Any) -> bool | None:

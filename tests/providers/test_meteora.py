@@ -42,6 +42,7 @@ NOW = datetime(2026, 10, 23, 14, 0, tzinfo=UTC)
 TRUMP_POOL = "9d9mb8kooFfaD3SctgZtkxQypkshx6ezhbKio89ixyy2"
 TRUMP_MINT = "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN"
 BP_POOL = "6qz7THwQvcjF3HyDGLuKaLBUk6EyJKeZXZMWLAeiwfjd"
+ANTFUN_POOL = "54Vp27uLaw4wNLo5n7r4fcC6zLamoQc28xBARjss4EUJ"  # quoted in USDT
 SOL_POOL = "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -256,6 +257,54 @@ def test_market_cap_comes_only_from_the_token_whose_mint_is_the_base() -> None:
 
         assert snapshots[TRUMP_POOL].base_token_market_cap is None
         assert snapshots[TRUMP_POOL].base_decimals == 6
+
+    asyncio.run(exercise())
+
+
+def test_the_quote_token_usd_price_comes_from_the_token_whose_mint_is_the_quote() -> None:
+    """A3: ``token_y.price`` (USD) of the quote mint turns USD sizes into quote units."""
+
+    async def exercise() -> None:
+        provider, client = _provider(_sweep_api(), FrozenClock(NOW))
+        async with client:
+            snapshots = await _snapshots(provider, NOW)
+            single = await provider.get_pool_snapshot(
+                PoolRef(
+                    address=PublicKey(SOL_POOL),
+                    base_mint=PublicKey(SOL_MINT),
+                    quote_mint=PublicKey(USDC_MINT),
+                ),
+                NOW,
+            )
+
+        # Recorded: USDC 0.9995525053028764, USDT 0.9984341485678068, USDC 0.999528176411276.
+        assert snapshots[TRUMP_POOL].quote_price_usd == Decimal("0.9995525053028764")
+        assert snapshots[ANTFUN_POOL].quote_price_usd == Decimal("0.9984341485678068")
+        assert single.quote_price_usd == Decimal("0.999528176411276")
+        # The base token's price is never taken for the quote's.
+        assert snapshots[TRUMP_POOL].quote_price_usd != Decimal("1.7868859291583727")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("price", [0, 0.0, None, "abc", -1.5, True], ids=repr)
+def test_an_unusable_quote_price_is_unknown_and_the_pool_is_kept(price: Any) -> None:
+    async def exercise() -> None:
+        page = _parsed("pools_page1.json")
+        trump = next(item for item in page["data"] if item["address"] == TRUMP_POOL)
+        if price is None:
+            del trump["token_y"]["price"]
+        else:
+            trump["token_y"]["price"] = price
+        provider, client = _provider(_sweep_api(page1=_encoded(page)), FrozenClock(NOW))
+        async with client:
+            snapshots = await _snapshots(provider, NOW)
+
+        kept = snapshots[TRUMP_POOL]
+        assert kept.quote_price_usd is None
+        # An optional figure like the market cap: its absence leaves the snapshot complete.
+        assert kept.data_quality is DataQuality.COMPLETE and kept.missing_fields == ()
+        assert provider.sweep.accepted == 6
 
     asyncio.run(exercise())
 
