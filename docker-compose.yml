@@ -102,9 +102,16 @@ services:
       EXECUTOR_URL: ${EXECUTOR_URL:-}
       EXECUTOR_INTERNAL_TOKEN: ${EXECUTOR_INTERNAL_TOKEN:-}
       EXECUTOR_INTERNAL_TOKEN_FILE: ${EXECUTOR_INTERNAL_TOKEN_FILE:-}
-      # GMGN metrics of candidates (G18) from the ``gmgn`` service below: empty = not asked,
-      # decisions as before. With ``--profile gmgn`` set GMGN_URL=http://gmgn:8080. LIVE stays
-      # closed without fresh GMGN data until GMGN_REQUIRED_FOR_LIVE=false is set explicitly.
+      # GMGN metrics of candidates (G18, G20). With GMGN_API_KEY (or GMGN_API_KEY_FILE, a path
+      # inside this container) the worker reads the official GMGN OpenAPI (IPv4 only); the key
+      # goes to this service alone. Without a key, the ``gmgn`` service below: with
+      # ``--profile gmgn`` set GMGN_URL=http://gmgn:8080. Neither = not asked, decisions as
+      # before. LIVE stays closed without fresh GMGN data until GMGN_REQUIRED_FOR_LIVE=false.
+      GMGN_API_KEY: ${GMGN_API_KEY:-}
+      GMGN_API_KEY_FILE: ${GMGN_API_KEY_FILE:-}
+      GMGN_API_URL: ${GMGN_API_URL:-}
+      GMGN_API_PLAN: ${GMGN_API_PLAN:-}
+      GMGN_API_CACHE_SECONDS: ${GMGN_API_CACHE_SECONDS:-}
       GMGN_URL: ${GMGN_URL:-}
       GMGN_REQUIRED_FOR_LIVE: ${GMGN_REQUIRED_FOR_LIVE:-}
       GMGN_TIMEOUT_SECONDS: ${GMGN_TIMEOUT_SECONDS:-}

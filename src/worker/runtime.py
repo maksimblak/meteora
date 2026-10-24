@@ -9,10 +9,12 @@ any new action) -> lease-guarded scheduler. Jobs, by priority:
 3. ``universe_sync``   - paginated discovery, open-position pools first;
 4. ``outbox_relay`` / 5. ``retention`` - publication and telemetry clean-up.
 
-GMGN (G18): with ``GMGN_URL`` the candidate pipeline's token risk carries the reading of
-the internal ``gmgn`` service (``GmgnProvider``); positions keep the plain provider, so
-page loads stay with candidates. Without it nothing is asked and nothing changes, except
-that the loaded guide-v1 rules keep LIVE closed until ``GMGN_REQUIRED_FOR_LIVE=false``.
+GMGN (G18, G20): with ``GMGN_API_KEY`` the candidate pipeline's token risk carries the
+reading of the official GMGN OpenAPI (``GmgnOpenApiProvider``); without a key but with
+``GMGN_URL``, that of the internal browser service ``gmgn`` (``GmgnProvider``). Positions
+keep the plain provider, so requests stay with candidates. Without either nothing is asked
+and nothing changes, except that the loaded guide-v1 rules keep LIVE closed until
+``GMGN_REQUIRED_FOR_LIVE=false``.
 
 The default stack is SHADOW-only: without an execution gateway, APPROVAL/LIVE
 entries are cancelled as ``EXECUTION_GATEWAY_NOT_CONFIGURED`` and nothing is sent.
@@ -50,8 +52,9 @@ from src.execution.service import (
     ReceiptLookup,
 )
 from src.execution.settings import ExecutorSettings
-from src.gmgn import GmgnProvider
+from src.gmgn import GmgnOpenApiProvider, GmgnProvider, OpenApiSettings
 from src.gmgn.enrichment import EnhancedSignalSource, EnrichedOnChainProvider
+from src.gmgn.openapi import openapi_client
 from src.market.contracts import MarketDataProvider, OnChainProvider, VolumeHistorySource
 from src.market.models import (
     AuthorityStatus,
@@ -782,24 +785,45 @@ def build_gmgn(
     *,
     clock: Clock,
     transport: httpx.AsyncBaseTransport | None = None,
-) -> tuple[GmgnProvider | None, httpx.AsyncClient | None]:
-    """The client of the internal ``gmgn`` service (compose profile ``gmgn``), or ``None``.
+) -> tuple[EnhancedSignalSource | None, httpx.AsyncClient | None]:
+    """The source of candidates' GMGN metrics (G18, G20), or ``None``.
 
-    ``GMGN_URL`` (e.g. ``http://gmgn:8080``) switches it on; ``GMGN_TIMEOUT_SECONDS``
-    bounds one answer of the service, ``GMGN_STALE_AFTER_SECONDS`` the age of fresh data.
+    ``GMGN_API_KEY`` (or ``GMGN_API_KEY_FILE``): the official GMGN OpenAPI
+    (``GMGN_API_URL``, ``GMGN_API_PLAN``, ``GMGN_API_CACHE_SECONDS``). Without a key,
+    ``GMGN_URL`` (e.g. ``http://gmgn:8080``): the internal browser service, compose profile
+    ``gmgn``. Without either nothing is asked. ``GMGN_TIMEOUT_SECONDS`` bounds one answer
+    (OpenAPI 10 s, service 20 s by default), ``GMGN_STALE_AFTER_SECONDS`` the age of fresh data.
     """
 
     url = (environ.get(GMGN_URL_ENV) or "").strip()
+    stale_after = _seconds(environ, GMGN_STALE_AFTER_ENV, 900)
+    openapi = OpenApiSettings.from_environment(environ)
+    if openapi is not None:
+        api_timeout = _seconds(environ, GMGN_TIMEOUT_ENV, 10).total_seconds()
+        api_client = openapi_client(openapi, timeout=api_timeout, transport=transport)
+        get_logger("worker.runtime").info(
+            "gmgn_source", source="openapi", plan=openapi.plan.value, browser_ignored=bool(url)
+        )
+        return (
+            GmgnOpenApiProvider(
+                api_client,
+                api_key=openapi.api_key,
+                clock=clock,
+                plan=openapi.plan,
+                stale_after=stale_after,
+                cache_ttl=openapi.cache_ttl,
+                timeout=api_timeout,
+            ),
+            api_client,
+        )
     if not url:
         return None, None
     timeout = _seconds(environ, GMGN_TIMEOUT_ENV, 20)
     client = httpx.AsyncClient(base_url=url, transport=transport)
     provider = GmgnProvider(
-        client,
-        clock=clock,
-        timeout=timeout.total_seconds(),
-        stale_after=_seconds(environ, GMGN_STALE_AFTER_ENV, 900),
+        client, clock=clock, timeout=timeout.total_seconds(), stale_after=stale_after
     )
+    get_logger("worker.runtime").info("gmgn_source", source="browser")
     return provider, client
 
 
