@@ -127,13 +127,20 @@ def command(
 
 
 class KillSwitch:
-    def __init__(self, active: bool = False) -> None:
+    """The durable mode state as the service sees it: active or not, and the policy for
+    open positions chosen when it was activated."""
+
+    def __init__(self, active: bool = False, policy: KillSwitchPolicy | None = None) -> None:
         self.active = active
+        self.policy = policy
         self.reads = 0
 
     async def kill_switch_active(self) -> bool:
         self.reads += 1
         return self.active
+
+    async def kill_switch_policy(self) -> KillSwitchPolicy | None:
+        return self.policy if self.active else None
 
 
 CLEAR = KillSwitch()
@@ -874,7 +881,36 @@ def test_active_kill_switch_lets_only_an_orderly_exit_through(
     async def scenario() -> int:
         gateway = RecordingGateway()
         service = live_service(
-            value, InMemoryExecutionStore(), gateway, KillSwitch(active=True), policy
+            value, InMemoryExecutionStore(), gateway, KillSwitch(active=True, policy=policy)
+        )
+        await service.prepare(PLAN_ID)
+        try:
+            await service.execute(COMMAND_ID)
+        except ExecutionBlocked:
+            pass
+        return gateway.submit_calls
+
+    assert asyncio.run(scenario()) == (1 if submitted else 0)
+
+
+@pytest.mark.parametrize(
+    ("configured", "chosen", "submitted"),
+    [
+        (KillSwitchPolicy.HOLD_AND_ALERT, KillSwitchPolicy.ORDERLY_EXIT, True),
+        (KillSwitchPolicy.ORDERLY_EXIT, KillSwitchPolicy.HOLD_AND_ALERT, False),
+    ],
+)
+def test_the_policy_chosen_at_activation_decides_an_exit_not_the_configured_one(
+    configured: KillSwitchPolicy, chosen: KillSwitchPolicy, submitted: bool
+) -> None:
+    async def scenario() -> int:
+        gateway = RecordingGateway()
+        service = live_service(
+            close_command(),
+            InMemoryExecutionStore(),
+            gateway,
+            KillSwitch(active=True, policy=chosen),
+            configured,
         )
         await service.prepare(PLAN_ID)
         try:

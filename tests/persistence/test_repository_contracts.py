@@ -34,6 +34,7 @@ from src.modes import (
     CriticalAlert,
     DailyPromotionObservation,
     DailyRiskService,
+    InMemoryModeRepository,
     KillSwitchPolicy,
     ModeService,
     ModeState,
@@ -485,6 +486,35 @@ def test_kill_switch_persists_actions_alert_outbox_and_release(backend: Backend)
     assert backend.mode().open_positions() == ()
     with pytest.raises(ValueError, match="not open"):
         backend.mode().close_position("position-a")
+
+
+def kill_switch_policy_round_trip(open_mode: Callable[[], Any]) -> None:
+    """Activate with each policy, read it back on a fresh instance, release clears it."""
+
+    clock = FrozenClock(NOW)
+    assert open_mode().mode_state().kill_switch_policy is None
+    for policy in (KillSwitchPolicy.ORDERLY_EXIT, KillSwitchPolicy.HOLD_AND_ALERT):
+        ModeService(open_mode(), clock, RULES).activate_kill_switch("operator stop", policy)
+        active = open_mode().mode_state()
+        assert active.kill_switch_active is True
+        assert active.kill_switch_policy is policy
+        assert active.active_kill_switch_policy is policy
+        ModeService(open_mode(), clock, RULES).release_kill_switch("resolved", CONFIRMATION)
+        released = open_mode().mode_state()
+        assert released.kill_switch_active is False
+        assert released.kill_switch_policy is None
+        assert released.active_kill_switch_policy is None
+
+
+def test_the_kill_switch_policy_chosen_at_activation_is_read_back_and_cleared(
+    backend: Backend,
+) -> None:
+    kill_switch_policy_round_trip(backend.mode)
+
+
+def test_the_in_memory_adapter_keeps_the_kill_switch_policy_the_same_way() -> None:
+    repo = InMemoryModeRepository()
+    kill_switch_policy_round_trip(lambda: repo)
 
 
 def test_alert_resolution_requires_reason_and_is_one_shot(backend: Backend) -> None:

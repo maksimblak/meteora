@@ -11,10 +11,11 @@ change, so an approval the audit trail does not know about cannot exist (R29i.1)
 A repeated submit of the same ``approval_id`` returns the original state.
 
 The executor swaps no tokens (D08): an entry's quoted price impact must be measured and
-within the command's slippage limit, while an exit's quote is shown and audited but
-never blocks it - an exit is needed most in a thin or falling pool. For the same reason
-a daily stop, or a kill switch under ``ORDERLY_EXIT``, and the demotion to SHADOW it
-causes do not block the exit of an APPROVAL position (spec 7.3).
+within the command's slippage limit (``entry_impact_rejection``, the execution service's
+own rule and codes), while an exit's quote is shown and audited but never blocks it - an
+exit is needed most in a thin or falling pool. For the same reason a daily stop, or a
+kill switch activated with ``ORDERLY_EXIT`` (the policy recorded in the mode state), and
+the demotion to SHADOW it causes do not block the exit of an APPROVAL position (spec 7.3).
 """
 
 import asyncio
@@ -47,15 +48,17 @@ from src.domain.models.events import AuditEvent, EventType
 from src.domain.models.trading import TradingMode
 from src.execution.contracts import (
     DlmmCommand,
-    DlmmOperation,
     ExecutionPhase,
     OperatorApproval,
     SimulationResult,
 )
 from src.execution.service import (
+    ENTRY_OPERATIONS,
+    EXIT_OPERATIONS,
     ExecutionBlocked,
     ExecutionRecord,
     ExecutionService,
+    entry_impact_rejection,
     sign_operator_approval,
 )
 from src.modes.models import KillSwitchPolicy
@@ -77,9 +80,6 @@ _RECENT_PHASES = (
     ExecutionPhase.FAILED,
     ExecutionPhase.EXPIRED,
 )
-# Operations that put tokens into a pool: only their quoted price impact is a limit (D08).
-_ENTRY_OPERATIONS = frozenset({DlmmOperation.OPEN, DlmmOperation.ADD})
-_EXIT_OPERATIONS = frozenset({DlmmOperation.REMOVE, DlmmOperation.CLOSE})
 # Simulation fields shown elsewhere in the preview (digests, identity) or as errors.
 _HIDDEN_SIMULATION_FIELDS = frozenset(
     {"schema_version", "command_id", "command_digest", "simulation_digest", "errors"}
@@ -142,7 +142,13 @@ class ApprovalDesk:
 
     async def queue(self) -> ApprovalQueue:
         store = self._ctx.repositories.execution
-        pending = await store.in_phases((ExecutionPhase.AWAITING_APPROVAL,))
+        now = self._ctx.clock.now()
+        # An expired request can no longer be approved; the worker renews an exit's preview.
+        pending = [
+            item
+            for item in await store.in_phases((ExecutionPhase.AWAITING_APPROVAL,))
+            if item.command.expires_at > now
+        ]
         recent = await store.in_phases(_RECENT_PHASES)
         newest = sorted(recent, key=lambda item: item.simulation.simulated_at, reverse=True)
         return ApprovalQueue(
@@ -341,10 +347,10 @@ class ApprovalDesk:
         daily_stop = state.daily_stop_active_on(self._ctx.today())
         leaving = _leaves_approval_position(command)
         # Spec 7.3: a stop halts entries, not the way out of an APPROVAL position. Under an
-        # active kill switch the configured policy decides, the same one the worker and
-        # ``ExecutionService`` apply; both stops demote the deployment to SHADOW.
+        # active kill switch the policy chosen at its activation decides (mode state), the
+        # same one the worker and ``ExecutionService`` apply; both stops demote to SHADOW.
         emergency_exit = leaving and (
-            self._ctx.policy.kill_switch_policy is KillSwitchPolicy.ORDERLY_EXIT
+            state.active_kill_switch_policy is KillSwitchPolicy.ORDERLY_EXIT
             if state.kill_switch_active
             else daily_stop
         )
@@ -366,11 +372,9 @@ class ApprovalDesk:
             blockers.append("SIMULATION_STALE")
         if not simulation.success or simulation.errors:
             blockers.append("SIMULATION_FAILED")
-        if command.operation in _ENTRY_OPERATIONS:
-            if simulation.price_impact_bps is None:
-                blockers.append("PRICE_IMPACT_UNMEASURED")
-            elif simulation.price_impact_bps > command.max_slippage_bps:
-                blockers.append("PRICE_IMPACT_ABOVE_LIMIT")
+        impact = entry_impact_rejection(command, simulation)
+        if impact is not None:
+            blockers.append(impact)
         return blockers
 
     def _approval_expiry(self, record: ExecutionRecord, now: datetime) -> datetime:
@@ -456,7 +460,7 @@ def _leaves_approval_position(command: DlmmCommand) -> bool:
     """A REMOVE/CLOSE queued for a position opened in APPROVAL (the command's own mode,
     not the deployment's mode after a demotion)."""
 
-    return command.operation in _EXIT_OPERATIONS and command.mode is TradingMode.APPROVAL
+    return command.operation in EXIT_OPERATIONS and command.mode is TradingMode.APPROVAL
 
 
 def _entry_plan_id(key: str) -> UUID | None:
@@ -471,11 +475,19 @@ def _entry_plan_id(key: str) -> UUID | None:
 
 
 def _position_of_action(key: str) -> str | None:
-    head, _, attempt = key.rpartition(":")
-    prefix, _, position_id = head.partition(":")
-    if prefix != "position-action" or not attempt.isdigit() or not position_id:
+    """The position of ``position-action:{position}:{attempt}[:{preview}]``."""
+
+    prefix, _, rest = key.partition(":")
+    position_id, *numbers = rest.split(":")
+    if (
+        prefix != "position-action"
+        or not position_id
+        or not 1 <= len(numbers) <= 2
+        or not all(number.isdigit() and int(number) >= 1 for number in numbers)
+    ):
         return None
-    return position_id if position_action_key(position_id, int(attempt)) == key else None
+    attempt, preview = int(numbers[0]), int(numbers[1]) if len(numbers) == 2 else 1
+    return position_id if position_action_key(position_id, attempt, preview) == key else None
 
 
 def _plan_diff(record: ExecutionRecord, plan: PlanRecord | None) -> list[PlanDiffRow]:
@@ -543,7 +555,7 @@ def _impact_row(command: DlmmCommand, simulation: SimulationResult) -> PlanDiffR
 
     impact = simulation.price_impact_bps
     simulated = None if impact is None else str(impact)
-    if command.operation not in _ENTRY_OPERATIONS:
+    if command.operation not in ENTRY_OPERATIONS:
         return PlanDiffRow(
             field="price_impact_bps",
             planned="справочно: выход без обмена токенов",
@@ -556,7 +568,7 @@ def _impact_row(command: DlmmCommand, simulation: SimulationResult) -> PlanDiffR
         planned=f"≤ {command.max_slippage_bps}",
         command=str(command.max_slippage_bps),
         simulated=simulated,
-        matches=impact is not None and impact <= command.max_slippage_bps,
+        matches=entry_impact_rejection(command, simulation) is None,
     )
 
 

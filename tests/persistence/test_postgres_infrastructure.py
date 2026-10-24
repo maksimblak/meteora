@@ -252,7 +252,7 @@ def test_migrations_downgrade_and_upgrade_cleanly(postgres_schema: MigratedSchem
     postgres_schema.alembic("downgrade", "0001_foundation")
     postgres_schema.alembic("upgrade", "head")
     assert scalar(postgres_schema, text("SELECT version_num FROM alembic_version")) == (
-        "0002_worker_state"
+        "0003_kill_switch_policy"
     )
 
 

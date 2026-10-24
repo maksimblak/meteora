@@ -168,7 +168,10 @@ class ModeRepository(Protocol):
         policy: KillSwitchPolicy,
         occurred_at: datetime,
         ruleset_version: str,
-    ) -> KillSwitchResult: ...
+    ) -> KillSwitchResult:
+        """Activate (or re-activate with another ``policy``); ``mode_state()`` then reports
+        ``kill_switch_policy == policy`` until the release clears it."""
+        ...
 
     def release_kill_switch(
         self, *, reason: str, operator_confirmation_id: str, released_at: datetime
@@ -606,6 +609,8 @@ class SqliteModeRepository:
                     ],
                 },
             )
+            # The operator's choice for open positions is mode state: every reader (position
+            # cycle, gateway exits, execution service, approval desk) applies this one.
             _demote(
                 connection,
                 state,
@@ -613,6 +618,7 @@ class SqliteModeRepository:
                 reason=KILL_SWITCH_ALERT,
                 correlation_id=correlation_id,
                 kill_switch_active=True,
+                kill_switch_policy=policy,
             )
             return KillSwitchResult(
                 activated_at=occurred_at,
@@ -634,7 +640,7 @@ class SqliteModeRepository:
                 alert = CriticalAlert.model_validate_json(row[0])
                 if alert.open and alert.code == KILL_SWITCH_ALERT:
                     _write_alert(connection, _resolved(alert, reason, released_at))
-            updated = _next_state(state, kill_switch_active=False)
+            updated = _next_state(state, kill_switch_active=False, kill_switch_policy=None)
             _write_state(connection, updated)
             _append(
                 connection,

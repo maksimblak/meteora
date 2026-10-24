@@ -276,9 +276,8 @@ def awaiting_approval(scenario: Scenario, repositories: Repositories) -> Approva
         clock=harness.clock,
         allowed_mode=TradingMode.APPROVAL,
         approval_verifier=HmacApprovalVerifier(APPROVAL_SECRET.encode("utf-8")),
+        # The service and the desk read one kill-switch policy: the mode state's.
         kill_switch=ModeKillSwitch(repositories.mode),
-        # As build_approval_setup: the service and the desk read one pipeline policy.
-        kill_switch_policy=harness.policy.kill_switch_policy,
     )
     asyncio.run(service.prepare(command.command_id))
     setup = ApprovalSetup(
@@ -298,23 +297,26 @@ def awaiting_exit(
     *,
     operation: contracts.DlmmOperation,
     price_impact_bps: int | None,
+    position_id: str = EXIT_POSITION,
+    preview: int = 1,
 ) -> ApprovalCase:
     """An APPROVAL exit of an open position, built as the position cycle builds it (no
     anchor, no amounts), simulated by an executor quoting ``price_impact_bps`` for the swap
-    leg it does not perform (D08) and waiting for the operator."""
+    leg it does not perform (D08) and waiting for the operator. ``preview`` > 1: a renewed
+    preview of the first attempt (the earlier ones expired unapproved)."""
 
     harness = scenario.harness
     attempt = 1
     command = contracts.DlmmCommandV2(
-        command_id=position_action_command_id(EXIT_POSITION, attempt),
-        idempotency_key=position_action_key(EXIT_POSITION, attempt),
+        command_id=position_action_command_id(position_id, attempt, preview),
+        idempotency_key=position_action_key(position_id, attempt, preview),
         correlation_id=uuid5(NAMESPACE_URL, "approval-exit"),
         ruleset_version=harness.policy.ruleset_version,
         mode=TradingMode.APPROVAL,
         operation=operation,
         pool_address=POOL.address.root,
         wallet_address=WALLET,
-        position_address=EXIT_POSITION,
+        position_address=position_id,
         expires_at=harness.clock.now() + timedelta(minutes=5),
         max_slippage_bps=100,
         min_bin_id=7_990,
@@ -329,7 +331,6 @@ def awaiting_exit(
         allowed_mode=TradingMode.APPROVAL,
         approval_verifier=HmacApprovalVerifier(APPROVAL_SECRET.encode("utf-8")),
         kill_switch=ModeKillSwitch(repositories.mode),
-        kill_switch_policy=harness.policy.kill_switch_policy,
     )
     asyncio.run(service.prepare(command.command_id))
     setup = ApprovalSetup(

@@ -5,7 +5,8 @@ any new action) -> lease-guarded scheduler. Jobs, by priority:
 
 0. ``position_cycle``  - open positions first: marks, exits, daily stop;
 1. ``recovery``        - periodic reconciliation of unresolved commands;
-2. ``candidate_pipeline`` - opens the UTC risk day, then evaluates the universe;
+2. ``candidate_pipeline`` - opens the UTC risk day, then evaluates the universe except
+   pools with an open position or an entry still in flight;
 3. ``universe_sync``   - paginated discovery, open-position pools first;
 4. ``outbox_relay`` / 5. ``retention`` - publication and telemetry clean-up.
 
@@ -33,7 +34,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Protocol
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -67,6 +68,8 @@ from src.market.models import (
     WalletState,
 )
 from src.market.universe import SyncStatus, UniverseSync
+from src.modes.alerts import SystemAlertResolver
+from src.modes.models import PendingPlanStatus
 from src.observability.alerts import CriticalAlertReporter
 from src.observability.health import HealthMonitor
 from src.observability.http import ObservabilityServer
@@ -176,6 +179,14 @@ class GatewayReadiness(Protocol):
     async def ready(self, mode: TradingMode) -> bool: ...
 
 
+class InFlightEntryUnresolved(RuntimeError):
+    """An entry in flight whose pool is unknown: no candidate is evaluated this cycle."""
+
+    def __init__(self, plan_id: UUID) -> None:
+        super().__init__(f"the pool of in-flight plan {plan_id} is unknown")
+        self.plan_id = plan_id
+
+
 @dataclass(frozen=True, slots=True)
 class GatewayWiring:
     """The execution gateway for exactly one non-SHADOW mode (``TRADING_MODE``)."""
@@ -283,8 +294,11 @@ class WorkerRuntime:
         self.execution: ExecutionService | None = None
         self.gateway_entries: GatewayEntrySettler | None = None
         self.gateway_positions: GatewayPositionManager | None = None
+        # Closes the alerts whose condition the worker itself has cleared (B5).
+        self.cleared = SystemAlertResolver(repos.mode, clock, policy.ruleset_version)
         if gateway is not None:
             resolver = CommandResolver(repos.execution)
+            # The kill-switch policy comes from the mode state, as chosen at activation.
             self.execution = ExecutionService(
                 gateway=gateway.gateway,
                 store=repos.execution,
@@ -296,7 +310,6 @@ class WorkerRuntime:
                 live_promotion=gateway.live_promotion,
                 receipts=gateway.receipts,
                 kill_switch=ModeKillSwitch(repos.mode),
-                kill_switch_policy=policy.kill_switch_policy,
             )
             book = GatewayFillBook(repos.accounting, repos.execution, clock, policy.shadow_costs)
             submitters[gateway.allowed_mode] = GatewaySubmitter(self.execution, resolver, book)
@@ -320,9 +333,9 @@ class WorkerRuntime:
                 resolver=resolver,
                 book=book,
                 alerts=self.alerts,
+                cleared=self.cleared,
                 clock=clock,
                 metrics=self.metrics,
-                policy=policy,
             )
         wallet = wallet_address or shadow_address("meteora-volume-bot:shadow-wallet")
         self.entries = EntryExecutor(
@@ -384,6 +397,7 @@ class WorkerRuntime:
             metrics=self.metrics,
             decisions=repos.decisions,
             evidence=self.evidence,
+            gateway_mode=None if gateway is None else gateway.allowed_mode,
         )
         self.recovery = RecoveryService(
             modes=repos.mode,
@@ -398,6 +412,7 @@ class WorkerRuntime:
                 repos.leases, CANDIDATE_JOB, f"{settings.owner}:recovery", CANDIDATE_LEASE_TTL
             ),
             stale_after=CANDIDATE_LEASE_TTL,
+            cleared=self.cleared,
         )
         self.relay = repos.outbox_relay(sink or LoggingEventSink(), clock, owner=settings.owner)
         self.retention = repos.retention()
@@ -456,11 +471,11 @@ class WorkerRuntime:
             # Approved and interrupted entries first, under this job's lease.
             await self.gateway_entries.run()
         snapshots = await self.repositories.history.latest_universe()
-        held = await self._open_position_pools()
+        busy = await self._busy_pools()
         addresses = [
             snapshot.pool.address.root
             for snapshot in snapshots
-            if snapshot.pool.address.root not in held
+            if snapshot.pool.address.root not in busy
         ]
         self.metrics.queue_depth("candidate_pipeline", len(addresses))
         decided_at = self.clock.now()
@@ -596,6 +611,28 @@ class WorkerRuntime:
             for context in await self.repositories.positions.all()
             if context.position_id in open_ids
         }
+
+    async def _busy_pools(self) -> set[str]:
+        """Pools no new entry is planned for: an open position, or an entry still in
+        flight - a PENDING plan before its expiry, or EXECUTING (awaiting the operator,
+        or an unknown outcome being reconciled). One pool never takes two slots."""
+
+        pools = await self._open_position_pools()
+        now = self.clock.now()
+        decisions = self.repositories.decisions
+        for plan in self.repositories.mode.entry_plans():
+            in_flight = plan.status is PendingPlanStatus.EXECUTING or (
+                plan.status is PendingPlanStatus.PENDING and plan.expires_at > now
+            )
+            if not in_flight:
+                continue
+            record = await decisions.plan(plan.plan_id)
+            decision = None if record is None else await decisions.decision(record.decision_id)
+            if decision is None:
+                # Fail closed: without its pool, any candidate could be a second entry.
+                raise InFlightEntryUnresolved(plan.plan_id)
+            pools.add(decision.market.pool.address.root)
+        return pools
 
     def close(self) -> None:
         self.repositories.close()

@@ -384,6 +384,41 @@ def test_executor_rejections_are_definitive_and_never_leak_the_token() -> None:
     assert INTERNAL_CREDENTIAL not in str(raised.value) and MODE_CREDENTIAL not in str(raised.value)
 
 
+@pytest.mark.parametrize("conflict", ["idempotency_conflict", "approval_already_used"])
+def test_a_conflict_with_an_existing_submission_is_an_unknown_outcome(conflict: str) -> None:
+    """engine.ts 543/677/778: the executor already holds a submission under this key or
+    this approval, so the command may be on its way - never "nothing was sent"."""
+
+    command = live_command()
+    simulation = simulated(command)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/simulations":
+            return httpx.Response(200, json=simulation.model_dump(mode="json"))
+        if request.method == "POST":
+            return httpx.Response(409, json={"error": conflict})
+        return httpx.Response(404, json={"error": "command_not_found"})
+
+    gw, seen = gateway(handler)
+    store = InMemoryExecutionStore()
+    service = live_service(gw, store)
+
+    async def run() -> ExecutionPhase:
+        with pytest.raises(ExecutionOutcomeUnknown) as raised:
+            await gw.submit(command, command.idempotency_key, None)
+        assert not isinstance(raised.value, GatewayRejected)
+        await service.prepare(PLAN_ID)
+        with pytest.raises(ExecutionOutcomeUnknown):
+            await service.execute(command.command_id)
+        record = await store.get(command.command_id)
+        assert record is not None
+        return record.phase
+
+    assert asyncio.run(run()) is ExecutionPhase.UNKNOWN
+    submits = [r for r in seen if (r.method, r.url.path) == ("POST", "/v1/commands")]
+    assert len(submits) == 2  # one direct call, one through the service; never a resend
+
+
 @pytest.mark.parametrize(
     "failure",
     [

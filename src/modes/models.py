@@ -29,19 +29,46 @@ def _require_aware(*values: datetime | None) -> None:
             raise ValueError("mode timestamps must be timezone-aware")
 
 
+class KillSwitchPolicy(StrEnum):
+    HOLD_AND_ALERT = "HOLD_AND_ALERT"
+    ORDERLY_EXIT = "ORDERLY_EXIT"
+
+
 class ModeState(BaseModel):
-    """Durable mode; ``version`` changes on every mode or safety-flag mutation."""
+    """Durable mode; ``version`` changes on every mode or safety-flag mutation.
+
+    ``kill_switch_policy`` is what the operator chose for open positions when the kill
+    switch was activated (spec 7.3); it exists only while the switch is active.
+    """
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
     mode: TradingMode = TradingMode.SHADOW
     promotion_authorized: bool = False
     kill_switch_active: bool = False
+    kill_switch_policy: KillSwitchPolicy | None = None
     daily_stop_date: date | None = None
     version: int = 1
 
+    @model_validator(mode="after")
+    def validate_kill_switch(self) -> "ModeState":
+        if self.kill_switch_policy is not None and not self.kill_switch_active:
+            raise ValueError("a kill switch policy is recorded only while the switch is active")
+        return self
+
     def daily_stop_active_on(self, risk_date: date) -> bool:
         return self.daily_stop_date == risk_date
+
+    @property
+    def active_kill_switch_policy(self) -> KillSwitchPolicy | None:
+        """The policy every reader applies to open positions, ``None`` without a kill switch.
+
+        A switch persisted without a recorded choice holds: no transaction is sent for it.
+        """
+
+        if not self.kill_switch_active:
+            return None
+        return self.kill_switch_policy or KillSwitchPolicy.HOLD_AND_ALERT
 
 
 class ModeTransition(BaseModel):
@@ -271,11 +298,6 @@ class EntryDecision(BaseModel):
     plan_id: UUID
     reasons: tuple[str, ...]
     correlation_id: str
-
-
-class KillSwitchPolicy(StrEnum):
-    HOLD_AND_ALERT = "HOLD_AND_ALERT"
-    ORDERLY_EXIT = "ORDERLY_EXIT"
 
 
 class KillSwitchActionKind(StrEnum):

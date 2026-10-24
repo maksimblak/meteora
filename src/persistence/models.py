@@ -300,6 +300,8 @@ class ModeStateRecord(Base):
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
     promotion_authorized: Mapped[bool] = mapped_column(Boolean, nullable=False)
     kill_switch_active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # The policy for open positions chosen at activation; NULL while inactive (0003).
+    kill_switch_policy: Mapped[str | None] = mapped_column(Text)
     daily_stop_date: Mapped[date | None] = mapped_column(Date)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

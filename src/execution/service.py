@@ -40,10 +40,10 @@ from src.execution.contracts import (
 )
 from src.modes.models import KillSwitchPolicy
 
-_EXIT_OPERATIONS = frozenset({DlmmOperation.REMOVE, DlmmOperation.CLOSE})
+EXIT_OPERATIONS = frozenset({DlmmOperation.REMOVE, DlmmOperation.CLOSE})
 # Only an entry is limited by the quoted price impact of its swap leg: an exit swaps
 # nothing, so its quote is recorded but never keeps a position open.
-_ENTRY_OPERATIONS = frozenset({DlmmOperation.OPEN, DlmmOperation.ADD})
+ENTRY_OPERATIONS = frozenset({DlmmOperation.OPEN, DlmmOperation.ADD})
 _UNRESOLVED = frozenset(
     {ExecutionPhase.SUBMITTING, ExecutionPhase.SUBMITTED, ExecutionPhase.UNKNOWN}
 )
@@ -94,7 +94,13 @@ class ReceiptLookup(Protocol):
 
 
 class KillSwitchProbe(Protocol):
+    """The durable kill switch, re-read on every call."""
+
     async def kill_switch_active(self) -> bool: ...
+
+    async def kill_switch_policy(self) -> KillSwitchPolicy | None:
+        """The policy for open positions chosen at activation; ``None`` while inactive."""
+        ...
 
 
 class PlanResolver(Protocol):
@@ -373,11 +379,15 @@ class ExecutionService:
         live_promotion: LivePromotionEvidence | None = None,
         receipts: ReceiptLookup | None = None,
         kill_switch: KillSwitchProbe | None = None,
-        kill_switch_policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT,
+        kill_switch_policy: KillSwitchPolicy | None = None,
     ) -> None:
-        """``kill_switch`` is re-read immediately before every submit; without it
-        nothing is ever submitted. ``receipts`` reconciles by command id (including a
-        submit that timed out before any signature was known)."""
+        """``kill_switch`` is re-read immediately before every submit, together with the
+        policy the operator chose when activating it; without it nothing is ever
+        submitted. ``receipts`` reconciles by command id (including a submit that timed
+        out before any signature was known).
+
+        ``kill_switch_policy`` is accepted for existing callers and ignored: a configured
+        policy never overrides the one recorded at activation (spec 7.3)."""
 
         if simulation_ttl <= timedelta(0):
             raise ValueError("simulation_ttl must be positive")
@@ -391,7 +401,7 @@ class ExecutionService:
         self._live_promotion = live_promotion
         self._receipts = receipts
         self._kill_switch = kill_switch
-        self._kill_switch_policy = kill_switch_policy
+        del kill_switch_policy
 
     async def prepare(self, plan_id: UUID) -> ExecutionPreview:
         command = await self._plans.resolve(plan_id)
@@ -641,17 +651,19 @@ class ExecutionService:
         return self._state(record)
 
     async def _require_kill_switch_clear(self, command: DlmmCommand) -> None:
-        """Active kill switch: no entry ever; an exit only under ``ORDERLY_EXIT``."""
+        """Active kill switch: no entry ever; an exit only under the ``ORDERLY_EXIT``
+        policy chosen at activation."""
 
-        if self._kill_switch is None:
+        probe = self._kill_switch
+        if probe is None:
             raise ExecutionBlocked("kill switch state is not wired; submit refused")
         try:
-            active = await self._kill_switch.kill_switch_active()
+            active = await probe.kill_switch_active()
+            policy = await probe.kill_switch_policy() if active else None
         except Exception as error:
             raise ExecutionBlocked("kill switch state is unavailable") from error
         if active and not (
-            command.operation in _EXIT_OPERATIONS
-            and self._kill_switch_policy is KillSwitchPolicy.ORDERLY_EXIT
+            command.operation in EXIT_OPERATIONS and policy is KillSwitchPolicy.ORDERLY_EXIT
         ):
             raise ExecutionBlocked("kill switch is active")
 
@@ -851,17 +863,26 @@ def _deserialize_record(payload: str) -> ExecutionRecord:
     )
 
 
+def entry_impact_rejection(command: DlmmCommand, simulation: SimulationResult) -> str | None:
+    """The one rule "an entry's quoted impact against its slippage limit" (D08), as the
+    executor's code: ``PRICE_IMPACT_UNAVAILABLE`` without a measured impact,
+    ``SLIPPAGE_BREACH`` above the limit; ``None`` within it and for every exit."""
+
+    if command.operation not in ENTRY_OPERATIONS:
+        return None
+    if simulation.price_impact_bps is None:
+        return "PRICE_IMPACT_UNAVAILABLE"
+    if simulation.price_impact_bps > command.max_slippage_bps:
+        return "SLIPPAGE_BREACH"
+    return None
+
+
 def _simulation_rejection(command: DlmmCommand, simulation: SimulationResult) -> str | None:
     """Why this simulation cannot be executed, as an executor error code; ``None`` if it can."""
 
     if not simulation.success or simulation.errors:
         return simulation.errors[0].code if simulation.errors else "SIMULATION_FAILED"
-    if command.operation in _ENTRY_OPERATIONS:
-        if simulation.price_impact_bps is None:
-            return "PRICE_IMPACT_UNAVAILABLE"
-        if simulation.price_impact_bps > command.max_slippage_bps:
-            return "SLIPPAGE_BREACH"
-    return None
+    return entry_impact_rejection(command, simulation)
 
 
 def _position_simulated(record: ExecutionRecord) -> bool:

@@ -12,7 +12,9 @@ Failure taxonomy that ``ExecutionService`` relies on:
   (4xx), had no execution engine (503 ``execution_unavailable``) or was unreachable
   before the request left this process;
 * ``ExecutionOutcomeUnknown`` - a submit that may have been received: timeout or drop
-  after sending, any other 5xx, or a receipt outside the V1 contract; the caller
+  after sending, any other 5xx, a receipt outside the V1 contract, or a submit refused
+  with ``idempotency_conflict`` / ``approval_already_used`` (HTTP 409: the executor
+  already holds a submission under this key or this approval - engine.ts); the caller
   reconciles through ``lookup`` and never resends;
 * ``ExecutorContractError`` - a simulation or lookup answer outside the V1 contract.
 
@@ -43,6 +45,8 @@ from src.execution.service import ExecutionBlocked, ExecutionOutcomeUnknown, Gat
 
 # Raised before the request could leave this process: nothing reached the executor.
 _NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+# Submit refusals that mean a submission already exists for this key or approval.
+_ALREADY_SUBMITTED = frozenset({"IDEMPOTENCY_CONFLICT", "APPROVAL_ALREADY_USED"})
 _ERROR_CODE = re.compile(r"[a-z0-9_]{1,64}")
 # A health probe must never stall the worker loop behind a long money-call timeout.
 _READINESS_TIMEOUT = 2.0
@@ -108,6 +112,11 @@ class HttpExecutionGateway:
             raise ExecutionOutcomeUnknown(
                 "submit outcome is unknown: the executor did not answer"
             ) from error
+        if 400 <= response.status_code < 500 and _error_code(response) in _ALREADY_SUBMITTED:
+            raise ExecutionOutcomeUnknown(
+                "submit outcome is unknown: the executor already holds a submission for "
+                f"this command ({_error_code(response)})"
+            )
         if 400 <= response.status_code < 500 or _engine_unavailable(response):
             raise _rejection(response)
         if response.status_code not in (200, 202):

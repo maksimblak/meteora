@@ -3,9 +3,12 @@
 Two strictly ordered phases:
 
 1. **Network first.** Every command whose outcome is not final (SUBMITTING,
-   SUBMITTED, UNKNOWN) is reconciled against the chain through the T05 execution
-   service (``status`` per signature). A command without a signature cannot be
-   looked up and is escalated to the operator; nothing is ever re-submitted.
+   SUBMITTED, UNKNOWN) is reconciled through the T05 execution service: by command id
+   when the gateway offers the lookup (it works without any signature, e.g. after a
+   submit timeout), otherwise per signature. Only a command still unknown afterwards is
+   escalated to the operator, one ``EXECUTION_RECOVERY_REQUIRED`` alert per command;
+   once a later pass finds its outcome, the system closes that alert. Nothing is ever
+   re-submitted.
 2. **Then decide.** Each EXECUTING entry plan is settled from the reconciled facts:
    a shadow receipt or a CONFIRMED command confirms it, a FAILED/EXPIRED command
    fails it, a still-unknown outcome keeps it EXECUTING (capacity stays reserved)
@@ -30,6 +33,7 @@ from src.accounting.repository import AccountingRepository
 from src.core.clock import Clock
 from src.execution.contracts import ExecutionPhase
 from src.execution.service import ExecutionRecord, ExecutionService
+from src.modes.alerts import SystemAlertResolver, alert_subject
 from src.modes.models import PendingPlan, PendingPlanStatus
 from src.modes.repository import ModeRepository
 from src.observability.alerts import CriticalAlertReporter
@@ -39,6 +43,7 @@ from src.persistence.contracts import JobLeases
 from src.worker.execution import entry_command_id, entry_idempotency_key
 
 UNRESOLVED_PHASES = (ExecutionPhase.SUBMITTING, ExecutionPhase.SUBMITTED, ExecutionPhase.UNKNOWN)
+RECOVERY_ALERT = "EXECUTION_RECOVERY_REQUIRED"
 _NOT_BROADCAST = frozenset(
     {ExecutionPhase.AWAITING_APPROVAL, ExecutionPhase.APPROVED, ExecutionPhase.SIMULATED}
 )
@@ -111,7 +116,11 @@ class RecoveryService:
         execution_service: ExecutionService | None = None,
         executor_lease: ExecutorLease | None = None,
         stale_after: timedelta = timedelta(minutes=2),
+        cleared: SystemAlertResolver | None = None,
     ) -> None:
+        """``cleared`` closes recovery alerts of commands whose outcome became known;
+        without it recovery only raises them."""
+
         if stale_after <= timedelta(0):
             raise ValueError("stale_after must be positive")
         self._modes = modes
@@ -124,6 +133,7 @@ class RecoveryService:
         self._service = execution_service
         self._executor_lease = executor_lease
         self._stale_after = stale_after
+        self._cleared = cleared
         self._log = get_logger("worker.recovery")
 
     async def reconcile(self, *, startup: bool = False) -> RecoveryReport:
@@ -149,12 +159,20 @@ class RecoveryService:
             command_id = entry_command_id(item.plan_id)
             if item.action is RecoveryAction.OPERATOR_REQUIRED and command_id not in operator:
                 operator.append(command_id)
-        if operator:
+        for command_id in operator:
             self._alerts.raise_alert(
-                "EXECUTION_RECOVERY_REQUIRED",
-                f"{len(operator)} command(s) have an unknown on-chain outcome; "
-                "operator reconciliation is required before they are retried",
-                dedupe_key="recovery:" + ",".join(sorted(str(item) for item in operator)),
+                RECOVERY_ALERT,
+                f"command {command_id} has an unknown on-chain outcome; operator "
+                "reconciliation is required before it is retried "
+                + alert_subject("command", command_id),
+                dedupe_key=f"recovery:{command_id}",
+            )
+        if self._cleared is not None and self._executions is not None:
+            self._cleared.resolve_except(
+                RECOVERY_ALERT,
+                "command",
+                {str(command_id) for command_id in operator},
+                "the command outcome was reconciled with the network",
             )
         report = RecoveryReport(tuple(checks), tuple(entries), tuple(operator))
         self._log.info(
@@ -187,15 +205,16 @@ class RecoveryService:
             return checks, operator
         for record in await self._executions.in_phases(UNRESOLVED_PHASES):
             command_id = record.command.command_id
-            receipt = record.receipt
-            if receipt is None or receipt.signature is None or self._service is None:
+            if self._service is None:
                 checks.append(CommandCheck(command_id, record.phase, record.phase, False))
                 operator.append(command_id)
                 continue
             try:
+                # By command id first when the gateway can look it up, else by signature;
+                # without either it refuses and the command goes to the operator.
                 state = await self._service.reconcile(command_id)
             except Exception as error:
-                self._log.error(
+                self._log.warning(
                     "reconcile_failed", command_id=str(command_id), **error_fields(error)
                 )
                 checks.append(CommandCheck(command_id, record.phase, record.phase, False))

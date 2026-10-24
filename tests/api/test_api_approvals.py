@@ -354,11 +354,12 @@ def test_an_exit_is_approved_whatever_its_quote_shows(
     assert event.payload["price_impact_bps"] == impact
 
 
+# The desk shows the code the execution service refuses the entry with (one definition).
 @pytest.mark.parametrize(
     ("impact", "blocker"),
     [
-        pytest.param(9_000, "PRICE_IMPACT_ABOVE_LIMIT", id="above-limit"),
-        pytest.param(None, "PRICE_IMPACT_UNMEASURED", id="unmeasured"),
+        pytest.param(9_000, "SLIPPAGE_BREACH", id="above-limit"),
+        pytest.param(None, "PRICE_IMPACT_UNAVAILABLE", id="unmeasured"),
     ],
 )
 def test_an_entry_over_the_impact_limit_or_unmeasured_stays_blocked(
@@ -382,6 +383,43 @@ def test_an_entry_over_the_impact_limit_or_unmeasured_stays_blocked(
     assert response.json()["error"]["details"]["blockers"] == [blocker]
     assert phase(panel, case) is ExecutionPhase.AWAITING_APPROVAL
     assert approval_events(panel) == []
+
+
+def renewed_exit(scenario: Scenario, repositories: Repositories) -> ApprovalCase:
+    """The second preview of the first exit attempt of the accepted (open) position."""
+
+    assert scenario.accepted.entry is not None
+    return awaiting_exit(
+        scenario,
+        repositories,
+        operation=DlmmOperation.CLOSE,
+        price_impact_bps=5,
+        position_id=str(scenario.accepted.entry.position_id),
+        preview=2,
+    )
+
+
+def test_a_renewed_exit_preview_still_links_its_plan_and_decision(desk: OpenDesk) -> None:
+    panel, case = desk(renewed_exit)
+
+    preview = panel.get(f"/api/v1/approvals/{case.command.command_id}").json()
+
+    assert preview["operation"] == "CLOSE" and preview["can_approve"] is True
+    assert preview["plan_id"] == str(case.plan_id)
+    assert preview["decision_id"] == str(case.decision_id)
+
+
+def test_an_expired_preview_leaves_the_pending_queue(desk: OpenDesk) -> None:
+    """Renewed exit previews (B2) must not pile up expired requests in the queue."""
+
+    panel, case = desk(exit_of(DlmmOperation.CLOSE, 5))
+    before = panel.get("/api/v1/approvals").json()["pending"]
+    panel.harness.clock.advance(timedelta(minutes=6))  # past the command's 5-minute expiry
+
+    after = panel.get("/api/v1/approvals").json()["pending"]
+
+    assert [item["command_id"] for item in before] == [str(case.command.command_id)]
+    assert after == []
 
 
 def test_an_exit_over_the_impact_limit_keeps_every_other_guard(
@@ -421,17 +459,47 @@ def test_an_exit_over_the_impact_limit_keeps_every_other_guard(
 
 # --- emergency stops (spec 7.3): an APPROVAL position may still be left ----------------
 
-# The configured pipeline policy decides, as for the worker and ExecutionService.
+# Rules whose kill-switch policy the operator's activation below repeats; what decides is
+# the policy chosen at activation (see the test right after these helpers).
 ORDERLY_EXIT = replace(harness_policy(), kill_switch_policy=KillSwitchPolicy.ORDERLY_EXIT)
 HOLD_AND_ALERT = harness_policy()
 
 
 def kill_switch(panel: Panel) -> None:
-    policy = panel.harness.policy.kill_switch_policy
+    activate_with(panel, panel.harness.policy.kill_switch_policy)
+
+
+def activate_with(panel: Panel, policy: KillSwitchPolicy) -> None:
     response = panel.bearer(
         "/api/v1/kill-switch/activate", {"reason": "авария", "policy": policy.value}
     )
     assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize(
+    ("configured", "chosen", "approvable"),
+    [
+        pytest.param(HOLD_AND_ALERT, KillSwitchPolicy.ORDERLY_EXIT, True, id="chosen-orderly"),
+        pytest.param(ORDERLY_EXIT, KillSwitchPolicy.HOLD_AND_ALERT, False, id="chosen-hold"),
+    ],
+)
+def test_the_desk_applies_the_kill_switch_policy_chosen_at_activation(
+    desk: OpenDesk,
+    configured: PipelinePolicy,
+    chosen: KillSwitchPolicy,
+    approvable: bool,
+) -> None:
+    panel, case = desk(exit_of(DlmmOperation.CLOSE, 5), policy=configured)
+    path = f"/api/v1/approvals/{case.command.command_id}"
+    activate_with(panel, chosen)
+
+    preview = panel.get(path).json()
+    response = panel.bearer(path, approve_body(preview))
+
+    assert preview["can_approve"] is approvable
+    assert response.status_code == (200 if approvable else 409), response.text
+    expected = ExecutionPhase.APPROVED if approvable else ExecutionPhase.AWAITING_APPROVAL
+    assert phase(panel, case) is expected
 
 
 def kill_switch_then_wait(panel: Panel) -> None:

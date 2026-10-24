@@ -542,6 +542,7 @@ class PostgresModeRepository:
                     ],
                 },
             )
+            # The operator's choice for open positions is mode state (spec 7.3).
             await _demote(
                 session,
                 state,
@@ -549,6 +550,7 @@ class PostgresModeRepository:
                 reason=KILL_SWITCH_ALERT,
                 correlation_id=correlation_id,
                 kill_switch_active=True,
+                kill_switch_policy=policy,
             )
             return KillSwitchResult(
                 activated_at=occurred_at,
@@ -575,7 +577,7 @@ class PostgresModeRepository:
             )
             for row in rows.all():
                 await _write_alert(session, _resolved(_alert(row), reason, released_at))
-            updated = _next_state(state, kill_switch_active=False)
+            updated = _next_state(state, kill_switch_active=False, kill_switch_policy=None)
             await _write_state(session, updated)
             await _append(
                 session,
@@ -733,6 +735,7 @@ async def _ensure_state(session: AsyncSession) -> None:
             mode=initial.mode.value,
             promotion_authorized=initial.promotion_authorized,
             kill_switch_active=initial.kill_switch_active,
+            kill_switch_policy=_policy_value(initial.kill_switch_policy),
             daily_stop_date=initial.daily_stop_date,
             version=initial.version,
         )
@@ -747,6 +750,7 @@ async def _state(session: AsyncSession) -> ModeState:
                 ModeStateRecord.mode,
                 ModeStateRecord.promotion_authorized,
                 ModeStateRecord.kill_switch_active,
+                ModeStateRecord.kill_switch_policy,
                 ModeStateRecord.daily_stop_date,
                 ModeStateRecord.version,
             ).where(ModeStateRecord.singleton == 1)
@@ -758,6 +762,9 @@ async def _state(session: AsyncSession) -> ModeState:
         mode=TradingMode(row.mode),
         promotion_authorized=row.promotion_authorized,
         kill_switch_active=row.kill_switch_active,
+        kill_switch_policy=None
+        if row.kill_switch_policy is None
+        else KillSwitchPolicy(row.kill_switch_policy),
         daily_stop_date=row.daily_stop_date,
         version=row.version,
     )
@@ -781,11 +788,16 @@ async def _write_state(session: AsyncSession, state: ModeState) -> None:
             mode=state.mode.value,
             promotion_authorized=state.promotion_authorized,
             kill_switch_active=state.kill_switch_active,
+            kill_switch_policy=_policy_value(state.kill_switch_policy),
             daily_stop_date=state.daily_stop_date,
             version=state.version,
             updated_at=func.now(),
         )
     )
+
+
+def _policy_value(policy: KillSwitchPolicy | None) -> str | None:
+    return None if policy is None else policy.value
 
 
 async def _append(

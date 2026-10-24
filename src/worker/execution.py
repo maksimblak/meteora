@@ -20,7 +20,8 @@ Order of guarantees of an entry (each step fails closed and never re-orders):
 Non-SHADOW work that outlives one cycle continues from durable state only:
 ``GatewayEntrySettler`` executes approved entries and settles reconciled ones,
 ``GatewayPositionManager`` exits and reduces non-SHADOW positions through a fresh
-simulation and the gateway, one bounded sequence of attempts per position.
+simulation and the gateway, one bounded sequence of attempts per position, under the
+kill-switch policy recorded in the mode state.
 """
 
 import hashlib
@@ -64,6 +65,7 @@ from src.execution.service import (
     GatewayRejected,
 )
 from src.market.models import PoolSnapshot, WalletState
+from src.modes.alerts import SystemAlertResolver, alert_subject
 from src.modes.models import KillSwitchPolicy, PendingPlan, PendingPlanStatus
 from src.modes.repository import ModeRepository
 from src.observability.alerts import CriticalAlertReporter
@@ -121,13 +123,20 @@ def entry_position_address(plan_id: UUID) -> str:
     return shadow_address(f"position:{plan_id}")
 
 
-def position_action_key(position_id: str, attempt: int) -> str:
-    return f"position-action:{position_id}:{attempt}"
+def position_action_key(position_id: str, attempt: int, preview: int = 1) -> str:
+    """``position-action:{position_id}:{attempt}``; a renewed APPROVAL preview of the same
+    attempt (the operator let the previous one expire unapproved) adds ``:{preview}``."""
+
+    if attempt < 1 or preview < 1:
+        raise ValueError("attempt and preview numbers start at 1")
+    key = f"position-action:{position_id}:{attempt}"
+    return key if preview == 1 else f"{key}:{preview}"
 
 
-def position_action_command_id(position_id: str, attempt: int) -> UUID:
+def position_action_command_id(position_id: str, attempt: int, preview: int = 1) -> UUID:
     return uuid5(
-        NAMESPACE_URL, f"meteora-volume-bot:{position_action_key(position_id, attempt)}"
+        NAMESPACE_URL,
+        f"meteora-volume-bot:{position_action_key(position_id, attempt, preview)}",
     )
 
 
@@ -410,6 +419,9 @@ class ModeKillSwitch:
 
     async def kill_switch_active(self) -> bool:
         return self._modes.mode_state().kill_switch_active
+
+    async def kill_switch_policy(self) -> KillSwitchPolicy | None:
+        return self._modes.mode_state().active_kill_switch_policy
 
 
 class GatewayFillBook:
@@ -1390,15 +1402,35 @@ class PositionActionResult:
     detail: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _Attempt:
+    """One started attempt of a position's sequence and its latest preview."""
+
+    number: int
+    preview: int
+    record: ExecutionRecord
+
+
+# Conditions a later successful gateway action of the same position has cleared.
+_CLEARED_BY_GATEWAY_SUCCESS = (
+    "POSITION_ACTION_FAILED",
+    "EXIT_GATEWAY_UNAVAILABLE",
+    "EXIT_REQUIRES_EXECUTION_GATEWAY",
+)
+
+
 class GatewayPositionManager:
     """Exit (CLOSE) and reduce (REMOVE) non-SHADOW positions through the gateway.
 
-    Each position has one durable sequence of at most ``attempts`` commands keyed
+    Each position has one durable sequence of at most ``attempts`` attempts keyed
     ``position-action:{position_id}:{n}``. Only the latest attempt is ever live: an
     unresolved one is reconciled (never resent), an approved one is executed once,
     and a new attempt - always with a fresh simulation - starts only after the
-    previous one provably ended. A reduction happens at most once per position.
-    Without a reachable gateway the position stays open under a critical alert.
+    previous one provably ended. An APPROVAL preview that expired before anybody
+    approved it sent nothing and spends no attempt: the same attempt gets a renewed
+    preview (``position-action:{position_id}:{n}:{k}``). A reduction happens at most
+    once per position. Without a reachable gateway the position stays open under a
+    critical alert, which the next successful action of the position closes.
     """
 
     def __init__(
@@ -1413,12 +1445,15 @@ class GatewayPositionManager:
         resolver: CommandResolver,
         book: GatewayFillBook,
         alerts: CriticalAlertReporter,
+        cleared: SystemAlertResolver,
         clock: Clock,
         metrics: WorkerMetrics,
-        policy: PipelinePolicy,
         attempts: int = POSITION_ACTION_ATTEMPTS,
         reduce_bps: int = REDUCE_BPS,
     ) -> None:
+        """``cleared`` closes this manager's own alerts once the position's action went
+        through; the kill-switch policy is read from the durable mode state."""
+
         if attempts <= 0 or not 0 < reduce_bps < 10_000:
             raise ValueError("attempts must be positive and reduce_bps inside (0, 10000)")
         self._modes = modes
@@ -1430,9 +1465,9 @@ class GatewayPositionManager:
         self._resolver = resolver
         self._book = book
         self._alerts = alerts
+        self._cleared = cleared
         self._clock = clock
         self._metrics = metrics
-        self._policy = policy
         self._attempts = attempts
         self._reduce_bps = reduce_bps
         self._log = get_logger("worker.positions.gateway")
@@ -1459,7 +1494,8 @@ class GatewayPositionManager:
                 )
                 self._alerts.raise_alert(
                     "GATEWAY_FILL_UNBOOKED",
-                    f"confirmed entry of position {position_id} could not be booked",
+                    f"confirmed entry of position {position_id} could not be booked "
+                    + alert_subject("position", position_id),
                     dedupe_key=f"unbooked:{position_id}",
                 )
 
@@ -1495,11 +1531,12 @@ class GatewayPositionManager:
     ) -> PositionActionResult | None:
         position_id = position.position_id
         history = await self._sequence(position_id)
-        for attempt, record in enumerate(history, start=1):
-            if _partially_executed(record):
-                return self._operator_required(position_id, record, attempt)
-        if history:
-            result = await self._continue(position, history[-1], len(history))
+        for item in history:
+            if _partially_executed(item.record):
+                return self._operator_required(position_id, item.record, item.number)
+        latest = history[-1] if history else None
+        if latest is not None:
+            result = await self._continue(position, latest.record, latest.number)
             if result is not None:
                 return result
         if action not in (PositionActionKind.EXIT, PositionActionKind.REDUCE):
@@ -1507,28 +1544,29 @@ class GatewayPositionManager:
         operation = DlmmOperation.CLOSE
         if action is PositionActionKind.REDUCE:
             if any(
-                record.command.operation is DlmmOperation.REMOVE
-                and record.phase is ExecutionPhase.CONFIRMED
-                for record in history
+                item.record.command.operation is DlmmOperation.REMOVE
+                and item.record.phase is ExecutionPhase.CONFIRMED
+                for item in history
             ):
                 return None
             operation = DlmmOperation.REMOVE
-        attempt = len(history) + 1
+        if latest is not None and _expired_unapproved(latest.record, self._clock.now()):
+            # Nobody approved that preview and nothing was sent: the same attempt, renewed.
+            attempt, preview = latest.number, latest.preview + 1
+        else:
+            attempt, preview = len(history) + 1, 1
         if attempt > self._attempts:
             self._alerts.raise_alert(
                 "POSITION_ACTION_ATTEMPTS_EXHAUSTED",
                 f"position {position_id} needs an operator: {self._attempts} gateway "
-                "attempts ended without an exit",
+                "attempts ended without an exit " + alert_subject("position", position_id),
                 dedupe_key=f"exhausted:{position_id}",
             )
             return PositionActionResult(position_id, PositionActionStatus.EXHAUSTED)
-        state = self._modes.mode_state()
-        if (
-            state.kill_switch_active
-            and self._policy.kill_switch_policy is KillSwitchPolicy.HOLD_AND_ALERT
-        ):
+        policy = self._modes.mode_state().active_kill_switch_policy
+        if policy is KillSwitchPolicy.HOLD_AND_ALERT:
             return PositionActionResult(position_id, PositionActionStatus.HELD, attempt)
-        return await self._start(position, operation, attempt)
+        return await self._start(position, operation, attempt, preview)
 
     async def _continue(
         self, position: ShadowPosition, record: ExecutionRecord, attempt: int
@@ -1560,22 +1598,23 @@ class GatewayPositionManager:
         return None  # FAILED / EXPIRED: the attempt ended without a transaction
 
     async def _start(
-        self, position: ShadowPosition, operation: DlmmOperation, attempt: int
+        self, position: ShadowPosition, operation: DlmmOperation, attempt: int, preview: int
     ) -> PositionActionResult:
         position_id = position.position_id
         context = await self._contexts.get(position_id)
         if context is None:
             self._alerts.raise_alert(
                 "POSITION_CONTEXT_MISSING",
-                f"open position {position_id} has no durable context",
+                f"open position {position_id} has no durable context "
+                + alert_subject("position", position_id),
                 dedupe_key=f"context:{position_id}",
             )
             return PositionActionResult(
                 position_id, PositionActionStatus.FAILED, attempt, "CONTEXT_MISSING"
             )
         command = DlmmCommandV2(
-            command_id=position_action_command_id(position_id, attempt),
-            idempotency_key=position_action_key(position_id, attempt),
+            command_id=position_action_command_id(position_id, attempt, preview),
+            idempotency_key=position_action_key(position_id, attempt, preview),
             correlation_id=_correlation(context.correlation_id),
             ruleset_version=position.ruleset_version,
             mode=position.mode,
@@ -1591,7 +1630,7 @@ class GatewayPositionManager:
         )
         self._resolver.stage(command)
         try:
-            preview = await self._service.prepare(command.command_id)
+            prepared = await self._service.prepare(command.command_id)
         except GatewayRejected as error:
             return self._unavailable(position_id, attempt, error)
         except ExecutionBlocked as error:
@@ -1602,7 +1641,7 @@ class GatewayPositionManager:
             return self._unavailable(position_id, attempt, error)
         finally:
             self._resolver.discard(command.command_id)
-        if preview.phase is ExecutionPhase.AWAITING_APPROVAL:
+        if prepared.phase is ExecutionPhase.AWAITING_APPROVAL:
             return PositionActionResult(
                 position_id, PositionActionStatus.AWAITING_APPROVAL, attempt
             )
@@ -1634,7 +1673,7 @@ class GatewayPositionManager:
         self._alerts.raise_alert(
             "POSITION_ACTION_FAILED",
             f"gateway {command.operation.value} of position {position_id} failed "
-            f"(attempt {attempt}): {outcome.detail}",
+            f"(attempt {attempt}): {outcome.detail} " + alert_subject("position", position_id),
             dedupe_key=f"action-failed:{position_id}:{attempt}",
         )
         return PositionActionResult(
@@ -1652,16 +1691,28 @@ class GatewayPositionManager:
             return PositionActionResult(
                 position_id, PositionActionStatus.PENDING, attempt, "MARKET_PRICE_UNAVAILABLE"
             )
+        # A confirmed fill is booked once: that booking is the attempt turning CONFIRMED.
+        # A later cycle re-reading the same confirmed attempt is no new success.
+        first_booking = self._accounting.receipt_for(command.idempotency_key) is None
         booked = await self._book.book(command.command_id, market[-1].price)
-        if booked.position.status is PositionStatus.CLOSED:
+        exited = booked.position.status is PositionStatus.CLOSED
+        if exited:
             try:
                 self._modes.close_position(position_id)
             except ValueError as error:
                 self._log.warning(
                     "position_already_closed", position_id=position_id, **error_fields(error)
                 )
-            return PositionActionResult(position_id, PositionActionStatus.EXITED, attempt)
-        return PositionActionResult(position_id, PositionActionStatus.REDUCED, attempt)
+        if first_booking:
+            # The gateway carried this action: failures raised before it are moot.
+            self._cleared.resolve(
+                _CLEARED_BY_GATEWAY_SUCCESS,
+                alert_subject("position", position_id),
+                f"gateway {command.operation.value} of the position went through",
+                raised_before=booked.applied_at,
+            )
+        status = PositionActionStatus.EXITED if exited else PositionActionStatus.REDUCED
+        return PositionActionResult(position_id, status, attempt)
 
     def _operator_required(
         self, position_id: str, record: ExecutionRecord, attempt: int
@@ -1672,7 +1723,8 @@ class GatewayPositionManager:
             "POSITION_PARTIALLY_EXECUTED",
             f"gateway {record.command.operation.value} of position {position_id} failed "
             f"after part of its transactions was broadcast (attempt {attempt}); "
-            "the position needs an operator before any further automatic action",
+            "the position needs an operator before any further automatic action "
+            + alert_subject("position", position_id),
             dedupe_key=f"partial:{position_id}",
         )
         return PositionActionResult(
@@ -1683,25 +1735,66 @@ class GatewayPositionManager:
         self, position_id: str, attempt: int, error: Exception
     ) -> PositionActionResult:
         self._log.error("gateway_unavailable", position_id=position_id, **error_fields(error))
+        # Once per attempt: a success closes it, and a later outage is a new alert.
         self._alerts.raise_alert(
             "EXIT_GATEWAY_UNAVAILABLE",
-            f"position {position_id} stays open: the execution gateway is unavailable",
-            dedupe_key=f"exit-gateway-unavailable:{position_id}",
+            f"position {position_id} stays open: the execution gateway is unavailable "
+            + alert_subject("position", position_id),
+            dedupe_key=f"exit-gateway-unavailable:{position_id}:{attempt}",
         )
         return PositionActionResult(
             position_id, PositionActionStatus.FAILED, attempt, "GATEWAY_UNAVAILABLE"
         )
 
-    async def _sequence(self, position_id: str) -> list[ExecutionRecord]:
-        records: list[ExecutionRecord] = []
-        for attempt in range(1, self._attempts + 1):
-            record = await self._executions.get_by_idempotency_key(
-                position_action_key(position_id, attempt)
-            )
-            if record is None:
+    async def _sequence(self, position_id: str) -> list[_Attempt]:
+        """Every started attempt with its latest preview (earlier previews of an attempt
+        expired unapproved and sent nothing)."""
+
+        attempts: list[_Attempt] = []
+        for number in range(1, self._attempts + 1):
+            first = await self._preview(position_id, number, 1)
+            if first is None:
                 break
-            records.append(record)
-        return records
+            attempts.append(await self._latest_preview(position_id, number, first))
+        return attempts
+
+    async def _latest_preview(
+        self, position_id: str, number: int, first: ExecutionRecord
+    ) -> _Attempt:
+        """Previews 1..k of an attempt are contiguous: gallop past k, then bisect."""
+
+        found, record = 1, first
+        missing = 2
+        while (probe := await self._preview(position_id, number, missing)) is not None:
+            found, record = missing, probe
+            missing *= 2
+        while missing - found > 1:
+            middle = (found + missing) // 2
+            probe = await self._preview(position_id, number, middle)
+            if probe is None:
+                missing = middle
+            else:
+                found, record = middle, probe
+        return _Attempt(number, found, record)
+
+    async def _preview(
+        self, position_id: str, number: int, preview: int
+    ) -> ExecutionRecord | None:
+        return await self._executions.get_by_idempotency_key(
+            position_action_key(position_id, number, preview)
+        )
+
+
+def _expired_unapproved(record: ExecutionRecord, now: datetime) -> bool:
+    """An APPROVAL preview that expired before anybody approved it: nothing was sent."""
+
+    return (
+        record.command.mode is TradingMode.APPROVAL
+        and record.approval is None
+        and record.receipt is None
+        and record.phase in (ExecutionPhase.AWAITING_APPROVAL, ExecutionPhase.EXPIRED)
+        and record.command.expires_at <= now
+    )
 
 
 def _partially_executed(record: ExecutionRecord) -> bool:

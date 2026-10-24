@@ -5,6 +5,12 @@ cycle opens the UTC risk day if needed, reviews every open position with the T03
 position monitor, applies SHADOW exits through the shadow broker (audited first),
 then records realized + conservative unrealized P&L so the T04 repository can trip
 the 4% daily stop atomically (blocking entries, demoting the mode, alerting).
+
+Under an active kill switch the policy the operator chose at activation (mode state,
+spec 7.3) decides: ``ORDERLY_EXIT`` turns every review into an EXIT - each position
+leaves through a fresh simulation even without another reason - and ``HOLD_AND_ALERT``
+keeps every position. Non-SHADOW exits of the mode the execution gateway serves are
+carried out by ``GatewayPositionManager`` in the same job.
 """
 
 from dataclasses import dataclass
@@ -19,17 +25,19 @@ from src.domain.models.events import EventType
 from src.domain.models.primitives import PublicKey
 from src.domain.models.trading import TradingMode
 from src.domain.risk.engine import RiskEngine
-from src.domain.risk.models import RiskAction, RiskState
+from src.domain.risk.models import RiskAction
 from src.domain.strategy import (
     PositionAction,
     PositionActionKind,
     PositionMonitor,
+    PositionReason,
     PositionSignals,
     PositionState,
 )
 from src.execution.contracts import DlmmCommandV1, DlmmOperation
 from src.market.contracts import OnChainProvider
 from src.market.models import AuthorityStatus, PoolSnapshot, RiskSignal, TokenRiskSnapshot
+from src.modes.alerts import alert_subject
 from src.modes.models import KillSwitchPolicy, RiskDayState
 from src.modes.repository import ModeRepository
 from src.modes.service import DailyRiskService
@@ -89,9 +97,11 @@ class PositionCycle:
         metrics: WorkerMetrics,
         decisions: DecisionStore | None = None,
         evidence: DailyEvidence | None = None,
+        gateway_mode: TradingMode | None = None,
     ) -> None:
         """``decisions``: the plan records whose own exit rules (the volume-decay ratio of
-        an overvolume Spot) the monitor applies; ``evidence`` counts invariant breaches."""
+        an overvolume Spot) the monitor applies; ``evidence`` counts invariant breaches;
+        ``gateway_mode``: the mode the wired execution gateway exits positions of."""
 
         self._modes = modes
         self._accounting = accounting
@@ -107,6 +117,7 @@ class PositionCycle:
         self._portfolio = portfolio
         self._decisions = decisions
         self._evidence = evidence
+        self._gateway_mode = gateway_mode
         self._plan_exits: dict[str, _PlanExit] = {}
         self._monitor = PositionMonitor(
             volume_decay_ratio=policy.strategy.volume_decay_ratio,
@@ -180,7 +191,8 @@ class PositionCycle:
         if context is None or position is None:
             self._alerts.raise_alert(
                 "POSITION_CONTEXT_MISSING",
-                f"open position {position_id} has no durable context",
+                f"open position {position_id} has no durable context "
+                + alert_subject("position", position_id),
                 dedupe_key=f"context:{position_id}",
             )
             return PositionReview(
@@ -215,7 +227,8 @@ class PositionCycle:
             expected_remaining_fee_income_base_units=0,
             above_range_since=await self._above_since(state, context, market, now),
         )
-        action = self._monitor.evaluate(state, market, risk, signals)
+        policy = self._modes.mode_state().active_kill_switch_policy
+        action = _under_kill_switch(self._monitor.evaluate(state, market, risk, signals), policy)
         reasons = tuple(reason.value for reason in action.reasons)
         proposed = audit_event(
             EventType.POSITION_ACTION_PROPOSED,
@@ -235,7 +248,7 @@ class PositionCycle:
             return PositionReview(position_id, action.kind, reasons, None), valuation
         closed = False
         if action.kind is PositionActionKind.EXIT:
-            closed = self._exit(position, context, market, action, risk, now)
+            closed = self._exit(position, context, market, action, policy, now)
         return PositionReview(
             position_id, action.kind, reasons, proposed.event_id, closed
         ), valuation
@@ -246,21 +259,22 @@ class PositionCycle:
         context: PositionContext,
         market: PoolSnapshot,
         action: PositionAction,
-        risk: RiskState,
+        policy: KillSwitchPolicy | None,
         now: datetime,
     ) -> bool:
-        if (
-            risk.kill_switch_active
-            and self._policy.kill_switch_policy is KillSwitchPolicy.HOLD_AND_ALERT
-        ):
+        if policy is KillSwitchPolicy.HOLD_AND_ALERT:
             self._log.warning("exit_held_by_kill_switch_policy", position_id=position.position_id)
             return False
         if position.mode is not TradingMode.SHADOW:
-            self._alerts.raise_alert(
-                "EXIT_REQUIRES_EXECUTION_GATEWAY",
-                f"position {position.position_id} needs an exit through the execution gateway",
-                dedupe_key=f"exit-gateway:{position.position_id}",
-            )
+            if position.mode is not self._gateway_mode:
+                self._alerts.raise_alert(
+                    "EXIT_REQUIRES_EXECUTION_GATEWAY",
+                    f"position {position.position_id} needs an exit through the execution "
+                    "gateway, which is not wired for its mode "
+                    + alert_subject("position", position.position_id),
+                    dedupe_key=f"exit-gateway:{position.position_id}",
+                )
+            # Otherwise GatewayPositionManager exits it later in this job.
             return False
         key = f"exit:{position.position_id}:{position.version}"
         command = DlmmCommandV1(
@@ -392,6 +406,19 @@ class PositionCycle:
             daily_loss=loss_ratio,
             positions=Decimal(committed) / Decimal(self._policy.risk.maximum_open_positions),
         )
+
+
+def _under_kill_switch(action: PositionAction, policy: KillSwitchPolicy | None) -> PositionAction:
+    """``ORDERLY_EXIT``: every open position exits, whatever else the monitor saw."""
+
+    if policy is not KillSwitchPolicy.ORDERLY_EXIT or action.kind is PositionActionKind.EXIT:
+        return action
+    reasons = action.reasons
+    if PositionReason.KILL_SWITCH_ACTIVE not in reasons:
+        reasons = (PositionReason.KILL_SWITCH_ACTIVE, *reasons)
+    return PositionAction(
+        kind=PositionActionKind.EXIT, reasons=reasons, position_id=action.position_id
+    )
 
 
 @dataclass(frozen=True, slots=True)

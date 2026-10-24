@@ -97,6 +97,7 @@
     <label>Открытые позиции
       <select name="policy"><option value="HOLD_AND_ALERT">держать и оповестить</option><option value="ORDERLY_EXIT">упорядоченный выход</option></select>
     </label>
+    <p class="muted">Выбор действует, пока kill switch включён. «Держать»: позиции не трогаются, бот только оповещает. «Упорядоченный выход»: каждая открытая позиция закрывается через свежую симуляцию; позицию режима APPROVAL — после вашего подтверждения.</p>
     <button type="submit" class="danger">Включить kill switch</button>
   </form>
 </section>
