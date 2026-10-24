@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import os
 from collections import defaultdict
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
@@ -10,10 +12,12 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from src.accounting.models import (
     CostModel,
+    ExitSaleModel,
     Fill,
     LedgerEntry,
     LedgerKind,
     LifecycleStep,
+    SaleFill,
     ShadowReceipt,
 )
 from src.accounting.repository import AccountingRepository
@@ -28,9 +32,11 @@ from src.execution.contracts import (
     GatewayState,
     canonical_command_digest,
 )
+from src.execution.settings import SwapSettings
 from src.market.models import DataQuality, Freshness, PoolSnapshot
 from src.market.windows import WINDOW_MINUTES
 from src.modes.models import DailyPromotionObservation
+from src.observability.logging import get_logger
 from src.portfolio.models import (
     LiquidityTranche,
     PerformanceGroup,
@@ -231,6 +237,65 @@ class AccountingService:
             slippage_base_units=slippage,
         )
 
+    def apply_sales(
+        self,
+        position: ShadowPosition,
+        sales: Sequence[SaleFill],
+        correlation_id: str,
+    ) -> tuple[ShadowPosition, tuple[LedgerEntry, ...]]:
+        """Book the sales of base tokens the position's exits returned (G22).
+
+        The exit booked that X at its mark; a sale for less is a cost of the position
+        (slippage), a sale for more adds to its realized proceeds, and every sale's
+        network and priority fees are its costs. Amounts are the receipt's (in SHADOW the
+        model's). The version is not advanced: sales are booked inside the exit's commit.
+        """
+
+        gains = losses = network = priority = Decimal(0)
+        entries: list[LedgerEntry] = []
+        for sale in sales:
+            difference = sale.proceeds_base_units - sale.sold_base_units * sale.mark_price
+            gain, loss = max(difference, Decimal(0)), max(-difference, Decimal(0))
+            gains += gain
+            losses += loss
+            network += sale.network_fee_base_units
+            priority += sale.priority_fee_base_units
+            effective = (
+                sale.proceeds_base_units / sale.sold_base_units
+                if sale.sold_base_units > 0
+                else sale.mark_price
+            )
+            entries.append(
+                LedgerEntry(
+                    entry_id=str(uuid5(NAMESPACE_URL, f"ledger:{sale.idempotency_key}")),
+                    command_id=sale.command_id,
+                    idempotency_key=sale.idempotency_key,
+                    correlation_id=correlation_id,
+                    position_id=position.position_id,
+                    kind=LedgerKind.SWAP,
+                    occurred_at=sale.sold_at,
+                    price=effective,
+                    capital_delta_base_units=Decimal(0),
+                    cost_basis_delta_base_units=Decimal(0),
+                    realized_pnl_base_units=gain,
+                    divergence_realized_base_units=Decimal(0),
+                    fee_income_base_units=Decimal(0),
+                    slippage_base_units=loss,
+                    network_base_units=sale.network_fee_base_units,
+                    jito_base_units=sale.priority_fee_base_units,
+                )
+            )
+        if not entries:
+            return position, ()
+        updated = _replace(
+            position,
+            realized_proceeds_base_units=position.realized_proceeds_base_units + gains,
+            slippage_base_units=position.slippage_base_units + losses,
+            network_base_units=position.network_base_units + network,
+            jito_base_units=position.jito_base_units + priority,
+        )
+        return updated, tuple(entries)
+
     def close(self, position: ShadowPosition, receipt: ShadowReceipt) -> PositionOutcome:
         if position.position_id != receipt.position.position_id:
             raise ValueError("receipt does not belong to position")
@@ -248,17 +313,40 @@ class AccountingService:
         )
 
 
+def default_exit_sale() -> ExitSaleModel:
+    """``SWAP_AFTER_EXIT`` of this process for the SHADOW model of the sale (G22).
+
+    Read here because SHADOW exits construct the broker without the worker's settings; an
+    unreadable value keeps the sale modeled (the setting's default) and is logged, so a
+    typo never blocks a SHADOW exit."""
+
+    try:
+        enabled = SwapSettings.from_environment(os.environ).enabled
+    except ValueError as error:
+        get_logger("accounting.shadow").error("swap_settings_unreadable", error=str(error))
+        enabled = True
+    return ExitSaleModel(enabled=enabled)
+
+
 class ShadowBroker:
     """Executes SHADOW commands without an executor, wallet or network access.
 
     Every fill after the open also books the LP fees the position earned since its last
-    fill (``shadow_fee_income``) on top of the cost model's own accrual.
+    fill (``shadow_fee_income``) on top of the cost model's own accrual. With the sale
+    after an exit on (``exit_sale``, ``SWAP_AFTER_EXIT``), a REMOVE/CLOSE also books the
+    modeled sale of the base token it returns, in the same commit (G22).
     """
 
-    def __init__(self, repository: AccountingRepository, clock: Clock) -> None:
+    def __init__(
+        self,
+        repository: AccountingRepository,
+        clock: Clock,
+        exit_sale: ExitSaleModel | None = None,
+    ) -> None:
         self._repository = repository
         self._clock = clock
         self._accounting = AccountingService()
+        self._exit_sale = exit_sale if exit_sale is not None else default_exit_sale()
 
     def apply(
         self,
@@ -304,7 +392,14 @@ class ShadowBroker:
             fee_income_base_units=fee_income,
         )
         step = self._accounting.apply_fill(current, command, fill)
-        valuation = self._accounting.value_at(step.position, fill.price, now)
+        position = step.position
+        sale_entries: tuple[LedgerEntry, ...] = ()
+        sale = self._modeled_sale(current, command, market, cost_model, fill)
+        if sale is not None:
+            position, sale_entries = self._accounting.apply_sales(
+                position, (sale,), str(command.correlation_id)
+            )
+        valuation = self._accounting.value_at(position, fill.price, now)
         entry = _ledger_entry(command, step, fill)
         events = _lifecycle_events(command, step, valuation, now)
         fill_digest = _fill_digest(command_digest, fill, market)
@@ -327,22 +422,58 @@ class ShadowBroker:
                 submitted_at=now,
                 attempt_count=0,
             ),
-            position=step.position,
+            position=position,
             valuation=valuation,
-            ledger_entry_ids=(entry.entry_id,),
+            ledger_entry_ids=(entry.entry_id, *(item.entry_id for item in sale_entries)),
             event_types=tuple(event.event_type for event in events),
         )
         outcome = (
-            self._accounting.close(step.position, receipt)
-            if step.position.status is PositionStatus.CLOSED
+            self._accounting.close(position, receipt)
+            if position.status is PositionStatus.CLOSED
             else None
         )
         return self._repository.commit(
             receipt,
-            (entry,),
+            (entry, *sale_entries),
             outcome,
             events,
             expected_version=None if current is None else current.version,
+        )
+
+    def _modeled_sale(
+        self,
+        current: ShadowPosition | None,
+        command: DlmmCommandV1,
+        market: PoolSnapshot,
+        cost_model: CostModel,
+        fill: Fill,
+    ) -> SaleFill | None:
+        """The sale of the X this exit returns by the conservative valuation, or ``None``."""
+
+        if (
+            not self._exit_sale.enabled
+            or current is None
+            or command.operation not in (DlmmOperation.REMOVE, DlmmOperation.CLOSE)
+        ):
+            return None
+        value = exit_base_value(current, command, fill.price)
+        if value <= 0:
+            return None
+        fee_rate = (
+            market.base_fee_rate
+            if market.base_fee_rate is not None
+            else self._exit_sale.unknown_pool_fee_rate
+        )
+        cost = value * (fee_rate + Decimal(cost_model.slippage_bps) / _BPS)
+        return SaleFill(
+            command_id=str(command.command_id),
+            idempotency_key=f"{command.idempotency_key}:sale",
+            sold_at=fill.filled_at,
+            sold_base_units=value / fill.price,
+            proceeds_base_units=max(value - cost, Decimal(0)),
+            mark_price=fill.price,
+            network_fee_base_units=cost_model.network_fee_base_units,
+            priority_fee_base_units=cost_model.jito_tip_base_units,
         )
 
 
@@ -431,6 +562,25 @@ def shadow_fee_income(
         if lower <= market.price < upper:
             earning += _tranche_values(tranche, market.price)[1]
     return earning * pool_fees / market.tvl
+
+
+def exit_base_value(
+    position: ShadowPosition, command: DlmmCommandV1, price: Decimal
+) -> Decimal:
+    """Value at ``price`` of the base token (X) a REMOVE/CLOSE of ``position`` returns by the
+    conservative valuation: a tranche below its entry price is all X, one at or above it
+    all Y (it sold its X on the way up)."""
+
+    fraction = (
+        Decimal(1)
+        if command.operation is DlmmOperation.CLOSE
+        else Decimal(command.remove_bps or 0) / _BPS
+    )
+    value = Decimal(0)
+    for tranche in position.tranches:
+        if price < tranche.entry_price:
+            value += _tranche_values(tranche, price)[1] * fraction
+    return value
 
 
 def _pool_fees(market: PoolSnapshot, interval: timedelta) -> Decimal:

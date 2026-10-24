@@ -8,6 +8,13 @@ import { z } from "zod";
  * anchor (active bin, tolerance, token decimals) the executor checks on chain; a simulation
  * returns the observed market facts. A V1 payload is rejected explicitly with
  * `ContractVersionError`, never parsed as a lookalike.
+ *
+ * V2 extension (G22), compatible: every V2 payload valid before stays valid with the same
+ * digest; additions are optional and omitted when absent. `SWAP` sells `in_amount` of the
+ * pool's X for Y (exact in) in the same pool, names the exited position whose tokens it
+ * sells, has no bin range, refuses a quote above `max_price_impact_bps` and writes the
+ * quote's output less `max_slippage_bps` into the transaction as its minimum output; the
+ * simulation reports that `swap_quote`; a confirmed receipt carries the chain `settlement`.
  */
 
 const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -45,6 +52,8 @@ const UtcTimestampSchema = z
   .refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
 const BaseUnitsSchema = z.string().regex(/^(0|[1-9][0-9]*)$/);
 const PositiveBaseUnitsSchema = z.string().regex(/^[1-9][0-9]*$/);
+// A signed change of a balance: no plus sign, no negative zero.
+const SignedBaseUnitsSchema = z.string().regex(/^(0|-?[1-9][0-9]*)$/);
 const DigestSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const BpsSchema = z.number().int().min(0).max(10_000);
 // SPL mint decimals are a u8.
@@ -72,6 +81,8 @@ const anchorFields = [
   "token_y_decimals",
 ] as const;
 
+const swapFields = ["swap_direction", "in_amount", "max_price_impact_bps"] as const;
+
 export const DlmmCommandV2Schema = z
   .strictObject({
     schema_version: z.literal(2),
@@ -80,15 +91,16 @@ export const DlmmCommandV2Schema = z
     correlation_id: z.string().uuid(),
     ruleset_version: NonBlank128Schema,
     mode: z.enum(["SHADOW", "APPROVAL", "LIVE"]),
-    operation: z.enum(["OPEN", "ADD", "REMOVE", "CLOSE"]),
+    operation: z.enum(["OPEN", "ADD", "REMOVE", "CLOSE", "SWAP"]),
     pool_address: PublicKeySchema,
     wallet_address: PublicKeySchema,
     position_address: PublicKeySchema.optional(),
     expires_at: UtcTimestampSchema,
     max_slippage_bps: BpsSchema,
     strategy: z.enum(["SPOT", "BID_ASK"]).optional(),
-    min_bin_id: z.number().int(),
-    max_bin_id: z.number().int(),
+    // Required by every operation but SWAP, which must not carry them.
+    min_bin_id: z.number().int().optional(),
+    max_bin_id: z.number().int().optional(),
     amount_x: BaseUnitsSchema.optional(),
     amount_y: BaseUnitsSchema.optional(),
     remove_bps: z.number().int().min(1).max(10_000).optional(),
@@ -96,8 +108,39 @@ export const DlmmCommandV2Schema = z
     active_bin_tolerance: z.number().int().min(0).max(1_000).optional(),
     token_x_decimals: DecimalsSchema.optional(),
     token_y_decimals: DecimalsSchema.optional(),
+    // Only the sale of the base token: buying was removed by the user (G22).
+    swap_direction: z.literal("X_TO_Y").optional(),
+    in_amount: PositiveBaseUnitsSchema.optional(),
+    max_price_impact_bps: BpsSchema.optional(),
   })
   .superRefine((value, context) => {
+    if (value.operation === "SWAP") {
+      if (value.position_address === undefined) {
+        context.addIssue({ code: "custom", path: ["position_address"], message: "position required" });
+      }
+      if (swapFields.some((field) => value[field] === undefined)) {
+        context.addIssue({ code: "custom", message: "swap direction, amount and limit required" });
+      }
+      if (
+        value.min_bin_id !== undefined ||
+        value.max_bin_id !== undefined ||
+        value.strategy !== undefined ||
+        value.amount_x !== undefined ||
+        value.amount_y !== undefined ||
+        value.remove_bps !== undefined ||
+        anchorFields.some((field) => value[field] !== undefined)
+      ) {
+        context.addIssue({ code: "custom", message: "a swap carries no bins, liquidity or anchor" });
+      }
+      return;
+    }
+    if (swapFields.some((field) => value[field] !== undefined)) {
+      context.addIssue({ code: "custom", message: "only a swap carries swap fields" });
+    }
+    if (value.min_bin_id === undefined || value.max_bin_id === undefined) {
+      context.addIssue({ code: "custom", path: ["min_bin_id"], message: "bin range required" });
+      return;
+    }
     if (value.min_bin_id > value.max_bin_id) {
       context.addIssue({ code: "custom", path: ["min_bin_id"], message: "invalid bin range" });
     }
@@ -144,6 +187,21 @@ export const DlmmCommandV2Schema = z
 
 export type DlmmCommandV2 = z.infer<typeof DlmmCommandV2Schema>;
 
+/** The official SDK's exact-in quote of a SWAP; `min_out_amount` is in its transaction. */
+export const SwapQuoteV2Schema = z
+  .strictObject({
+    in_amount: PositiveBaseUnitsSchema,
+    out_amount: BaseUnitsSchema,
+    min_out_amount: BaseUnitsSchema,
+    fee_amount: BaseUnitsSchema,
+  })
+  .refine(
+    (value) => BigInt(value.min_out_amount) <= BigInt(value.out_amount),
+    "the minimum output cannot exceed the quoted output",
+  );
+
+export type SwapQuoteV2 = z.infer<typeof SwapQuoteV2Schema>;
+
 export const SimulationResultV2Schema = z
   .strictObject({
     schema_version: z.literal(2),
@@ -158,15 +216,30 @@ export const SimulationResultV2Schema = z
     network_fee_lamports: BaseUnitsSchema,
     priority_fee_lamports: BaseUnitsSchema,
     price_impact_bps: BpsSchema.nullable(),
-    min_bin_id: z.number().int(),
-    max_bin_id: z.number().int(),
+    // Null for a SWAP, which has no bin range.
+    min_bin_id: z.number().int().nullable(),
+    max_bin_id: z.number().int().nullable(),
     position_address: PublicKeySchema.nullable(),
     active_bin_id: z.number().int().nullable(),
     token_x_decimals: DecimalsSchema.nullable(),
     token_y_decimals: DecimalsSchema.nullable(),
     errors: z.array(ErrorV1Schema),
+    swap_quote: SwapQuoteV2Schema.optional(),
   })
   .superRefine((value, context) => {
+    if (
+      value.success &&
+      value.swap_quote === undefined &&
+      (value.min_bin_id === null || value.max_bin_id === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "a successful simulation carries a bin range or a swap quote",
+      });
+    }
+    if (value.success && value.swap_quote !== undefined && value.swap_quote.out_amount === "0") {
+      context.addIssue({ code: "custom", message: "a successful swap quote has an output" });
+    }
     // An exit may succeed with an unknown price impact: it swaps nothing (D08). An entry
     // without a measured impact never succeeds; the engine refuses it.
     if (
@@ -192,6 +265,28 @@ export const SimulationResultV2Schema = z
 
 export type SimulationResultV2 = z.infer<typeof SimulationResultV2Schema>;
 
+/**
+ * What the chain says a confirmed command did to the wallet, over all its transactions:
+ * the fee paid, its priority part, and the signed changes of the wallet's X and Y (for
+ * wrapped SOL, native lamports received net of the fee and token-account rent count), and
+ * the mints of X and Y: the receipt alone tells whether its lamport fees are quote units.
+ */
+export const SettlementV2Schema = z
+  .strictObject({
+    fee_lamports: BaseUnitsSchema,
+    priority_fee_lamports: BaseUnitsSchema,
+    delta_x: SignedBaseUnitsSchema,
+    delta_y: SignedBaseUnitsSchema,
+    mint_x: PublicKeySchema,
+    mint_y: PublicKeySchema,
+  })
+  .refine(
+    (value) => BigInt(value.priority_fee_lamports) <= BigInt(value.fee_lamports),
+    "the priority fee is part of the paid fee",
+  );
+
+export type SettlementV2 = z.infer<typeof SettlementV2Schema>;
+
 export const GatewayReceiptV2Schema = z
   .strictObject({
     schema_version: z.literal(2),
@@ -207,8 +302,20 @@ export const GatewayReceiptV2Schema = z
     submitted_at: UtcTimestampSchema,
     attempt_count: z.number().int().nonnegative(),
     error: ErrorV1Schema.nullable(),
+    settlement: SettlementV2Schema.nullable().optional(),
   })
   .superRefine((value, context) => {
+    if (
+      value.settlement !== undefined &&
+      value.settlement !== null &&
+      value.state !== "CONFIRMED"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["settlement"],
+        message: "only a confirmed command has a settlement",
+      });
+    }
     const primary = value.signatures.at(-1) ?? null;
     if (value.signature !== primary) {
       context.addIssue({

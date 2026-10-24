@@ -23,6 +23,18 @@
 </section>
 {% endif %}
 
+{% if p.swap %}
+{% set s = p.swap %}
+<section class="card">
+  <h2>Продажа монеты после выхода</h2>
+  <p>Позиция <code>{{ s.position_address or '—' }}</code>{% if s.exit_attempt %} · выход №{{ s.exit_attempt }}{% endif %}{% if s.part %} · часть {{ s.part }}{% endif %}</p>
+  <p>Продаётся: <strong>{{ s.in_amount }}</strong> base units монеты в quote того же пула</p>
+  <p>Ожидаемый выход: <strong>{{ s.expected_out_amount or 'нет котировки' }}</strong> · Минимальный выход: <strong>{{ s.min_out_amount or '—' }}</strong> (проскальзывание {{ s.slippage_bps }} bps) · комиссия пула {{ s.fee_amount or '—' }}</p>
+  <p>Price impact {{ s.price_impact_bps if s.price_impact_bps is not none else 'не измерен' }} bps при лимите обмена {{ s.max_price_impact_bps if s.max_price_impact_bps is not none else '—' }} bps</p>
+  <p class="muted small">Каждая часть продажи подтверждается отдельно; ниже минимального выхода сеть транзакцию не исполнит.</p>
+</section>
+{% endif %}
+
 <section class="grid">
   <div class="card">
     <h2>Срок</h2>

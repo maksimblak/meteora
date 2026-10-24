@@ -20,6 +20,7 @@ from src.accounting import (
     SqliteAccountingRepository,
     TimeWindow,
 )
+from src.accounting.models import ExitSaleModel
 from src.core.clock import FrozenClock
 from src.domain.models.events import EventType
 from src.domain.models.trading import TradingMode
@@ -260,7 +261,8 @@ def test_add_at_new_price_measures_divergence_from_its_own_entry() -> None:
 
 def test_partial_remove_realizes_pnl_and_close_does_not_double_count() -> None:
     repo = InMemoryAccountingRepository()
-    broker = ShadowBroker(repo, FrozenClock(NOW))
+    # The lifecycle alone: the sale of the returned base token has its own tests (T17).
+    broker = ShadowBroker(repo, FrozenClock(NOW), exit_sale=ExitSaleModel(enabled=False))
     broker.apply(command(DlmmOperation.OPEN, "open"), snapshot("2"), costs())
     removed = broker.apply(
         command(DlmmOperation.REMOVE, "remove"), snapshot("1"), costs(fees="10")

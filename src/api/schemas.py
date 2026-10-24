@@ -415,6 +415,21 @@ class CostView(ApiModel):
     estimated_loss_base_units: int | None
 
 
+class SwapView(ApiModel):
+    """The sale after an exit (G22): what one SWAP command sells and its limits."""
+
+    position_address: str | None
+    exit_attempt: int | None
+    part: int | None
+    in_amount: str
+    expected_out_amount: str | None
+    min_out_amount: str | None
+    fee_amount: str | None
+    price_impact_bps: int | None
+    max_price_impact_bps: int | None
+    slippage_bps: int
+
+
 class ApprovalSummary(ApiModel):
     command_id: UUID
     operation: str
@@ -455,6 +470,7 @@ class ApprovalPreview(ApiModel):
     plan_id: UUID | None
     blockers: list[Notice]
     can_approve: bool
+    swap: SwapView | None = None
 
 
 class ApprovalQueue(ApiModel):

@@ -102,6 +102,34 @@ describe("executor runtime composition", () => {
     expect(readiness.json()).toEqual({ status: "not_ready", missing: ["rpc"] });
   });
 
+  it("refuses to build a money engine with a misread priority fee ceiling", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "executor-priority-fee-"));
+    temporaryDirectories.push(directory);
+    const walletPath = join(directory, "wallet.json");
+    const promotionPath = await promotionFile(
+      directory,
+      "2026-10-18T11:00:00.000Z",
+      "2030-01-02T03:04:05.000Z",
+    );
+    const wallet = Keypair.generate();
+    await writeFile(walletPath, JSON.stringify([...wallet.secretKey]), "utf8");
+    const environ = {
+      TRADING_MODE: "LIVE",
+      SOLANA_RPC_URL: UNREACHABLE_RPC,
+      WALLET_KEYPAIR_FILE: walletPath,
+      EXECUTOR_STATE_FILE: join(directory, "execution-state.json"),
+      LIVE_PROMOTION_FILE: promotionPath,
+      EXECUTOR_INTERNAL_TOKEN: "internal-token",
+      EXECUTOR_MODE_TOKEN: "mode-token",
+    };
+
+    const misread = await buildRuntimeConfig({ ...environ, PRIORITY_FEE_MAX_LAMPORTS: "0.015" });
+    const raised = await buildRuntimeConfig({ ...environ, PRIORITY_FEE_MAX_LAMPORTS: "30000000" });
+
+    expect(misread.engine).toBeUndefined();
+    expect(raised.engine).toBeDefined();
+  });
+
   it("keeps LIVE readiness false for future-dated promotion evidence", async () => {
     const directory = await mkdtemp(join(tmpdir(), "executor-future-promotion-"));
     temporaryDirectories.push(directory);

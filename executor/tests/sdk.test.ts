@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 
-import { Keypair, SystemProgram, Transaction, type Connection, type PublicKey } from "@solana/web3.js";
+import { Keypair, PublicKey, SystemProgram, Transaction, type Connection } from "@solana/web3.js";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { parseDlmmCommandV2, type DlmmCommandV2 } from "../src/contracts.js";
@@ -89,9 +89,10 @@ interface Call {
 class FakePool implements MeteoraPoolClient {
   readonly calls: Call[] = [];
   readonly quotes: Array<{ kind: string; amount: string; swapForY: boolean; slippage: string }> = [];
+  pubkey = new PublicKey(POOL);
   lbPair = { activeId: 8001 };
-  tokenX = { mint: { decimals: 6 } };
-  tokenY = { mint: { decimals: 9 } };
+  tokenX = { publicKey: new PublicKey("SysvarC1ock11111111111111111111111111111111"), mint: { decimals: 6 } };
+  tokenY = { publicKey: new PublicKey("So11111111111111111111111111111111111111112"), mint: { decimals: 9 } };
   quoteFailure: Error | undefined;
 
   constructor(private readonly wallet: Keypair) {}
@@ -157,6 +158,10 @@ class FakePool implements MeteoraPoolClient {
   async addLiquidityByStrategy(parameters: Record<string, unknown>): Promise<Transaction> {
     this.calls.push({ operation: "ADD", parameters });
     return this.#transfer();
+  }
+
+  async swap(): Promise<Transaction> {
+    throw new Error("a liquidity command never swaps");
   }
 
   async removeLiquidity(parameters: { shouldClaimAndClose: boolean }): Promise<Transaction[]> {

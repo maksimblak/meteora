@@ -16,6 +16,11 @@ own rule and codes), while an exit's quote is shown and audited but never blocks
 exit is needed most in a thin or falling pool. For the same reason a daily stop, or a
 kill switch activated with ``ORDERLY_EXIT`` (the policy recorded in the mode state), and
 the demotion to SHADOW it causes do not block the exit of an APPROVAL position (spec 7.3).
+
+The sale of the base token an exit returned (G22) gets its own card per SWAP command:
+amount, expected and minimum output, quoted impact and its limit (``swap_rejection``,
+the service's own rule). It only lowers risk, so neither a kill switch (any policy) nor
+the daily stop, nor the demotion they cause, blocks it.
 """
 
 import asyncio
@@ -41,6 +46,7 @@ from src.api.schemas import (
     Notice,
     PlanDiffRow,
     SimulationField,
+    SwapView,
 )
 from src.api.security import OperatorAuth, OperatorPrincipal
 from src.domain.models.events import AuditEvent, EventType
@@ -54,16 +60,18 @@ from src.execution.contracts import (
 from src.execution.service import (
     ENTRY_OPERATIONS,
     EXIT_OPERATIONS,
+    SALE_OPERATIONS,
     ExecutionBlocked,
     ExecutionRecord,
     ExecutionService,
     entry_impact_rejection,
     sign_operator_approval,
+    swap_rejection,
 )
 from src.modes.models import KillSwitchPolicy
 from src.observability.logging import error_fields, get_logger
 from src.persistence.contracts import DecisionRecord, PlanRecord, UniverseSummary
-from src.worker.execution import entry_idempotency_key, position_action_key
+from src.worker.execution import entry_idempotency_key, exit_sale_key, position_action_key
 
 DEFAULT_SIMULATION_TTL = timedelta(minutes=2)
 OPERATOR_ID = "operator"
@@ -208,6 +216,7 @@ class ApprovalDesk:
             plan_id=None if links.plan is None else links.plan.plan_id,
             blockers=presenters.readiness_notices(blockers),
             can_approve=not blockers,
+            swap=_swap_view(record),
         )
 
     async def approve(
@@ -262,6 +271,7 @@ class ApprovalDesk:
                 "Котировка или команда изменились после показа preview: обновите страницу",
             )
         expires_at = self._approval_expiry(record, now)
+        swap = _swap_view(record)
         approval = OperatorApproval(
             approval_id=request.approval_id,
             approved_at=now,
@@ -296,6 +306,8 @@ class ApprovalDesk:
                 "checklist": {key: True for key, _ in labels.CHECKLIST},
                 "checklist_confirmed_at": now.isoformat(),
                 "comment": request.comment,
+                # A sale card: exactly the amounts and limits the operator approved.
+                **({} if swap is None else {"swap": swap.model_dump(mode="json")}),
             },
         )
         try:
@@ -340,14 +352,19 @@ class ApprovalDesk:
         blockers = list(self.unavailable())
         daily_stop = state.daily_stop_active_on(self._ctx.today())
         leaving = _leaves_approval_position(command)
+        selling = _sells_after_exit(command)
         # Spec 7.3: a stop halts entries, not the way out of an APPROVAL position. Under an
         # active kill switch the policy chosen at its activation decides (mode state), the
         # same one the worker and ``ExecutionService`` apply; both stops demote to SHADOW.
-        emergency_exit = leaving and (
-            state.active_kill_switch_policy is KillSwitchPolicy.ORDERLY_EXIT
-            if state.kill_switch_active
-            else daily_stop
-        )
+        # The sale of what an exit returned is never held by either stop (G22).
+        emergency_exit = (
+            leaving
+            and (
+                state.active_kill_switch_policy is KillSwitchPolicy.ORDERLY_EXIT
+                if state.kill_switch_active
+                else daily_stop
+            )
+        ) or (selling and (state.kill_switch_active or daily_stop))
         if record.phase is not ExecutionPhase.AWAITING_APPROVAL:
             blockers.append("NOT_AWAITING_APPROVAL")
         if command.mode is not TradingMode.APPROVAL:
@@ -358,7 +375,7 @@ class ApprovalDesk:
             blockers.append("MODE_NOT_APPROVAL")
         if state.kill_switch_active and not emergency_exit:
             blockers.append("KILL_SWITCH_ACTIVE")
-        if daily_stop and not leaving:
+        if daily_stop and not (leaving or selling):
             blockers.append("DAILY_STOP_ACTIVE")
         if command.expires_at <= now:
             blockers.append("COMMAND_EXPIRED")
@@ -366,7 +383,9 @@ class ApprovalDesk:
             blockers.append("SIMULATION_STALE")
         if not simulation.success or simulation.errors:
             blockers.append("SIMULATION_FAILED")
-        impact = entry_impact_rejection(command, simulation)
+        impact = entry_impact_rejection(command, simulation) or swap_rejection(
+            command, simulation
+        )
         if impact is not None:
             blockers.append(impact)
         return blockers
@@ -386,7 +405,7 @@ class ApprovalDesk:
         if plan_id is not None:
             plan = await repositories.decisions.plan(plan_id)
         else:
-            position_id = _position_of_action(key)
+            position_id = _position_of_action(key) or _position_of_sale(key)
             if position_id is not None:
                 context = await repositories.positions.get(position_id)
                 if context is not None:
@@ -457,6 +476,57 @@ def _leaves_approval_position(command: DlmmCommand) -> bool:
     return command.operation in EXIT_OPERATIONS and command.mode is TradingMode.APPROVAL
 
 
+def _sells_after_exit(command: DlmmCommand) -> bool:
+    """The sale of what an exit of an APPROVAL position returned (G22)."""
+
+    return command.operation in SALE_OPERATIONS and command.mode is TradingMode.APPROVAL
+
+
+def _sale_numbers(key: str) -> tuple[str, int, int] | None:
+    """(position, exit attempt, part) of ``exit-sale:{position}:{attempt}:{part}[:{preview}]``."""
+
+    prefix, _, rest = key.partition(":")
+    position_id, *numbers = rest.split(":")
+    if (
+        prefix != "exit-sale"
+        or not position_id
+        or not 2 <= len(numbers) <= 3
+        or not all(number.isdigit() and int(number) >= 1 for number in numbers)
+    ):
+        return None
+    attempt, part = int(numbers[0]), int(numbers[1])
+    preview = int(numbers[2]) if len(numbers) == 3 else 1
+    if exit_sale_key(position_id, attempt, part, preview) != key:
+        return None
+    return position_id, attempt, part
+
+
+def _position_of_sale(key: str) -> str | None:
+    numbers = _sale_numbers(key)
+    return None if numbers is None else numbers[0]
+
+
+def _swap_view(record: ExecutionRecord) -> SwapView | None:
+    command, simulation = record.command, record.simulation
+    in_amount = getattr(command, "in_amount", None)
+    if command.operation not in SALE_OPERATIONS or in_amount is None:
+        return None
+    quote = getattr(simulation, "swap_quote", None)
+    numbers = _sale_numbers(command.idempotency_key)
+    return SwapView(
+        position_address=command.position_address,
+        exit_attempt=None if numbers is None else numbers[1],
+        part=None if numbers is None else numbers[2],
+        in_amount=in_amount,
+        expected_out_amount=None if quote is None else quote.out_amount,
+        min_out_amount=None if quote is None else quote.min_out_amount,
+        fee_amount=None if quote is None else quote.fee_amount,
+        price_impact_bps=simulation.price_impact_bps,
+        max_price_impact_bps=getattr(command, "max_price_impact_bps", None),
+        slippage_bps=command.max_slippage_bps,
+    )
+
+
 def _entry_plan_id(key: str) -> UUID | None:
     prefix, _, rest = key.partition(":")
     if prefix != "entry":
@@ -504,9 +574,16 @@ def _plan_diff(record: ExecutionRecord, plan: PlanRecord | None) -> list[PlanDif
             planned=None
             if strategy is None
             else f"смещения {strategy.lower_bin_offset}..{strategy.upper_bin_offset}",
-            command=f"{command.min_bin_id}..{command.max_bin_id}",
-            simulated=f"{simulation.min_bin_id}..{simulation.max_bin_id}",
-            matches=command_range == simulated_range
+            command=None
+            if command.min_bin_id is None or command.max_bin_id is None
+            else f"{command.min_bin_id}..{command.max_bin_id}",
+            simulated=None
+            if simulation.min_bin_id is None or simulation.max_bin_id is None
+            else f"{simulation.min_bin_id}..{simulation.max_bin_id}",
+            # A sale has no bin range to compare (G22).
+            matches=None
+            if command.min_bin_id is None or command.max_bin_id is None
+            else command_range == simulated_range
             and (
                 strategy is None
                 or command.max_bin_id - command.min_bin_id
@@ -517,9 +594,7 @@ def _plan_diff(record: ExecutionRecord, plan: PlanRecord | None) -> list[PlanDif
         PlanDiffRow(
             field="size",
             planned=None if plan is None else f"{plan.sized_plan.size_base_units} base units",
-            command=f"x={command.amount_x}, y={command.amount_y}"
-            if command.amount_x is not None
-            else f"remove {command.remove_bps} bps",
+            command=_size_text(command),
             simulated=None,
             matches=None,
         ),
@@ -545,10 +620,20 @@ def _plan_diff(record: ExecutionRecord, plan: PlanRecord | None) -> list[PlanDif
 
 
 def _impact_row(command: DlmmCommand, simulation: SimulationResult) -> PlanDiffRow:
-    """An entry's quoted impact against its slippage limit; an exit's quote is shown only."""
+    """An entry's quoted impact against its slippage limit, a sale's against its own impact
+    limit; an exit's quote is shown only."""
 
     impact = simulation.price_impact_bps
     simulated = None if impact is None else str(impact)
+    if command.operation in SALE_OPERATIONS:
+        limit = getattr(command, "max_price_impact_bps", None)
+        return PlanDiffRow(
+            field="price_impact_bps",
+            planned=None if limit is None else f"≤ {limit}",
+            command=None if limit is None else str(limit),
+            simulated=simulated,
+            matches=swap_rejection(command, simulation) is None,
+        )
     if command.operation not in ENTRY_OPERATIONS:
         return PlanDiffRow(
             field="price_impact_bps",
@@ -564,6 +649,15 @@ def _impact_row(command: DlmmCommand, simulation: SimulationResult) -> PlanDiffR
         simulated=simulated,
         matches=entry_impact_rejection(command, simulation) is None,
     )
+
+
+def _size_text(command: DlmmCommand) -> str:
+    in_amount = getattr(command, "in_amount", None)
+    if command.operation in SALE_OPERATIONS and in_amount is not None:
+        return f"sell {in_amount} base units"
+    if command.amount_x is not None:
+        return f"x={command.amount_x}, y={command.amount_y}"
+    return f"remove {command.remove_bps} bps"
 
 
 def _anchor_rows(record: ExecutionRecord) -> list[PlanDiffRow]:

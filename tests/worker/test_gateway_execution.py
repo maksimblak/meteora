@@ -35,6 +35,7 @@ from src.execution.contracts import (
     GatewayState,
     LivePromotionEvidence,
     OperatorApproval,
+    SettlementV2,
     SimulationErrorV1,
     SimulationResultV2,
     bind_simulation_result_v2,
@@ -148,6 +149,14 @@ class FakeExecutor:
         self.simulation_failures: dict[DlmmOperation, str] = {}
         # Quoted price impact of the swap leg, per operation (default 5 bps).
         self.price_impacts: dict[DlmmOperation, int | None] = {}
+        self.settlement: SettlementV2 | None = SettlementV2(
+            fee_lamports="5000",
+            priority_fee_lamports="0",
+            delta_x="0",
+            delta_y="0",
+            mint_x=POOL.base_mint.root,
+            mint_y=POOL.quote_mint.root,
+        )
 
     async def simulate(self, command: DlmmCommand) -> SimulationResultV2:
         if not self.reachable:
@@ -215,18 +224,22 @@ class FakeExecutor:
             count, signed = (1, 1) if self.failed_shape is None else self.failed_shape
             signatures = tuple(f"sig-{len(self.submitted)}-{n}" for n in range(signed))
             assert simulation.position_address is not None
+            confirmed = self.failed_shape is None
             receipt = GatewayReceiptV2(
                 command_id=command.command_id,
                 command_digest=simulation.command_digest,
                 simulation_digest=simulation.simulation_digest,
                 idempotency_key=idempotency_key,
-                state=GatewayState.CONFIRMED if self.failed_shape is None else GatewayState.FAILED,
+                state=GatewayState.CONFIRMED if confirmed else GatewayState.FAILED,
                 position_address=simulation.position_address,
                 signature=signatures[-1] if signatures else None,
                 signatures=signatures,
                 transaction_count=count,
                 submitted_at=self.clock.now(),
                 attempt_count=1,
+                # The chain's account of the command (G22): these exits return no base
+                # token, so nothing is left to sell; the fee is the simulated one.
+                settlement=self.settlement if confirmed else None,
             )
             self.receipts[command.command_id] = receipt
         if self.submit_behavior == "timeout":
@@ -235,7 +248,7 @@ class FakeExecutor:
             return receipt.model_copy(update={"simulation_digest": "f" * 64})
         if self.submit_behavior == "submitted":
             # Broadcast and later confirmed on chain; the first answer only says SUBMITTED.
-            return receipt.model_copy(update={"state": GatewayState.SUBMITTED})
+            return receipt.model_copy(update={"state": GatewayState.SUBMITTED, "settlement": None})
         return receipt
 
     async def lookup(self, command_id: UUID) -> GatewayReceiptV2 | None:

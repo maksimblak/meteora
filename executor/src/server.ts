@@ -26,6 +26,7 @@ import {
   OfficialMeteoraQuoter,
   SolanaLiveReadiness,
   SolanaRpcTransport,
+  priorityFeePolicyFromEnvironment,
   type LiveReadiness,
   type LiveReadinessProbe,
 } from "./sdk.js";
@@ -88,6 +89,8 @@ export async function buildRuntimeConfig(
     return base;
   }
   try {
+    // A misread fee ceiling is a misconfiguration: no money engine, readiness stays false.
+    const priorityFees = priorityFeePolicyFromEnvironment(environ);
     const signers = new FileSecretSignerProvider(walletPath);
     const wallet = await signers.loadWalletSigner();
     if (
@@ -98,7 +101,7 @@ export async function buildRuntimeConfig(
     }
     const engine = new ExecutionEngine({
       sdk: new OfficialMeteoraDlmmBoundary(connection, signers),
-      rpc: new SolanaRpcTransport(connection),
+      rpc: new SolanaRpcTransport(connection, "confirmed", undefined, priorityFees),
       store: new FileExecutionStateStore(statePath),
       submissionEnabled: true,
       allowedMode: configuredMode,

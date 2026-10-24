@@ -30,6 +30,7 @@ from src.execution.contracts import (
     GatewayState,
     LivePromotionEvidence,
     OperatorApproval,
+    SettlementV2,
     SimulationResult,
     SimulationResultV2,
     canonical_command_digest,
@@ -44,6 +45,10 @@ EXIT_OPERATIONS = frozenset({DlmmOperation.REMOVE, DlmmOperation.CLOSE})
 # Only an entry is limited by the quoted price impact of its swap leg: an exit swaps
 # nothing, so its quote is recorded but never keeps a position open.
 ENTRY_OPERATIONS = frozenset({DlmmOperation.OPEN, DlmmOperation.ADD})
+# The sale of the base token an exit returned (G22): limited by its own impact limit and
+# minimum output, never blocked by the kill switch or the daily stop (it lowers risk).
+SALE_OPERATIONS = frozenset({DlmmOperation.SWAP})
+_BPS = 10_000
 _UNRESOLVED = frozenset(
     {ExecutionPhase.SUBMITTING, ExecutionPhase.SUBMITTED, ExecutionPhase.UNKNOWN}
 )
@@ -632,6 +637,31 @@ class ExecutionService:
         await self._store.put(record)
         return self._state(record)
 
+    async def refresh_settlement(self, command_id: UUID) -> SettlementV2 | None:
+        """The chain settlement of a CONFIRMED command (what it did to the wallet).
+
+        A receipt confirmed before the executor could read its transactions has none: it
+        is asked for again by command id and adopted only when it answers for the same
+        binding, still CONFIRMED, without losing a signature. ``None`` while unknown."""
+
+        record = await self._require_record(command_id)
+        receipt = record.receipt
+        if not isinstance(receipt, GatewayReceiptV2) or receipt.state is not GatewayState.CONFIRMED:
+            return None
+        if receipt.settlement is not None or self._receipts is None:
+            return receipt.settlement
+        found = await self._receipts.lookup(command_id)
+        if not isinstance(found, GatewayReceiptV2) or found.settlement is None:
+            return None
+        self._validate_receipt_binding(record, found)
+        if found.state is not GatewayState.CONFIRMED or set(found.signatures) != set(
+            receipt.signatures
+        ):
+            raise ExecutionBlocked("the settled receipt contradicts the confirmed one")
+        record.receipt = found
+        await self._store.put(record)
+        return found.settlement
+
     async def _adopt_receipt(
         self, record: ExecutionRecord, receipt: GatewayReceipt
     ) -> ExecutionState:
@@ -647,11 +677,14 @@ class ExecutionService:
 
     async def _require_kill_switch_clear(self, command: DlmmCommand) -> None:
         """Active kill switch: no entry ever; an exit only under the ``ORDERLY_EXIT``
-        policy chosen at activation."""
+        policy chosen at activation; the sale of tokens an exit already returned under
+        any policy - it only lowers the risk the switch is about (spec 8.5, G22)."""
 
         probe = self._kill_switch
         if probe is None:
             raise ExecutionBlocked("kill switch state is not wired; submit refused")
+        if command.operation in SALE_OPERATIONS:
+            return
         try:
             active = await probe.kill_switch_active()
             policy = await probe.kill_switch_policy() if active else None
@@ -872,12 +905,40 @@ def entry_impact_rejection(command: DlmmCommand, simulation: SimulationResult) -
     return None
 
 
+def swap_rejection(command: DlmmCommand, simulation: SimulationResult) -> str | None:
+    """The rule of a sale (G22), as the executor's codes; ``None`` within it and for any
+    other operation. ``PRICE_IMPACT_UNAVAILABLE``: no measured quote;
+    ``SWAP_QUOTE_INCOMPLETE``: the quote does not sell the whole ``in_amount`` for a
+    positive output, or its on-chain minimum is looser than ``max_slippage_bps``;
+    ``PRICE_IMPACT_BREACH``: impact above the command's own limit (sell a smaller part)."""
+
+    if command.operation not in SALE_OPERATIONS:
+        return None
+    quote = getattr(simulation, "swap_quote", None)
+    impact = simulation.price_impact_bps
+    if not isinstance(command, DlmmCommandV2) or quote is None or impact is None:
+        return "PRICE_IMPACT_UNAVAILABLE"
+    out, minimum = int(quote.out_amount), int(quote.min_out_amount)
+    tolerated = out * (_BPS - command.max_slippage_bps) // _BPS
+    if (
+        quote.in_amount != command.in_amount
+        or out <= 0
+        or minimum <= 0
+        or not tolerated <= minimum <= out
+    ):
+        return "SWAP_QUOTE_INCOMPLETE"
+    limit = command.max_price_impact_bps
+    if limit is None or impact > limit:
+        return "PRICE_IMPACT_BREACH"
+    return None
+
+
 def _simulation_rejection(command: DlmmCommand, simulation: SimulationResult) -> str | None:
     """Why this simulation cannot be executed, as an executor error code; ``None`` if it can."""
 
     if not simulation.success or simulation.errors:
         return simulation.errors[0].code if simulation.errors else "SIMULATION_FAILED"
-    return entry_impact_rejection(command, simulation)
+    return entry_impact_rejection(command, simulation) or swap_rejection(command, simulation)
 
 
 def _position_simulated(record: ExecutionRecord) -> bool:

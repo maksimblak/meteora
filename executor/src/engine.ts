@@ -7,11 +7,22 @@ import {
   type ChainReceiptV1,
   type DlmmCommandV2,
   type GatewayReceiptV2,
+  type SettlementV2,
   type SimulationResultV2,
+  type SwapQuoteV2,
 } from "./contracts.js";
 
 export interface Clock {
   now(): Date;
+}
+
+/** The official SDK's exact-in quote of a SWAP, as written into its transaction. */
+export interface SwapFacts {
+  inAmount: string;
+  outAmount: string;
+  /** The minimum output of the transaction: the quoted output less the command's slippage. */
+  minOutAmount: string;
+  feeAmount: string;
 }
 
 /** What the official SDK read from chain for one command (LB pair, mints and its quote). */
@@ -19,7 +30,7 @@ export interface MarketFacts {
   /**
    * Price impact of the command's swap leg from the SDK quote, rounded up to whole bps.
    * `null` only for an exit whose quote was unavailable: an exit swaps nothing, so its
-   * impact is reported but never gates it; an entry needs a measured value.
+   * impact is reported but never gates it; an entry and a SWAP need a measured value.
    */
   priceImpactBps: number | null;
   /** Active bin of the LB pair account. */
@@ -27,6 +38,18 @@ export interface MarketFacts {
   /** Decimals of the X and Y mint accounts. */
   tokenXDecimals: number;
   tokenYDecimals: number;
+  /** Mints of X and Y: the settlement of a confirmed command reads the wallet's changes. */
+  tokenXMint?: string;
+  tokenYMint?: string;
+  /** Only for a SWAP: the quote it was built with. */
+  swap?: SwapFacts;
+}
+
+/** Whose balances and which mints the settlement of a confirmed command is read for. */
+export interface SettlementBinding {
+  wallet: string;
+  tokenXMint: string;
+  tokenYMint: string;
 }
 
 /**
@@ -70,6 +93,14 @@ export interface RpcTransport {
     recordSignature?: SignatureRecorder,
   ): Promise<readonly string[] | string>;
   status(signature: string): Promise<RpcStatus>;
+  /**
+   * What the confirmed transactions did to the wallet; `undefined` while the chain
+   * cannot tell yet (the receipt stays without a settlement and is read again).
+   */
+  settlement?(
+    signatures: readonly string[],
+    binding: SettlementBinding,
+  ): Promise<SettlementV2 | undefined>;
 }
 
 export interface SubmitAuthorization {
@@ -145,6 +176,8 @@ export interface PersistedSubmission {
   simulationDigest: string;
   idempotencyKey: string;
   approvalId?: string;
+  /** Addresses only; absent on submissions recorded before settlements existed. */
+  settlementBinding?: SettlementBinding;
   receipt: GatewayReceiptV2;
 }
 
@@ -457,13 +490,14 @@ export class ExecutionEngine {
         network_fee_lamports: result.networkFeeLamports.toString(),
         priority_fee_lamports: result.priorityFeeLamports.toString(),
         price_impact_bps: market.priceImpactBps,
-        min_bin_id: immutableCommand.min_bin_id,
-        max_bin_id: immutableCommand.max_bin_id,
+        min_bin_id: immutableCommand.min_bin_id ?? null,
+        max_bin_id: immutableCommand.max_bin_id ?? null,
         position_address: built.positionAddress,
         active_bin_id: market.activeBinId,
         token_x_decimals: market.tokenXDecimals,
         token_y_decimals: market.tokenYDecimals,
         errors: [],
+        ...swapQuoteOf(immutableCommand, market),
       }));
       const entry: PreparedCommand = {
         built,
@@ -531,6 +565,14 @@ export class ExecutionEngine {
     ) {
       throw new GatewayError("SLIPPAGE_BREACH", "simulation exceeds the command slippage limit");
     }
+    if (
+      command.operation === "SWAP" &&
+      (prepared.simulation.price_impact_bps === null ||
+        prepared.simulation.swap_quote === undefined ||
+        prepared.simulation.price_impact_bps > (command.max_price_impact_bps ?? -1))
+    ) {
+      throw new GatewayError("PRICE_IMPACT_BREACH", "simulation exceeds the swap impact limit");
+    }
     if (command.mode === "APPROVAL") {
       this.#assertApproval(command, prepared.simulation, authorization);
     } else if (command.mode === "LIVE") {
@@ -592,7 +634,10 @@ export class ExecutionEngine {
 
   async #reconcileReceipt(state: PersistedSubmission): Promise<GatewayReceiptV2> {
     const receipt = state.receipt;
-    if (receipt.state === "CONFIRMED" || receipt.state === "FAILED") {
+    if (receipt.state === "CONFIRMED") {
+      return this.#settle(state);
+    }
+    if (receipt.state === "FAILED") {
       return receipt;
     }
     if (receipt.signatures.length === 0) {
@@ -628,6 +673,34 @@ export class ExecutionEngine {
       receipt: { ...receipt, state: next },
     };
     await this.#store.update(updated);
+    return next === "CONFIRMED" ? this.#settle(updated) : updated.receipt;
+  }
+
+  /**
+   * Attach what the chain says the confirmed command did to the wallet. Until the RPC can
+   * tell, the receipt stays without a settlement and the next lookup reads it again.
+   */
+  async #settle(state: PersistedSubmission): Promise<GatewayReceiptV2> {
+    const receipt = state.receipt;
+    const binding = state.settlementBinding;
+    if (
+      (receipt.settlement !== undefined && receipt.settlement !== null) ||
+      binding === undefined ||
+      this.#rpc.settlement === undefined
+    ) {
+      return receipt;
+    }
+    let settlement: SettlementV2 | undefined;
+    try {
+      settlement = await this.#withTimeout(this.#rpc.settlement(receipt.signatures, binding));
+    } catch {
+      settlement = undefined;
+    }
+    if (settlement === undefined) {
+      return receipt;
+    }
+    const updated: PersistedSubmission = { ...state, receipt: { ...receipt, settlement } };
+    await this.#store.update(updated);
     return updated.receipt;
   }
 
@@ -641,12 +714,16 @@ export class ExecutionEngine {
   ): Promise<GatewayReceiptV2> {
     const transactionCount = built.opaqueTransactions.length;
     const submittedAt = this.#clock.now().toISOString();
+    const { tokenXMint, tokenYMint } = built.market;
     let state: PersistedSubmission = {
       commandId: command.command_id,
       commandDigest: digest,
       simulationDigest: simulation.simulation_digest,
       idempotencyKey,
       ...(approvalId === undefined ? {} : { approvalId }),
+      ...(tokenXMint === undefined || tokenYMint === undefined
+        ? {}
+        : { settlementBinding: { wallet: command.wallet_address, tokenXMint, tokenYMint } }),
       receipt: {
         schema_version: 2,
         command_id: command.command_id,
@@ -887,14 +964,16 @@ export class ExecutionEngine {
       network_fee_lamports: "0",
       priority_fee_lamports: "0",
       price_impact_bps: market?.priceImpactBps ?? null,
-      min_bin_id: command.min_bin_id,
-      max_bin_id: command.max_bin_id,
+      min_bin_id: command.min_bin_id ?? null,
+      max_bin_id: command.max_bin_id ?? null,
       // A position that will never be opened is not published.
       position_address: null,
       active_bin_id: market?.activeBinId ?? null,
       token_x_decimals: market?.tokenXDecimals ?? null,
       token_y_decimals: market?.tokenYDecimals ?? null,
       errors: [{ code: error.code, message: error.message, retryable: error.retryable ?? false }],
+      // A refused swap still shows the quote it was refused on (the size of the next part).
+      ...(market === undefined ? {} : swapQuoteOf(command, market)),
     }));
   }
 
@@ -951,12 +1030,38 @@ function isEntry(command: DlmmCommandV2): boolean {
   return command.operation === "OPEN" || command.operation === "ADD";
 }
 
+/** Only an exit may go on without a measured impact: it swaps nothing (D08). */
+function needsMeasuredImpact(command: DlmmCommandV2): boolean {
+  return isEntry(command) || command.operation === "SWAP";
+}
+
+/** The simulation's `swap_quote` of a SWAP; nothing for any other operation. */
+function swapQuoteOf(
+  command: DlmmCommandV2,
+  market: MarketFacts,
+): { swap_quote: SwapQuoteV2 } | Record<string, never> {
+  const swap = market.swap;
+  if (command.operation !== "SWAP" || swap === undefined) {
+    return {};
+  }
+  return {
+    swap_quote: {
+      in_amount: swap.inAmount,
+      out_amount: swap.outAmount,
+      min_out_amount: swap.minOutAmount,
+      fee_amount: swap.feeAmount,
+    },
+  };
+}
+
+const wholeAmount = /^(0|[1-9][0-9]*)$/;
+
 function measuredMarket(command: DlmmCommandV2, market: MarketFacts | undefined): MarketFacts {
   const impact = market?.priceImpactBps;
   if (
     market === undefined ||
     impact === undefined ||
-    (impact === null ? isEntry(command) : !isWhole(impact, 0, 10_000))
+    (impact === null ? needsMeasuredImpact(command) : !isWhole(impact, 0, 10_000))
   ) {
     throw new GatewayError(
       "PRICE_IMPACT_UNAVAILABLE",
@@ -969,6 +1074,16 @@ function measuredMarket(command: DlmmCommandV2, market: MarketFacts | undefined)
     !isWhole(market.tokenYDecimals, 0, 255)
   ) {
     throw new GatewayError("MARKET_STATE_UNAVAILABLE", "LB pair or mint state is unavailable");
+  }
+  if (command.operation === "SWAP") {
+    const swap = market.swap;
+    if (swap === undefined) {
+      throw new GatewayError("PRICE_IMPACT_UNAVAILABLE", "the SDK did not quote the swap");
+    }
+    const amounts = [swap.inAmount, swap.outAmount, swap.minOutAmount, swap.feeAmount];
+    if (!amounts.every((value) => wholeAmount.test(value))) {
+      throw new GatewayError("SWAP_QUOTE_INCOMPLETE", "the SDK quote of the swap is not whole");
+    }
   }
   return Object.freeze({ ...market });
 }
@@ -988,6 +1103,9 @@ function assertPositionBinding(command: DlmmCommandV2, positionAddress: string):
 
 /** The command's own limits checked against what the chain says right now. */
 function marketRejection(command: DlmmCommandV2, market: MarketFacts): Rejection | undefined {
+  if (command.operation === "SWAP") {
+    return swapRejection(command, market);
+  }
   if (!isEntry(command)) {
     // An exit swaps nothing: its quote is reported, never a reason to stay in (D08).
     return undefined;
@@ -1015,6 +1133,36 @@ function marketRejection(command: DlmmCommandV2, market: MarketFacts): Rejection
   }
   if (market.priceImpactBps === null || market.priceImpactBps > command.max_slippage_bps) {
     return { code: "SLIPPAGE_BREACH", message: "quoted price impact exceeds the command limit" };
+  }
+  return undefined;
+}
+
+/**
+ * A sale goes out only whole (the quote consumes exactly `in_amount`), with an output and
+ * a non-zero minimum, and within its own impact limit; the caller sells a smaller part
+ * after `PRICE_IMPACT_BREACH`.
+ */
+function swapRejection(command: DlmmCommandV2, market: MarketFacts): Rejection | undefined {
+  const swap = market.swap;
+  if (swap === undefined || market.priceImpactBps === null) {
+    return { code: "PRICE_IMPACT_UNAVAILABLE", message: "the swap has no measured quote" };
+  }
+  if (
+    swap.inAmount !== command.in_amount ||
+    swap.outAmount === "0" ||
+    swap.minOutAmount === "0" ||
+    BigInt(swap.minOutAmount) > BigInt(swap.outAmount)
+  ) {
+    return {
+      code: "SWAP_QUOTE_INCOMPLETE",
+      message: "the quote does not sell the whole amount for a positive output",
+    };
+  }
+  if (market.priceImpactBps > (command.max_price_impact_bps ?? -1)) {
+    return {
+      code: "PRICE_IMPACT_BREACH",
+      message: "quoted price impact of the swap exceeds the command limit",
+    };
   }
   return undefined;
 }
