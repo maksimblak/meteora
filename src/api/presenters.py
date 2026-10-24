@@ -74,6 +74,27 @@ _ARTIFICIAL_CODE = "ARTIFICIAL_VOLUME_SUSPECTED"
 _ARTIFICIAL_FEES_ROWS = frozenset({"total_fees_sol", "required_total_fees_sol"})
 _TURNOVER_ROW = "pool_hourly_turnover"
 _WASH_ROW = "gmgn_wash_trading"
+# GMGN_UNAVAILABLE (G18, G24): the status row when the reading is not fresh; with a fresh
+# reading, the threshold metrics it lacks - the developer's share is one of them.
+_GMGN_UNAVAILABLE = "GMGN_UNAVAILABLE"
+_GMGN_STATUS_ROW = "gmgn_status"
+_GMGN_REQUIRED_ROWS = frozenset(
+    {
+        "insiders_share",
+        "bundling_share",
+        "phishing_share",
+        "gmgn_top10_holder_share",
+        "developer_share",
+    }
+)
+_FRESH = "FRESH"
+_UNAVAILABLE = "UNAVAILABLE"
+# A token without a name or ticker: its theme could not be checked (flag THEME_UNKNOWN in
+# SHADOW, the missing signal ``theme`` behind GUIDE_SIGNAL_UNKNOWN in APPROVAL and LIVE).
+_THEME_ROW = "theme"
+_UNKNOWN = "UNKNOWN"
+_GUIDE_UNKNOWN = "GUIDE_SIGNAL_UNKNOWN"
+_THEME_UNKNOWN = "THEME_UNKNOWN"
 # GMGN metrics (G18, spec 6.7); top-10 and total fees join them once GMGN reports any.
 _GMGN_MARKERS = ("gmgn", "insider", "bundl", "phish", "developer", "dev_")
 _GMGN_COMPANIONS = ("top10_holder_share", "total_fees_sol")
@@ -184,18 +205,30 @@ def decision_summary(record: DecisionRecord) -> DecisionSummary:
     )
 
 
-def evidence_views(items: Sequence[EvidenceItem], reasons: Iterable[str]) -> list[EvidenceView]:
+def evidence_views(
+    items: Sequence[EvidenceItem], reasons: Iterable[str], flags: Iterable[str] = ()
+) -> list[EvidenceView]:
+    """Rows with the code that marks them; ``flags`` mark the rows a flag is about (the theme
+    a nameless token could not be checked against)."""
+
     fired = set(reasons)
+    raised = set(flags)
     turnover = next((item for item in items if item.name == _TURNOVER_ROW), None)
     cap_rule = (
         _ARTIFICIAL_CODE in fired and turnover is not None and _at_least_threshold(turnover)
+    )
+    status = next((item for item in items if item.name == _GMGN_STATUS_ROW), None)
+    # A fresh GMGN reading is "unavailable" only for the metrics it lacks (G24: an unknown
+    # developer share too); then those rows are marked, not the fresh status.
+    gmgn_gaps = (
+        _GMGN_UNAVAILABLE in fired and status is not None and status.value == _FRESH
     )
     return [
         EvidenceView(
             name=item.name,
             value=item.value,
             threshold=item.threshold,
-            triggered=_triggered(item, fired, cap_rule=cap_rule),
+            triggered=_triggered(item, fired, raised, cap_rule=cap_rule, gmgn_gaps=gmgn_gaps),
             note=labels.evidence_note(item.name, item.value, item.threshold),
         )
         for item in items
@@ -224,7 +257,9 @@ def decision_detail(record: DecisionRecord, plan: PlanRecord | None) -> Decision
     facts = record.facts
     return DecisionDetail(
         decision=decision_summary(record),
-        evidence=evidence_views(decision.evidence, reasons),
+        evidence=evidence_views(
+            decision.evidence, reasons, (flag.value for flag in decision.flags)
+        ),
         score_components=[
             ScoreComponentView(
                 name=component.name,
@@ -364,7 +399,14 @@ def performance_group_view(group: PerformanceGroup) -> PerformanceGroupView:
     return PerformanceGroupView(**group.model_dump())
 
 
-def _triggered(item: EvidenceItem, fired: set[str], *, cap_rule: bool = False) -> bool:
+def _triggered(
+    item: EvidenceItem,
+    fired: set[str],
+    raised: set[str],
+    *,
+    cap_rule: bool = False,
+    gmgn_gaps: bool = False,
+) -> bool:
     if item.name in _SPIKE_MINIMUMS and _SPIKE_CODE in fired:
         value, threshold = _decimal(item.value), _decimal(item.threshold)
         if value is None or (threshold is not None and value < threshold):
@@ -373,6 +415,14 @@ def _triggered(item: EvidenceItem, fired: set[str], *, cap_rule: bool = False) -
         return True
     if item.name == _WASH_ROW:
         return _ARTIFICIAL_CODE in fired and item.value == "UNSAFE"
+    if gmgn_gaps and item.name in _GMGN_REQUIRED_ROWS and item.value == _UNAVAILABLE:
+        return True
+    if gmgn_gaps and item.name == _GMGN_STATUS_ROW:
+        return False
+    if item.name == _THEME_ROW and item.value == _UNKNOWN and (
+        _GUIDE_UNKNOWN in fired or _THEME_UNKNOWN in raised
+    ):
+        return True
     return bool(_TRIGGERS.get(item.name, frozenset()) & fired)
 
 

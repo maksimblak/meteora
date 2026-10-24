@@ -1,14 +1,23 @@
 # guide-v1 thresholds relaxed for the acceptance smoke only (RULESET_OVERRIDES_FILE).
 # A short baseline lets recorded pools leave warm-up after a few sweeps, and the spike and
 # volume thresholds are opened so a shadow position opens on recorded data. The hard
-# filters (freeze authority, blacklist, market cap, organicity) stay as in guide-v1.
+# filters (freeze authority, blacklist, market cap, organicity), the pair shape, the theme,
+# one position per token and the strategy's refusals stay as in guide-v1.
 # Never use this file for a real run: these numbers are not a strategy.
-config_version: "acceptance-relaxed-v1"
+#
+# The recorded sweeps (17 pools, 2026-10-23) are quiet: no token trades the guide's 14 000 USD
+# a minute over the hour (the sustained-volume rule, G24), and no pool has the bin step of
+# about 176 that lets one 70-bin SDK position reach a 70% deep Bid-Ask (D10; the deepest
+# recorded pool, bin step 100, reaches about 50%). So the hourly minimum is opened like the
+# 5m one, and the Bid-Ask minimum depth is lowered to what 70 bins give at bin step 16..25.
+# RANGE_TOO_NARROW still refuses a pool whose 70 bins stay below it (XMR-SOL, bin step 8).
+config_version: "acceptance-relaxed-v2"
 thresholds:
   baseline_points: 3
   minimum_baseline_points: 2
   maximum_history_points: 20
   minimum_volume_per_minute: "10"
+  minimum_hourly_volume_per_minute: "10"
   overvolume_volume_per_minute: "100000000"
   minimum_volume_to_liquidity: "0"
   minimum_short_ratio: "0"
@@ -16,3 +25,4 @@ thresholds:
   minimum_robust_z_score: "0"
   minimum_fee_tvl: "0"
   minimum_score: "0"
+  bid_ask_minimum_depth: "0.10"

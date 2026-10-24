@@ -3,7 +3,8 @@
 The approval itself is ``ExecutionService.approve`` (T05) with a proof signed by the
 same ``EXECUTOR_APPROVAL_SECRET`` the gateway verifies; this desk only adds what the
 operator must see and confirm first: irreversibility, simulation, expiry, costs, the
-plan diff, decision flags (D03/G18) and the manual checklist (G17).
+plan diff, decision flags (D03/G18) and the manual checklist (G17; an entry also asks
+"the chart is organic" and "the theme is not Elon/Trump/politics/a stream", spec 6.8).
 
 Order of an approval: re-authentication -> checklist -> pending phase -> readiness ->
 preview digests -> audit record -> ``approve``. The audit record precedes the state
@@ -209,7 +210,9 @@ class ApprovalDesk:
                 else sized.estimated_loss_base_units,
             ),
             plan_diff=_plan_diff(record, links.plan),
-            checklist=[ChecklistItemView(key=key, label=text) for key, text in labels.CHECKLIST],
+            checklist=[
+                ChecklistItemView(key=key, label=text) for key, text in _checklist(command)
+            ],
             notices=presenters.flag_notices(flags),
             gmgn=[] if decision is None else presenters.gmgn_metrics(decision.decision.evidence),
             decision_id=None if decision is None else decision.decision_id,
@@ -223,8 +226,10 @@ class ApprovalDesk:
         self, command_id: UUID, request: ApprovalRequest, principal: OperatorPrincipal
     ) -> ApprovalResult:
         self._auth.require_reauthentication(request.operator_token, request.confirm_irreversible)
+        # The marks an entry asks for differ from an exit's and a sale's (spec 6.8).
+        record = await self._record(command_id)
         marks = request.checklist.model_dump()
-        missing = [key for key, _ in labels.CHECKLIST if not marks.get(key)]
+        missing = [key for key, _ in _checklist(record.command) if not marks.get(key)]
         if missing:
             raise ApiError(
                 422,
@@ -303,7 +308,7 @@ class ApprovalDesk:
                 "approved_at": now.isoformat(),
                 "expires_at": expires_at.isoformat(),
                 "operator": principal.confirmation_id,
-                "checklist": {key: True for key, _ in labels.CHECKLIST},
+                "checklist": {key: True for key, _ in _checklist(record.command)},
                 "checklist_confirmed_at": now.isoformat(),
                 "comment": request.comment,
                 # A sale card: exactly the amounts and limits the operator approved.
@@ -467,6 +472,16 @@ class ApprovalDesk:
             await self._ctx.repositories.audit.append(refusal)
         except Exception as error:
             self._log.error("approval_refusal_audit_failed", **error_fields(error))
+
+
+def _checklist(command: DlmmCommand) -> tuple[tuple[str, str], ...]:
+    """The manual marks this command asks for: G17 for every approval, plus "the chart is
+    organic" and "the theme is allowed" before an entry (spec 6.8) - not before an exit or
+    the sale after it, which only lower the risk of a coin already bought."""
+
+    if command.operation in ENTRY_OPERATIONS:
+        return labels.ENTRY_CHECKLIST
+    return labels.EXIT_CHECKLIST
 
 
 def _leaves_approval_position(command: DlmmCommand) -> bool:

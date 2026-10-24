@@ -37,12 +37,16 @@ from tests.api.support import (
 )
 from tests.worker.harness import NOW, harness_policy
 
-ALL_MARKS = {
+# G17 (spec 6.6): the marks of every approval - an exit and a sale ask only for these.
+EXIT_MARKS = {
     "twitter_hype": True,
     "developer_supply": True,
     "no_pvp_copies": True,
     "bubblemaps_clusters": True,
 }
+# Spec 6.8 (G23): an entry asks for two more - an organic chart and an allowed theme.
+ENTRY_ONLY_MARKS = {"organic_chart": True, "theme_not_excluded": True}
+ALL_MARKS = {**EXIT_MARKS, **ENTRY_ONLY_MARKS}
 
 
 @pytest.fixture
@@ -124,6 +128,8 @@ def test_preview_shows_irreversibility_simulation_expiry_costs_plan_diff_and_che
         "Запас монет у девелопера проверен",
         "Нет гонки копий монеты (PvP)",
         "Кластеры на Bubblemaps проверены",
+        "График органичный",
+        "Тема не Илон/Трамп/политика/стрим",
     ]
     assert preview["decision_id"] == str(case.decision_id)
     assert [item["message"] for item in preview["notices"]] == [
@@ -145,6 +151,30 @@ def test_approval_without_every_checklist_mark_is_refused(
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "CHECKLIST_INCOMPLETE"
     assert response.json()["error"]["details"]["missing"] == ["bubblemaps_clusters"]
+    assert phase(panel, case) is ExecutionPhase.AWAITING_APPROVAL
+    assert not [
+        event
+        for event in panel.harness.audit.events
+        if event.event_type is EventType.APPROVAL_REQUESTED
+    ]
+
+
+def test_an_entry_without_the_chart_and_theme_marks_is_refused(
+    approval: tuple[Panel, ApprovalCase],
+) -> None:
+    panel, case = approval
+    path = f"/api/v1/approvals/{case.command.command_id}"
+    preview = panel.get(path).json()
+
+    # The four G17 marks alone were enough before spec 6.8; an entry now needs all six.
+    response = panel.bearer(path, approve_body(preview, checklist=EXIT_MARKS))
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "CHECKLIST_INCOMPLETE"
+    assert response.json()["error"]["details"]["missing"] == [
+        "organic_chart",
+        "theme_not_excluded",
+    ]
     assert phase(panel, case) is ExecutionPhase.AWAITING_APPROVAL
     assert not [
         event
@@ -337,7 +367,10 @@ def test_an_exit_is_approved_whatever_its_quote_shows(
     path = f"/api/v1/approvals/{case.command.command_id}"
 
     preview = panel.get(path).json()
-    approved = panel.bearer(path, approve_body(preview))
+    # An exit asks only for the G17 marks: the chart and theme marks are about an entry.
+    approved = panel.bearer(path, approve_body(preview, checklist=EXIT_MARKS))
+
+    assert [item["key"] for item in preview["checklist"]] == list(EXIT_MARKS)
 
     assert preview["operation"] == operation.value
     assert preview["blockers"] == [] and preview["can_approve"] is True
@@ -352,6 +385,7 @@ def test_an_exit_is_approved_whatever_its_quote_shows(
     (event,) = approval_events(panel)
     assert event.payload["stage"] == "approved"
     assert event.payload["price_impact_bps"] == impact
+    assert event.payload["checklist"] == EXIT_MARKS
 
 
 # The desk shows the code the execution service refuses the entry with (one definition).

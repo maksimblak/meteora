@@ -2,8 +2,10 @@
 
 Codes stay the contract (API payloads, audit); this module is presentation only. Every
 code the panel can show has a line here - screening reasons, decision flags, worker and
-gateway readiness, executor refusals, entry admission, depth details and GMGN statuses;
-a code that appears later without one is still shown verbatim rather than hidden.
+gateway readiness, executor refusals, entry admission, depth details, GMGN statuses,
+critical alerts and code-valued evidence - and so does every code the worker writes into
+events and logs for the operator (the sale after an exit, exit reasons, plan and cost
+flags); a code that appears later without one is still shown verbatim rather than hidden.
 """
 
 from collections.abc import Iterable
@@ -114,7 +116,8 @@ FLAG_NOTICES = {
     # G24 (T18).
     "VOLUME_SPIKE": "всплеск объёма в окне 5m — плюс к баллу",
     "TOKEN_VOLUME_POOL_ONLY": (
-        "объём токена — сумма его DLMM-пулов, не GMGN по всем площадкам: проверь в GMGN"
+        "объём токена — сумма его DLMM-пулов Meteora, а не объём токена GMGN, как в Trending "
+        "(нет ключа GMGN или свежего ответа): сверь объём в GMGN"
     ),
     "SNIPERS_HIGH": "много снайперов по GMGN — автор советует подождать",
     "TOKEN_REVIVED": "токену 60+ дней: монета ожила, объёмы обычно быстро пропадают",
@@ -179,9 +182,19 @@ APPROVAL_BLOCKERS = {
     "COMMAND_EXPIRED": "срок команды истёк",
     "SIMULATION_STALE": "симуляция устарела — нужна новая",
     "SIMULATION_FAILED": "симуляция завершилась ошибкой",
-    # ``entry_impact_rejection`` (F2): the execution service's own codes for an entry.
-    "PRICE_IMPACT_UNAVAILABLE": "price impact входа не измерен котировкой executor'а",
+    # ``entry_impact_rejection`` (F2) and ``swap_rejection`` (T17): the execution service's
+    # own codes for an entry and for the sale after an exit.
+    "PRICE_IMPACT_UNAVAILABLE": (
+        "price impact не измерен котировкой executor'а: вход и продажа без него не подтверждаются"
+    ),
     "SLIPPAGE_BREACH": "price impact входа выше допустимого slippage команды",
+    "PRICE_IMPACT_BREACH": (
+        "price impact продажи выше лимита SWAP_MAX_PRICE_IMPACT_BPS — бот продаст часть поменьше"
+    ),
+    "SWAP_QUOTE_INCOMPLETE": (
+        "котировка продажи неполная: продаёт не всю сумму, нулевой выход или минимальный "
+        "выход шире допуска SWAP_SLIPPAGE_BPS"
+    ),
     "ENTRY_ANCHOR_UNAVAILABLE": (
         "источник данных не даёт active bin и decimals токенов: вход в APPROVAL/LIVE закрыт "
         "(D06), новые сделки не строятся"
@@ -194,12 +207,23 @@ EXECUTOR = {
     "ACTIVE_BIN_UNAVAILABLE": "active bin пула не прочитан — вход не строится",
     "POOL_STATE_MISMATCH": "состояние пула on-chain не совпало со снимком",
     "SLIPPAGE_BREACH": "price impact входа выше допустимого slippage команды",
-    "PRICE_IMPACT_UNAVAILABLE": "price impact входа не измерен котировкой SDK",
+    "PRICE_IMPACT_UNAVAILABLE": "price impact не измерен котировкой SDK",
     "WALLET_INSUFFICIENT_BASE_TOKEN": "в кошельке не хватает базового токена для входа",
     "WALLET_INSUFFICIENT_QUOTE_TOKEN": "в кошельке не хватает quote-токена для входа",
     "INSUFFICIENT_FUNDS": "в кошельке не хватает средств (токена, SOL на комиссию или rent)",
     "INSUFFICIENT_LIQUIDITY": "у пула не хватает ликвидности на эталонный размер",
-    "SWAP_QUOTE_INSUFFICIENT_LIQUIDITY": "котировка SDK: ликвидности на размер не хватает",
+    # The sale after an exit (G22, T17/F4): a refused part is retried at half its size.
+    "SWAP_QUOTE_INSUFFICIENT_LIQUIDITY": (
+        "котировка SDK: в пуле не хватает ликвидности на эту часть продажи — бот попробует "
+        "часть вдвое меньше"
+    ),
+    "PRICE_IMPACT_BREACH": (
+        "price impact котировки продажи выше лимита команды — бот попробует часть вдвое меньше"
+    ),
+    "SWAP_QUOTE_INCOMPLETE": "котировка продажи неполная — команда продажи не строится",
+    "SWAP_EXCEEDS_EXIT_RETURNS": (
+        "продажа больше, чем позиция вернула при выходе: executor отказал, ничего не отправлено"
+    ),
     "TOKEN_DECIMALS_MISMATCH": "decimals токенов on-chain не совпали с командой",
     "MARKET_STATE_UNAVAILABLE": "executor не прочитал состояние пула",
     "POSITION_STATE_UNAVAILABLE": "executor не прочитал состояние позиции",
@@ -280,8 +304,144 @@ ALERTS = {
     "POSITION_ACTION_ATTEMPTS_EXHAUSTED": "попытки действия по позиции исчерпаны",
     "POSITION_PARTIALLY_EXECUTED": "выход выполнен частично — нужны действия оператора",
     "GATEWAY_FILL_UNBOOKED": "подтверждённое исполнение не попало в учёт",
-    "POSITION_CONTEXT_MISSING": "нет контекста позиции",
+    "POSITION_CONTEXT_MISSING": (
+        "нет контекста позиции: выход и продажа монеты после выхода не строятся"
+    ),
     "EXECUTION_STATE_UNAVAILABLE": "состояние исполнения недоступно",
+    # The sale of the coin an exit returned (G22, T17/F4). Until the sale ends the position
+    # keeps its slot (CLOSE is booked after it); the unsold coin stays in the wallet.
+    "EXIT_SALE_IMPACT_EXCEEDED": (
+        "монета после выхода не продана: даже самая малая часть выше лимита price impact "
+        "или в пуле нет ликвидности — решение за оператором"
+    ),
+    "EXIT_SALE_FAILED": (
+        "монета после выхода не продана: попытки продажи исчерпаны — решение за оператором"
+    ),
+    "EXIT_SALE_AMOUNT_UNKNOWN": (
+        "сеть не сообщила, сколько монеты вернул выход: продажа не начата, проверь кошелёк"
+    ),
+    "EXIT_SALE_GATEWAY_UNAVAILABLE": (
+        "продажа монеты после выхода ждёт execution gateway — продолжится, когда он ответит"
+    ),
+    "EXIT_SALE_OUTCOME_UNKNOWN": (
+        "исход части продажи неизвестен: продажа и закрытие позиции остановлены, слот "
+        "занят — проверь кошелёк в эксплорере"
+    ),
+    "EXIT_SALE_BLOCKED": (
+        "часть продажи отклонена до записи: монета не продана, нужна проверка оператора"
+    ),
+}
+
+# Steps of a position's ledger (position page, ``LedgerKind``).
+LEDGER_KIND = {
+    "OPEN": "вход",
+    "ADD": "добавление ликвидности",
+    "REMOVE": "частичный выход",
+    "CLOSE": "закрытие",
+    "SWAP": "продажа монеты после выхода",
+}
+
+# Where the sale of the coin one confirmed exit returned stands (G22, ``SaleStatus``).
+SALE_STATUS = {
+    "DISABLED": "продажа выключена (SWAP_AFTER_EXIT=false): монета остаётся в кошельке",
+    "NOT_REQUIRED": "выход не вернул монету — продавать нечего",
+    "PENDING": "продажа ждёт: расчёта сети, сверки исхода или execution gateway",
+    "AWAITING_APPROVAL": "часть продажи ждёт подтверждения оператора",
+    "SELLING": "монета продаётся по частям",
+    "SOLD": "монета продана в quote-токен",
+    "UNSOLD": "монета не продана и осталась в кошельке — решение за оператором",
+}
+
+# ``SaleProgress.detail``: why a sale waits or how it ended (T17, F4).
+SALE_DETAIL = {
+    "SETTLEMENT_PENDING": "ждём, пока сеть сообщит, сколько монеты вернул выход",
+    "SALE_SETTLEMENT_PENDING": "ждём расчёт сети по проданной части",
+    "REDUCTION_SALE_PENDING": "закрытие ждёт конца продажи после частичного выхода",
+    "NEXT_PART": "следующая часть продажи",
+    "AMOUNT_UNKNOWN": "сеть не сообщила, сколько монеты вернул выход",
+    "PRICE_IMPACT_EXCEEDED": "даже самая малая часть выше лимита price impact",
+    "ATTEMPTS_EXHAUSTED": "попытки продажи исчерпаны",
+    "GATEWAY_UNAVAILABLE": "execution gateway недоступен",
+    "SALE_OUTCOME_UNKNOWN": "исход части продажи неизвестен — только сверка, без повтора",
+    "SALE_BLOCKED": "часть продажи отклонена до записи",
+    "CONTEXT_MISSING": "нет контекста позиции",
+    "AWAITING_APPROVAL": "часть продажи ждёт подтверждения",
+}
+
+# Why the monitor reduces or closes a position (``PositionReason``; spec 6.5, 6.8).
+POSITION_REASON = {
+    "KILL_SWITCH_ACTIVE": "kill switch с политикой ORDERLY_EXIT",
+    "RANGE_BREACH": "цена вышла из диапазона позиции",
+    "MAX_HOLDING_PERIOD": "истёк срок удержания (Bid-Ask 24 ч, Spot на ATH 3 ч, сверхобъём 30 мин)",
+    "VOLUME_DECAY": "объём упал против входа",
+    "FEE_DECAY": "комиссии пула упали против входа",
+    "TVL_COMPETITION": "в пул пришло много конкурирующей ликвидности",
+    "NEAR_RANGE_EDGE": "цена у края диапазона",
+    "PRICE_SHOCK": "ценовой шок",
+    "TOKEN_RISK_DETERIORATED": "риск токена ухудшился",
+    "TOKEN_RISK_UNKNOWN": "риск токена стал неизвестен",
+    "MARKET_DATA_UNSAFE": "данные рынка ненадёжны",
+    "FEE_SIGNAL_UNKNOWN": "сигнал комиссий неизвестен",
+    "REBALANCE_AFTER_COSTS": "ребаланс выгоден после издержек",
+    "CLOSE_BEATS_REBALANCE": "закрыть выгоднее, чем ребалансировать",
+    "TAKE_PROFIT": (
+        "тейк-профит: net P&L с комиссиями достиг цели плана (5% или 3% у сверхобъёма; "
+        "только SHADOW)"
+    ),
+    "DEV_SOLD": "девелопер продал монету (GMGN: статус «продал» или доля упала вдвое)",
+}
+
+# What a plan was decided without (``StrategyFlag``, T19).
+STRATEGY_FLAG = {
+    "ATH_POOL_ONLY": "ATH взят у пула, а не у токена GMGN (нет ключа или свежего ответа)",
+}
+
+# ``CommandConfirmed.cost_model_flags`` (F4): costs SHADOW could not price.
+COST_MODEL_FLAGS = {
+    "PRIORITY_FEE_UNPRICED": (
+        "priority fee не учтён: пул не к wSOL, комиссию в SOL нечем пересчитать в quote-токен"
+    ),
+}
+
+# ``PositionActionProposed.take_profit`` (F4).
+TAKE_PROFIT_STATE = {
+    "UNMEASURED": (
+        "тейк-профит не срабатывает: вне SHADOW фактический net P&L позиции не измеряется"
+    ),
+}
+
+# Evidence rows whose value is a code: the Russian line next to it (G24, F5, T19).
+_EVIDENCE_VALUES: dict[str, dict[str, str]] = {
+    "ath_source": {
+        "GMGN_TOKEN": "ATH токена из GMGN",
+        **STRATEGY_FLAG,
+    },
+    "pool_pair": {
+        "TOKEN_FIRST": "монета первой, quote-токен второй — рабочая пара",
+        "TOKEN_SECOND": "монета второй (SOL-МОНЕТА): вход не поддержан",
+        "QUOTE_ONLY": "оба токена — SOL/USDC/USDT, монеты нет",
+        "NO_QUOTE": "в паре нет SOL, USDC или USDT",
+    },
+    "token_volume_source": {
+        "GMGN": "объём токена GMGN, как в Trending",
+        "DLMM_POOLS": "сумма DLMM-пулов токена на Meteora (без GMGN)",
+        "PENDING": "GMGN спрашивается только после дешёвых фильтров — пока сумма пулов",
+    },
+    "token_volume_rank_source": {
+        "GMGN": "ранг по объёму токена GMGN из кэша",
+        "DLMM_POOLS": "ранг по сумме DLMM-пулов токена",
+        "PENDING": "ранг по сумме DLMM-пулов токена",
+    },
+    "market_cap_source": {
+        "GMGN": "капитализация из GMGN",
+        "DATA_API": "капитализация из Meteora Data API",
+        "UNKNOWN": "капитализацию не дал ни один источник",
+    },
+    "developer_status": {
+        "HOLDING": "девелопер держит монету",
+        "SOLD": "девелопер продал монету",
+        "UNAVAILABLE": "статус девелопера неизвестен (нет свежего ответа GMGN)",
+    },
 }
 
 # ``gmgn_status`` reasons (T16 OpenAPI and the browser service), by exact code or family.
@@ -317,13 +477,22 @@ _GMGN_GENERIC = "GMGN недоступен"
 # Readiness (/health/ready, gateway, approval desk) shows codes from any of these tables.
 _READINESS_TABLES = (READINESS, APPROVAL_BLOCKERS, EXECUTOR)
 
-# G17 (spec 6.6): what the bot cannot see; every mark is required for an approval.
-CHECKLIST = (
+# G17 (spec 6.6): what the bot cannot see; every mark is required for any approval - an
+# entry, an exit and the sale after an exit.
+EXIT_CHECKLIST = (
     ("twitter_hype", "Twitter и хайп проверены"),
     ("developer_supply", "Запас монет у девелопера проверен"),
     ("no_pvp_copies", "Нет гонки копий монеты (PvP)"),
     ("bubblemaps_clusters", "Кластеры на Bubblemaps проверены"),
 )
+# Spec 6.8 (G23, No 11-14): an entry asks for two more marks.
+ENTRY_CHECKLIST = (
+    *EXIT_CHECKLIST,
+    ("organic_chart", "График органичный"),
+    ("theme_not_excluded", "Тема не Илон/Трамп/политика/стрим"),
+)
+# Every mark an approval request can carry (the web form reads each of them).
+CHECKLIST = ENTRY_CHECKLIST
 
 
 def label(table: dict[str, str], code: str) -> str:
@@ -373,7 +542,7 @@ def evidence_note(name: str, value: str, threshold: str | None) -> str | None:
         return gmgn_status_label(value)
     if name == "depth_source" and threshold:
         return DEPTH_DETAIL.get(threshold) or executor_label(threshold)
-    return None
+    return _EVIDENCE_VALUES.get(name, {}).get(value)
 
 
 def flag_notices(codes: Iterable[str]) -> list[str]:

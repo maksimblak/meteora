@@ -1,15 +1,29 @@
 """F3 (C4, spec 9): every code the operator can meet in the panel has a Russian line."""
 
 import re
+from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 
+from src.accounting.models import LedgerKind
 from src.api import labels
-from src.api.presenters import evidence_views, flag_notices
+from src.api.presenters import alert_view, evidence_views, flag_notices
 from src.domain.risk.models import RiskReason
-from src.domain.screening.models import DecisionFlag, EvidenceItem, RejectionCode
+from src.domain.screening.models import (
+    DecisionFlag,
+    EvidenceItem,
+    RejectionCode,
+    TokenVolumeSource,
+)
+from src.domain.screening.pairs import PairShape
+from src.domain.strategy.models import PositionReason, StrategyFlag
+from src.market.models import DeveloperStatus
+from src.modes.models import CriticalAlert
+from src.worker.execution import SaleStatus
 
 CYRILLIC = re.compile(r"[А-Яа-яЁё]")
+NOW = datetime(2026, 10, 24, 12, 0, tzinfo=UTC)
 
 # Worker readiness (src/observability/health.py, WorkerHealthProbe) as /health/ready lists it.
 WORKER_READINESS = (
@@ -60,6 +74,51 @@ EXECUTOR_CODES = (
     "QUOTE_FAILED",
     "ENTRY_ANCHOR_UNAVAILABLE",
     "EXECUTION_GATEWAY_NOT_CONFIGURED",
+    # The sale after an exit (G22, T17/F4): the executor's and ``swap_rejection``'s codes.
+    "PRICE_IMPACT_BREACH",
+    "SWAP_QUOTE_INCOMPLETE",
+    "SWAP_EXCEEDS_EXIT_RETURNS",
+)
+# Critical alerts the worker, recovery and mode service raise (src/worker, src/recovery,
+# src/modes), with the sale's own (T17, F4: the sale of what an exit returned).
+ALERT_CODES = (
+    "DAILY_STOP_TRIGGERED",
+    "KILL_SWITCH_ACTIVE",
+    "EXECUTION_RECOVERY_REQUIRED",
+    "DECISION_PERSISTENCE_FAILED",
+    "AUDIT_PERSISTENCE_FAILED",
+    "PLAN_PERSISTENCE_FAILED",
+    "ENTRY_FILL_UNTRACKED",
+    "ENTRY_POSITION_UNKNOWN",
+    "EXIT_REQUIRES_EXECUTION_GATEWAY",
+    "EXIT_GATEWAY_UNAVAILABLE",
+    "POSITION_ACTION_FAILED",
+    "POSITION_ACTION_ATTEMPTS_EXHAUSTED",
+    "POSITION_PARTIALLY_EXECUTED",
+    "GATEWAY_FILL_UNBOOKED",
+    "POSITION_CONTEXT_MISSING",
+    "EXIT_SALE_IMPACT_EXCEEDED",
+    "EXIT_SALE_FAILED",
+    "EXIT_SALE_AMOUNT_UNKNOWN",
+    "EXIT_SALE_GATEWAY_UNAVAILABLE",
+    "EXIT_SALE_OUTCOME_UNKNOWN",
+    "EXIT_SALE_BLOCKED",
+)
+# ``SaleProgress.detail`` of a sale (src/worker/execution.py, T17/F4) as logs and the
+# ``PositionClosed.exit_sale`` event carry it.
+SALE_DETAILS = (
+    "SETTLEMENT_PENDING",
+    "SALE_SETTLEMENT_PENDING",
+    "REDUCTION_SALE_PENDING",
+    "NEXT_PART",
+    "AMOUNT_UNKNOWN",
+    "PRICE_IMPACT_EXCEEDED",
+    "ATTEMPTS_EXHAUSTED",
+    "GATEWAY_UNAVAILABLE",
+    "SALE_OUTCOME_UNKNOWN",
+    "SALE_BLOCKED",
+    "CONTEXT_MISSING",
+    "AWAITING_APPROVAL",
 )
 # Entry admission (EntryGate / ModeRepository.admit_entry) and the sizer's caps (RiskReason).
 ADMISSION = ("RISK_DAY_NOT_OPENED", "KILL_SWITCH_ACTIVE", "DAILY_STOP_REACHED",
@@ -123,9 +182,88 @@ def test_every_executor_refusal_has_a_russian_line(code: str) -> None:
     russian(labels.executor_label(code), code)
 
 
-@pytest.mark.parametrize("code", ["SLIPPAGE_BREACH", "PRICE_IMPACT_UNAVAILABLE"])
-def test_the_entry_impact_blockers_of_the_approval_desk_are_labelled(code: str) -> None:
+@pytest.mark.parametrize(
+    "code",
+    [
+        "SLIPPAGE_BREACH",
+        "PRICE_IMPACT_UNAVAILABLE",
+        # ``swap_rejection`` (T17): the blockers of a sale card.
+        "PRICE_IMPACT_BREACH",
+        "SWAP_QUOTE_INCOMPLETE",
+    ],
+)
+def test_the_impact_blockers_of_the_approval_desk_are_labelled(code: str) -> None:
     russian(labels.readiness_label(code), code)
+
+
+@pytest.mark.parametrize("code", ALERT_CODES)
+def test_every_critical_alert_has_a_russian_line_on_the_panel(code: str) -> None:
+    alert = CriticalAlert(
+        alert_id=uuid4(), code=code, message="english text of the worker", created_at=NOW
+    )
+
+    russian(alert_view(alert).label, code)
+
+
+@pytest.mark.parametrize("status", [item.value for item in SaleStatus])
+def test_every_sale_status_has_a_russian_line(status: str) -> None:
+    russian(labels.label(labels.SALE_STATUS, status), status)
+
+
+@pytest.mark.parametrize("detail", SALE_DETAILS)
+def test_every_sale_detail_has_a_russian_line(detail: str) -> None:
+    russian(labels.label(labels.SALE_DETAIL, detail), detail)
+
+
+@pytest.mark.parametrize("kind", [item.value for item in LedgerKind])
+def test_every_lifecycle_step_of_a_position_has_a_russian_line(kind: str) -> None:
+    # SWAP (T17): the sale of the coin an exit returned, booked with the closing exit.
+    russian(labels.label(labels.LEDGER_KIND, kind), kind)
+
+
+@pytest.mark.parametrize("reason", [item.value for item in PositionReason])
+def test_every_position_exit_reason_has_a_russian_line(reason: str) -> None:
+    # TAKE_PROFIT and DEV_SOLD (T19) among them.
+    russian(labels.label(labels.POSITION_REASON, reason), reason)
+
+
+@pytest.mark.parametrize(
+    ("table", "code"),
+    [
+        ("COST_MODEL_FLAGS", "PRIORITY_FEE_UNPRICED"),  # F4: a pool not quoted in wSOL
+        ("TAKE_PROFIT_STATE", "UNMEASURED"),  # F4: no take profit outside SHADOW
+        *(("STRATEGY_FLAG", item.value) for item in StrategyFlag),  # ATH_POOL_ONLY (T19)
+    ],
+)
+def test_the_event_and_plan_codes_of_t19_and_f4_have_russian_lines(table: str, code: str) -> None:
+    russian(labels.label(getattr(labels, table), code), code)
+
+
+@pytest.mark.parametrize(
+    ("name", "values"),
+    [
+        ("ath_source", ["GMGN_TOKEN", *(item.value for item in StrategyFlag)]),
+        ("pool_pair", [item.value for item in PairShape]),
+        ("token_volume_source", [item.value for item in TokenVolumeSource]),
+        ("token_volume_rank_source", [item.value for item in TokenVolumeSource]),
+        ("market_cap_source", ["GMGN", "DATA_API", "UNKNOWN"]),
+        ("developer_status", [*(item.value for item in DeveloperStatus), "UNAVAILABLE"]),
+    ],
+)
+def test_every_code_valued_evidence_row_is_explained(name: str, values: list[str]) -> None:
+    for value in values:
+        (row,) = evidence_views([EvidenceItem(name=name, value=value)], ())
+        assert row.note is not None, (name, value)
+        russian(row.note, value)
+
+
+def test_the_pool_only_token_volume_names_its_real_source() -> None:
+    (notice,) = flag_notices(["TOKEN_VOLUME_POOL_ONLY"])
+
+    # GMGN's token volume is what the author reads in Trending; nothing was checked about
+    # "every venue", so the line must not claim it.
+    assert "по всем площадкам" not in notice.message
+    assert "объём токена GMGN, как в Trending" in notice.message
 
 
 def test_the_unused_impact_blocker_codes_are_gone() -> None:

@@ -53,7 +53,7 @@
   <table>
     <tr><th>Время</th><th>Шаг</th><th>Цена</th><th>Капитал</th><th>Реализовано</th><th>Комиссии</th><th>Slippage</th><th>Сеть</th><th>Jito</th></tr>
     {% for step in detail.lifecycle %}
-      <tr><td>{{ step.occurred_at | dt }}</td><td>{{ step.kind }}</td><td>{{ step.price | dec }}</td><td>{{ step.capital_delta_base_units | dec(0) }}</td><td>{{ step.realized_pnl_base_units | dec(0) }}</td><td>{{ step.fee_income_base_units | dec(0) }}</td><td>{{ step.slippage_base_units | dec(0) }}</td><td>{{ step.network_base_units | dec(0) }}</td><td>{{ step.jito_base_units | dec(0) }}</td></tr>
+      <tr><td>{{ step.occurred_at | dt }}</td><td>{{ labels.label(labels.LEDGER_KIND, step.kind) }} <code>{{ step.kind }}</code></td><td>{{ step.price | dec }}</td><td>{{ step.capital_delta_base_units | dec(0) }}</td><td>{{ step.realized_pnl_base_units | dec(0) }}</td><td>{{ step.fee_income_base_units | dec(0) }}</td><td>{{ step.slippage_base_units | dec(0) }}</td><td>{{ step.network_base_units | dec(0) }}</td><td>{{ step.jito_base_units | dec(0) }}</td></tr>
     {% endfor %}
   </table>
   {% else %}<p class="muted">Шагов учёта нет.</p>{% endif %}

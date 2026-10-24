@@ -11,7 +11,8 @@ no executor secrets. The deployed worker syncs recorded live sweeps from ``fixtu
 
 1. migrations at head and every service healthy;
 2. the fixture universe ingested through the real Data API adapter;
-3. a candidate rejected by a hard filter (USDC with a live freeze authority);
+3. a candidate rejected by a hard filter (USDC with a live freeze authority) and by the
+   guide-v1 pair and theme rules (USDC/SOL is two quote tokens, TRUMP an excluded theme);
 4. a shadow position opened, kept across a worker/api restart and closed exactly once;
 5. the web panel and the API, operator login, CSRF and the kill switch;
 6. state (kill switch, positions, decisions) after a full stop and start, worker resumed.
@@ -39,6 +40,7 @@ PORT = int(os.environ.get("ACCEPTANCE_API_PORT", "18080"))
 KEEP = os.environ.get("ACCEPTANCE_KEEP") == "1"
 FIXTURE_POOLS = 17
 USDC_SOL = "HRYEjwdo3bZ1TpXKWKcezqiwSV2Ywuh4LxMa2PzoCnG6"
+TRUMP_USDC = "3C5YE97HADPDxZehYq9Cis8AXr9aNyrUsczKzE1nDbW9"
 COMPOSE = [
     "docker",
     "compose",
@@ -217,9 +219,18 @@ def test_a_candidate_is_rejected_by_a_hard_filter(stack: Stack) -> None:
     decision = wait_for("a REJECT decision for USDC/SOL", rejected, timeout=240)
     codes = {reason["code"] for reason in decision["reasons"]}
     assert "FREEZE_AUTHORITY_PRESENT" in codes
+    assert "PAIR_OF_QUOTE_TOKENS" in codes  # F5: two quote tokens are no coin to provide for
     assert decision["mode"] == "SHADOW" and decision["ruleset_version"] == "guide-v1"
     detail = stack.json(f"/api/v1/decisions/{decision['decision_id']}")
     assert detail  # the full decision record (facts, thresholds, evidence) is served
+
+    # The theme filter of guide-v1 (spec 6.8) on a recorded pool: TRUMP is an excluded word.
+    def theme_rejected() -> dict[str, Any] | None:
+        page = stack.json(f"/api/v1/decisions?status=REJECT&pool={TRUMP_USDC}&limit=5")
+        return page["items"][0] if page["items"] else None
+
+    trump = wait_for("a REJECT decision for TRUMP-USDC", theme_rejected, timeout=240)
+    assert "THEME_EXCLUDED" in {reason["code"] for reason in trump["reasons"]}
 
 
 def test_a_shadow_position_survives_a_restart_and_closes_once(stack: Stack) -> None:

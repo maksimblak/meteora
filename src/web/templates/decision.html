@@ -33,7 +33,7 @@
       {% if s.admission_notices %}<ul>{% for item in s.admission_notices %}<li>{{ item.message }} <code>{{ item.code }}</code></li>{% endfor %}</ul>{% endif %}
       {% if s.selection_evidence %}
         <table><tr><th>Признак выбора</th><th>Значение</th><th>Порог</th></tr>
-        {% for item in s.selection_evidence %}<tr><td>{{ item.name }}</td><td>{{ item.value }}</td><td>{{ item.threshold or '—' }}</td></tr>{% endfor %}
+        {% for item in s.selection_evidence %}<tr><td>{{ item.name }}</td><td>{{ item.value }}{% if item.note %}<div class="muted small">{{ item.note }}</div>{% endif %}</td><td>{{ item.threshold or '—' }}</td></tr>{% endfor %}
         </table>
       {% endif %}
     {% else %}

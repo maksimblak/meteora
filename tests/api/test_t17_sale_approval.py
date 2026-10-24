@@ -201,6 +201,8 @@ def test_the_sale_card_shows_amount_expected_output_minimum_impact_and_its_limit
         "slippage_bps": 100,
     }
     assert preview["blockers"] == [] and preview["can_approve"] is True
+    # The exit's G17 checklist; the chart and theme marks of an entry (spec 6.8) are not asked.
+    assert [item["key"] for item in preview["checklist"]] == list(ALL_MARKS)
     diff = {row["field"]: row for row in preview["plan_diff"]}
     assert diff["price_impact_bps"]["planned"] == "≤ 300"
     assert diff["price_impact_bps"]["matches"] is True

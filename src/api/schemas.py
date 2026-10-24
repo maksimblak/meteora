@@ -484,6 +484,9 @@ class ChecklistMarks(ApiModel):
     developer_supply: bool = False
     no_pvp_copies: bool = False
     bubblemaps_clusters: bool = False
+    # Spec 6.8 (G23): asked before an entry only.
+    organic_chart: bool = False
+    theme_not_excluded: bool = False
 
 
 class ApprovalRequest(ApiModel):

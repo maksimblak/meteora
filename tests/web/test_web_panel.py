@@ -28,6 +28,9 @@ CHECKLIST = {
     "developer_supply": "on",
     "no_pvp_copies": "on",
     "bubblemaps_clusters": "on",
+    # An entry's two marks of spec 6.8 (G23).
+    "organic_chart": "on",
+    "theme_not_excluded": "on",
 }
 
 
@@ -146,11 +149,15 @@ def test_approval_page_shows_checklist_flags_irreversibility_and_survives_refres
         "Запас монет у девелопера проверен",
         "Нет гонки копий монеты (PvP)",
         "Кластеры на Bubblemaps проверены",
+        "График органичный",
+        "Тема не Илон/Трамп/политика/стрим",
         "Издержки",
         "План и команда",
         "Подтверждение будет действовать до",
     ):
         assert fragment in page
+    assert 'name="organic_chart" required' in page
+    assert 'name="theme_not_excluded" required' in page
     form = {
         "csrf_token": csrf,
         "approval_id": hidden(page, "approval_id"),
@@ -159,13 +166,20 @@ def test_approval_page_shows_checklist_flags_irreversibility_and_survives_refres
         "operator_token": OPERATOR_TOKEN,
         "confirm_irreversible": "on",
     }
+    g17_only = {
+        key: value
+        for key, value in CHECKLIST.items()
+        if key not in {"organic_chart", "theme_not_excluded"}
+    }
 
     incomplete = panel.post(path, data={**form, "twitter_hype": "on"})
+    without_chart_and_theme = panel.post(path, data={**form, **g17_only})
     approved = panel.post(path, data={**form, **CHECKLIST})
     resent = panel.post(path, data={**form, **CHECKLIST})
     refreshed = panel.get(approved.headers["location"])
 
     assert incomplete.status_code == 422 and "Отметьте все пункты" in incomplete.text
+    assert without_chart_and_theme.status_code == 422
     assert approved.status_code == 303
     assert approved.headers["location"] == f"{path}?done=approved"
     assert resent.status_code == 303
