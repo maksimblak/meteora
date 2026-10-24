@@ -18,6 +18,11 @@ window summed over those rereads by the F1 rules, nothing of them stored with th
 universe's history; its net P&L of leaving now (the fills' accounting: fees, slippage,
 priority fees, the sale) is checked against the plan's take profit; and with a GMGN source
 the developer's status and share are read every ``developer_interval`` (5 min).
+
+The take profit applies to SHADOW positions only: the net P&L above is the SHADOW model,
+and the actual value of an APPROVAL/LIVE position is not measured, so a real position is
+never closed in a loss on the model's word - its review carries ``take_profit=UNMEASURED``
+and the worker logs ``take_profit_unmeasured`` once per position (F4).
 """
 
 from dataclasses import dataclass
@@ -81,6 +86,9 @@ from src.worker.portfolio import RiskDayKeeper, ShadowPortfolio
 _BPS = Decimal(10_000)
 DEFAULT_SNAPSHOT_INTERVAL = timedelta(seconds=30)
 DEFAULT_DEVELOPER_INTERVAL = timedelta(minutes=5)
+# ``PositionActionProposed.take_profit`` of a non-SHADOW position whose plan has a take
+# profit: its actual net P&L is not measured, so the take profit does not fire.
+TAKE_PROFIT_UNMEASURED = "UNMEASURED"
 
 
 class PoolSnapshotSource(Protocol):
@@ -170,6 +178,7 @@ class PositionCycle:
         self._above_from: dict[str, datetime] = {}
         self._developer_watch: dict[str, _DeveloperWatch] = {}
         self._plan_exits: dict[str, _PlanExit] = {}
+        self._take_profit_unmeasured: set[str] = set()
         self._monitor = PositionMonitor(
             volume_decay_ratio=policy.strategy.volume_decay_ratio,
             price_shock_fraction=policy.strategy.price_shock_fraction,
@@ -272,6 +281,14 @@ class PositionCycle:
         plan_exit = await self._plan_exit(context)
         state = _state(context, plan_exit)
         close_cost = self._cost(valuation, market)
+        # A real position's worth is not measured here (the executor values no position):
+        # its take profit never fires on the SHADOW model, and the review says so (T19).
+        take_profit_unmeasured = (
+            position.mode is not TradingMode.SHADOW
+            and plan_exit.take_profit_fraction is not None
+        )
+        if take_profit_unmeasured:
+            self._note_take_profit_unmeasured(position_id)
         signals = PositionSignals(
             current_fee_tvl=_fee_tvl(market),
             baseline_fee_tvl=context.baseline_fee_tvl,
@@ -282,19 +299,30 @@ class PositionCycle:
             estimated_close_cost_base_units=close_cost,
             expected_remaining_fee_income_base_units=0,
             above_range_since=await self._above_since(state, context, market, now),
-            net_pnl_fraction=self._net_pnl_fraction(position, plan_exit, market, now),
+            net_pnl_fraction=(
+                None
+                if take_profit_unmeasured
+                else self._net_pnl_fraction(position, plan_exit, market, now)
+            ),
             developer_sold=await self._developer_sold(context, now),
         )
         policy = self._modes.mode_state().active_kill_switch_policy
         action = _under_kill_switch(self._monitor.evaluate(state, market, risk, signals), policy)
         reasons = tuple(reason.value for reason in action.reasons)
+        payload: dict[str, object] = {
+            "position_id": position_id,
+            "action": action.kind.value,
+            "reasons": list(reasons),
+        }
+        if take_profit_unmeasured:
+            payload["take_profit"] = TAKE_PROFIT_UNMEASURED
         proposed = audit_event(
             EventType.POSITION_ACTION_PROPOSED,
             now,
             uuid5(NAMESPACE_URL, f"position:{position_id}"),
             correlation,
             None,
-            {"position_id": position_id, "action": action.kind.value, "reasons": list(reasons)},
+            payload,
         )
         try:
             await self._audit.append(proposed)
@@ -431,6 +459,19 @@ class PositionCycle:
         self._fresh[pool] = derived
         return derived
 
+    def _note_take_profit_unmeasured(self, position_id: str) -> None:
+        """Once per open position: its take profit is off, the operator sees why."""
+
+        if position_id in self._take_profit_unmeasured:
+            return
+        self._take_profit_unmeasured.add(position_id)
+        self._log.warning(
+            "take_profit_unmeasured",
+            position_id=position_id,
+            reason="the actual value of a non-SHADOW position is not measured; "
+            "its take profit does not fire",
+        )
+
     def _net_pnl_fraction(
         self,
         position: ShadowPosition,
@@ -440,7 +481,8 @@ class PositionCycle:
     ) -> Decimal | None:
         """Net P&L of leaving now over the capital, as the SHADOW exit would book it (fees
         earned, slippage, network and priority fees, the sale of the returned base token);
-        only for a plan with a take profit."""
+        only for a plan with a take profit and only for a SHADOW position - a real one is
+        never closed on this model (``TAKE_PROFIT_UNMEASURED``)."""
 
         if plan.take_profit_fraction is None or plan.bins is None:
             return None
@@ -509,6 +551,7 @@ class PositionCycle:
             del self._plan_exits[position_id]
         for position_id in set(self._above_from) - open_ids:
             del self._above_from[position_id]
+        self._take_profit_unmeasured &= open_ids
         pools ={pool for position_id, pool in self._pools.items() if position_id in open_ids}
         self._pools = {key: value for key, value in self._pools.items() if key in open_ids}
         for pool in set(self._fresh) - pools:

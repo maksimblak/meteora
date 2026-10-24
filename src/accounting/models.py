@@ -23,9 +23,10 @@ class CostModel(BaseModel):
     since its last fill on top of it (``shadow_fee_income``).
 
     ``priority_fee_lamports`` (spec 6.8, No 49): the priority fee of one transaction - the
-    executor's ceiling ``PRIORITY_FEE_MAX_LAMPORTS``, so SHADOW never pays less than LIVE may.
-    Lamports are quote base units only in a pool quoted in wrapped SOL; the broker books it
-    there, with the tip, on the entry, the exit and the sale (``priority_fee_base_units``)."""
+    worker's estimate (guide-v1 ``shadow_priority_fee_lamports``), never above the executor's
+    ceiling ``PRIORITY_FEE_MAX_LAMPORTS``. Lamports are quote base units only in a pool quoted
+    in wrapped SOL; the broker books it there, with the tip, on the entry, the exit and the
+    sale (``priority_fee_base_units``), and flags it unpriced elsewhere (``cost_model_flags``)."""
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 

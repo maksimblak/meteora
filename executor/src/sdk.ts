@@ -120,6 +120,8 @@ const MeteoraDlmm = require("@meteora-ag/dlmm") as MeteoraDlmmFactory & {
 const BN = require("bn.js") as BigNumberConstructor;
 
 const quoteMethods = ["swapQuote", "swapQuoteExactOut", "getBinArrayForSwap", "getPosition", "swap"];
+/** The official SDK's quote error (`DlmmSdkError.name`) when the bin arrays cannot fill it. */
+const INSUFFICIENT_LIQUIDITY = "SWAP_QUOTE_INSUFFICIENT_LIQUIDITY";
 
 /** True when the installed official SDK exposes the quote API price impact is measured with. */
 export function officialQuotesAvailable(): boolean {
@@ -321,7 +323,10 @@ export class OfficialMeteoraDlmmBoundary implements SdkBoundary {
    * measures the impact and the output; the transaction is the official `swap` over the
    * quote's bin arrays with the quoted output less the command's slippage as its
    * minimum, so the chain refuses a worse fill. A quote that cannot be made refuses the
-   * swap (`PRICE_IMPACT_UNAVAILABLE`) - a sale is never sent unmeasured.
+   * swap (`PRICE_IMPACT_UNAVAILABLE`) - a sale is never sent unmeasured - except when the
+   * SDK says the pool's bin arrays cannot fill the amount: that refusal keeps the SDK's own
+   * code (`SWAP_QUOTE_INSUFFICIENT_LIQUIDITY`), so the caller sells a smaller part, as after
+   * `PRICE_IMPACT_BREACH`, instead of repeating the same size.
    */
   async #swap(
     pool: MeteoraPoolClient,
@@ -346,7 +351,10 @@ export class OfficialMeteoraDlmmBoundary implements SdkBoundary {
         throw new Error("the quote has no output or bin arrays");
       }
       quote = quoted;
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.name === INSUFFICIENT_LIQUIDITY) {
+        throw new GatewayError(INSUFFICIENT_LIQUIDITY, "the pool has no liquidity for the whole part");
+      }
       throw new GatewayError("PRICE_IMPACT_UNAVAILABLE", "the official SDK quote is unavailable");
     }
     let consumed: bigint;
@@ -453,7 +461,7 @@ export class OfficialMeteoraQuoter implements PoolQuoter {
     try {
       quote = client.swapQuote(new BN(inAmount.toString()), swapForY, new BN(0), binArrays);
     } catch (error) {
-      if (error instanceof Error && error.name === "SWAP_QUOTE_INSUFFICIENT_LIQUIDITY") {
+      if (error instanceof Error && error.name === INSUFFICIENT_LIQUIDITY) {
         throw new InsufficientLiquidityError(market);
       }
       throw error;

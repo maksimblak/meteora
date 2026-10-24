@@ -148,6 +148,10 @@ describe("execution contract corpus V2: swap and settlement extension", () => {
       fee_amount: "2500000",
     });
     expect(simulations[2]?.swap_quote).toBeUndefined();
+    // F4: a quote refused for the pool's liquidity keeps the SDK's code (the part is split).
+    expect(simulations[3]?.errors.map((error) => error.code)).toEqual([
+      "SWAP_QUOTE_INSUFFICIENT_LIQUIDITY",
+    ]);
     expect(simulations.map((value) => simulationDigest(value))).toEqual(
       v2.swap_simulation_digests,
     );

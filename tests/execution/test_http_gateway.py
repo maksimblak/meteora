@@ -384,6 +384,27 @@ def test_executor_rejections_are_definitive_and_never_leak_the_token() -> None:
     assert INTERNAL_CREDENTIAL not in str(raised.value) and MODE_CREDENTIAL not in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    "refusal", CORPUS["submit_refusals"], ids=lambda item: str(item["body"]["error"])
+)
+def test_corpus_submit_refusals_map_to_their_shared_outcome(refusal: dict[str, Any]) -> None:
+    """F4: the executor's refusal of a sale beyond its exits' returns (engine.ts) sent
+    nothing - a definitive rejection with its own code; a key conflict stays unknown."""
+
+    gw, _ = gateway(lambda request: httpx.Response(refusal["status"], json=refusal["body"]))
+    command = corpus_command(0)
+
+    expected = ExecutionOutcomeUnknown if refusal["outcome"] == "UNKNOWN" else GatewayRejected
+    with pytest.raises(expected) as raised:
+        asyncio.run(gw.submit(command, command.idempotency_key, None))
+
+    if refusal["outcome"] == "REJECTED":
+        assert isinstance(raised.value, GatewayRejected)
+        assert raised.value.code == refusal["body"]["error"].upper()
+    else:
+        assert not isinstance(raised.value, GatewayRejected)
+
+
 @pytest.mark.parametrize("conflict", ["idempotency_conflict", "approval_already_used"])
 def test_a_conflict_with_an_existing_submission_is_an_unknown_outcome(conflict: str) -> None:
     """engine.ts 543/677/778: the executor already holds a submission under this key or

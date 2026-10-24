@@ -41,9 +41,16 @@ RULESET_OVERRIDES_ENV = "RULESET_OVERRIDES_FILE"
 UNIVERSE_INTERVAL_ENV = "WORKER_UNIVERSE_INTERVAL_SECONDS"
 # G18: LIVE needs fresh GMGN data unless this is switched off explicitly ("false").
 GMGN_REQUIRED_FOR_LIVE_ENV = "GMGN_REQUIRED_FOR_LIVE"
-# The executor's priority fee ceiling per transaction (T17, No 49); SHADOW pays it (T19).
+# The executor's priority fee ceiling per transaction (T17, No 49); SHADOW books no more.
 PRIORITY_FEE_MAX_ENV = "PRIORITY_FEE_MAX_LAMPORTS"
 DEFAULT_PRIORITY_FEE_LAMPORTS = 15_000_000
+# SHADOW's estimate of the priority fee of one transaction (spec 6.8, No 49; F4). A starting
+# estimate of this build, not market data: 1 000 000 lamports = 0.001 SOL, a fifteenth of the
+# guide's ceiling of 0.015 SOL, which the executor reaches only when the network's fee
+# percentile is at the cap. It is checked against the ``priority_fee_lamports`` of APPROVAL
+# settlements and tuned as a versioned guide-v1 setting (``shadow_priority_fee_lamports``);
+# ``PRIORITY_FEE_MAX_LAMPORTS`` stays only its upper bound.
+DEFAULT_SHADOW_PRIORITY_FEE_LAMPORTS = 1_000_000
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
 DEFAULT_UNIVERSE_INTERVAL = timedelta(minutes=5)
@@ -206,15 +213,17 @@ def hypothesis_policy(
     max_slippage_bps: int = 100,
     kill_switch_policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT,
     universe_interval: timedelta = DEFAULT_UNIVERSE_INTERVAL,
-    priority_fee_lamports: int = 0,
+    priority_fee_ceiling_lamports: int = 0,
 ) -> PipelinePolicy:
     """``shadow-hypothesis-v1``: volume-spike rules of spec 6.2-6.4 without guide signals.
 
-    ``priority_fee_lamports``: the priority fee SHADOW books per transaction (spec 6.8)."""
+    SHADOW books the build's priority fee estimate per transaction, capped by
+    ``priority_fee_ceiling_lamports`` (the executor's ceiling; spec 6.8)."""
 
+    priority = min(DEFAULT_SHADOW_PRIORITY_FEE_LAMPORTS, priority_fee_ceiling_lamports)
     return PipelinePolicy(
         short_window=_short_window_rules(universe_interval),
-        conservative_costs=_shadow_costs(max_slippage_bps, priority_fee_lamports),
+        conservative_costs=_shadow_costs(max_slippage_bps, priority),
         features=VolumeFeatureRules(
             ruleset_version=ruleset_version,
             config_version=config_version,
@@ -236,7 +245,7 @@ def hypothesis_policy(
         ),
         strategy=StrategyPolicy(ruleset_version=ruleset_version, config_version=config_version),
         risk=RiskPolicy(ruleset_version=ruleset_version, config_version=config_version),
-        shadow_costs=_shadow_costs(priority_fee_lamports=priority_fee_lamports),
+        shadow_costs=_shadow_costs(priority_fee_lamports=priority),
         entry_notional_quote=entry_notional_quote,
         quote_base_units_per_unit=quote_base_units_per_unit,
         max_slippage_bps=max_slippage_bps,
@@ -342,12 +351,22 @@ class GuidePolicySettings(BaseModel):
     maximum_sniper_count: int = 20
     revived_token_age: timedelta = timedelta(days=60)
     maximum_deep_candidates: int = 50
+    # SHADOW's priority fee per transaction (``DEFAULT_SHADOW_PRIORITY_FEE_LAMPORTS``: the
+    # build's starting estimate), capped by the executor's ``PRIORITY_FEE_MAX_LAMPORTS``.
+    shadow_priority_fee_lamports: int = DEFAULT_SHADOW_PRIORITY_FEE_LAMPORTS
 
     @field_validator("*", mode="before")
     @classmethod
     def _reject_binary_float(cls, value: Any) -> Any:
         if isinstance(value, (float, bool)):
             raise ValueError("binary float is forbidden; quote decimal thresholds as strings")
+        return value
+
+    @field_validator("shadow_priority_fee_lamports")
+    @classmethod
+    def _non_negative_priority_fee(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("shadow_priority_fee_lamports cannot be negative")
         return value
 
 
@@ -359,7 +378,7 @@ def guide_policy(
     kill_switch_policy: KillSwitchPolicy = KillSwitchPolicy.HOLD_AND_ALERT,
     universe_interval: timedelta = DEFAULT_UNIVERSE_INTERVAL,
     gmgn_required_for_live: bool | None = None,
-    priority_fee_lamports: int = 0,
+    priority_fee_ceiling_lamports: int = 0,
 ) -> PipelinePolicy:
     """``guide-v1``: spec 6.2-6.4 plus the LexDollar thresholds and strategy choice (6.6).
 
@@ -367,10 +386,12 @@ def guide_policy(
     observation gap of the ATH proof follows ``universe_interval``. ``gmgn_required_for_live``
     adds the GMGN rules of spec 6.7 with that LIVE requirement; ``None`` builds the bundle
     without them (the worker and the API always load them through ``load_pipeline_policy``).
-    ``priority_fee_lamports``: the priority fee SHADOW books per transaction (spec 6.8).
+    SHADOW books ``shadow_priority_fee_lamports`` per transaction, capped by
+    ``priority_fee_ceiling_lamports`` (the executor's ceiling; spec 6.8).
     """
 
     values = settings or GuidePolicySettings()
+    priority = min(values.shadow_priority_fee_lamports, priority_fee_ceiling_lamports)
     gmgn = (
         None
         if gmgn_required_for_live is None
@@ -392,7 +413,7 @@ def guide_policy(
             counter_reset_after=values.short_window_counter_reset_after,
         ),
         active_bin_tolerance=values.active_bin_tolerance,
-        conservative_costs=_shadow_costs(values.conservative_slippage_bps, priority_fee_lamports),
+        conservative_costs=_shadow_costs(values.conservative_slippage_bps, priority),
         conservative_depth_fraction=values.conservative_depth_fraction,
         features=VolumeFeatureRules(
             ruleset_version=ruleset_version,
@@ -469,7 +490,7 @@ def guide_policy(
             ),
         ),
         risk=RiskPolicy(ruleset_version=ruleset_version, config_version=config_version),
-        shadow_costs=_shadow_costs(priority_fee_lamports=priority_fee_lamports),
+        shadow_costs=_shadow_costs(priority_fee_lamports=priority),
         entry_notional_quote=values.entry_notional_quote,
         quote_base_units_per_unit=values.quote_base_units_per_unit,
         max_slippage_bps=values.max_slippage_bps,
@@ -491,17 +512,18 @@ def load_pipeline_policy(environ: Mapping[str, str]) -> PipelinePolicy:
     mapping of ``GuidePolicySettings`` fields; tuned numbers must carry their own version.
     ``guide-v1`` always carries the GMGN rules (G18); ``GMGN_REQUIRED_FOR_LIVE=false``
     is the only way to let LIVE enter without fresh GMGN data. ``PRIORITY_FEE_MAX_LAMPORTS``
-    (the executor's ceiling) is the priority fee SHADOW books per transaction, any ruleset.
+    (the executor's ceiling) caps the priority fee SHADOW books per transaction - the
+    estimate ``shadow_priority_fee_lamports`` - in any ruleset.
     """
 
     version = environ.get(RULESET_VERSION_ENV) or DEFAULT_RULESET_VERSION
     overrides_path = environ.get(RULESET_OVERRIDES_ENV)
     interval = universe_interval(environ)
-    priority = priority_fee_lamports(environ)
+    ceiling = priority_fee_lamports(environ)
     if version == LEGACY_RULESET_VERSION:
         if overrides_path:
             raise ValueError("threshold overrides apply to guide-v1 only")
-        return hypothesis_policy(universe_interval=interval, priority_fee_lamports=priority)
+        return hypothesis_policy(universe_interval=interval, priority_fee_ceiling_lamports=ceiling)
     if version != GUIDE_RULESET_VERSION:
         raise ValueError(f"unknown ruleset version {version!r}")
     required = gmgn_required_for_live(environ)
@@ -509,7 +531,7 @@ def load_pipeline_policy(environ: Mapping[str, str]) -> PipelinePolicy:
         return guide_policy(
             universe_interval=interval,
             gmgn_required_for_live=required,
-            priority_fee_lamports=priority,
+            priority_fee_ceiling_lamports=ceiling,
         )
     document = yaml.safe_load(Path(overrides_path).read_text(encoding="utf-8")) or {}
     if not isinstance(document, dict):
@@ -534,13 +556,13 @@ def load_pipeline_policy(environ: Mapping[str, str]) -> PipelinePolicy:
         config_version=config_version,
         universe_interval=interval,
         gmgn_required_for_live=required,
-        priority_fee_lamports=priority,
+        priority_fee_ceiling_lamports=ceiling,
     )
 
 
 def priority_fee_lamports(environ: Mapping[str, str]) -> int:
-    """``PRIORITY_FEE_MAX_LAMPORTS``: empty means the executor's default (0.015 SOL); like the
-    executor, anything but a whole number refuses to start."""
+    """The ceiling ``PRIORITY_FEE_MAX_LAMPORTS``: empty means the executor's default (0.015
+    SOL); like the executor, anything but a whole number refuses to start."""
 
     raw = (environ.get(PRIORITY_FEE_MAX_ENV) or "").strip()
     if not raw:

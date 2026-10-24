@@ -972,12 +972,40 @@
           "retryable": false
         }
       ]
+    },
+    {
+      "schema_version": 2,
+      "command_id": "10000000-0000-4000-8000-000000000205",
+      "command_digest": "336edd1730c73c0017571245667c28da08ad660e395822e2594fbc8ad76852e9",
+      "simulation_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+      "success": false,
+      "simulated_at": "2030-01-02T03:00:00Z",
+      "blockhash": null,
+      "last_valid_block_height": null,
+      "compute_units": 0,
+      "network_fee_lamports": "0",
+      "priority_fee_lamports": "0",
+      "price_impact_bps": null,
+      "min_bin_id": null,
+      "max_bin_id": null,
+      "position_address": null,
+      "active_bin_id": null,
+      "token_x_decimals": null,
+      "token_y_decimals": null,
+      "errors": [
+        {
+          "code": "SWAP_QUOTE_INSUFFICIENT_LIQUIDITY",
+          "message": "the pool has no liquidity for the whole part",
+          "retryable": false
+        }
+      ]
     }
   ],
   "swap_simulation_digests": [
     "7528b5388dcb2100f622854ef5203d3c1920919d7ba6e1829c70a990049e842b",
     "0f31112b02aa9aa1b978ccef74a24221a829e061dd4f5db420dec66c4baced2c",
-    "3aae2d943edad5b40ea9f1997e3e94d52779058dbcd68492e3940600cb6880bf"
+    "3aae2d943edad5b40ea9f1997e3e94d52779058dbcd68492e3940600cb6880bf",
+    "27ab8a5eee0d1a29003b6caef97669ccd6c53705fdcb6bae1534e6aae24f64aa"
   ],
   "invalid_swap_simulations": [
     {
@@ -1390,6 +1418,24 @@
           "mint_y": "So11111111111111111111111111111111111111112"
         }
       }
+    }
+  ],
+  "submit_refusals": [
+    {
+      "case": "a sale part beyond the base token the position's confirmed exits returned: nothing was broadcast",
+      "status": 409,
+      "body": {
+        "error": "swap_exceeds_exit_returns"
+      },
+      "outcome": "REJECTED"
+    },
+    {
+      "case": "the executor already holds a submission under this key: the outcome is reconciled, never resent",
+      "status": 409,
+      "body": {
+        "error": "idempotency_conflict"
+      },
+      "outcome": "UNKNOWN"
     }
   ]
 }

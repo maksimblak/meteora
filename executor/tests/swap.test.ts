@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import {
   ComputeBudgetInstruction,
   ComputeBudgetProgram,
@@ -9,12 +11,20 @@ import {
 } from "@solana/web3.js";
 import { describe, expect, it } from "vitest";
 
-import { parseDlmmCommandV2, type DlmmCommandV2, type SettlementV2 } from "../src/contracts.js";
+import {
+  parseDlmmCommandV2,
+  type DlmmCommandV2,
+  type GatewayReceiptV2,
+  type SettlementV2,
+} from "../src/contracts.js";
 import {
   ExecutionEngine,
   GatewayError,
+  InMemoryExecutionStateStore,
   type BuiltCommand,
+  type ExecutionStateStore,
   type MarketFacts,
+  type PersistedSubmission,
   type RpcTransport,
   type SdkBoundary,
   type SettlementBinding,
@@ -239,6 +249,7 @@ class SwapPool implements MeteoraPoolClient {
   tokenX = { publicKey: new PublicKey(MINT_X), mint: { decimals: 6 } };
   tokenY = { publicKey: new PublicKey(WSOL), mint: { decimals: 9 } };
   binArrays = [Keypair.generate().publicKey, Keypair.generate().publicKey];
+  quoteFailure: Error | undefined;
 
   constructor(
     private readonly wallet: Keypair,
@@ -261,6 +272,9 @@ class SwapPool implements MeteoraPoolClient {
     priceImpact: { toFixed(): string };
     binArraysPubkey: PublicKey[];
   } {
+    if (this.quoteFailure !== undefined) {
+      throw this.quoteFailure;
+    }
     this.quotes.push({
       amount: inAmount.toString(),
       swapForY,
@@ -368,6 +382,32 @@ describe("official SDK boundary: the sale of the base token", () => {
       swap: { inAmount: "125", outAmount: "2500", minOutAmount: "2475", feeAmount: "25" },
     });
   });
+
+  it("names a quote refused for liquidity by the SDK's own code, so the caller splits it", async () => {
+    // The official SDK throws DlmmSdkError(name "SWAP_QUOTE_INSUFFICIENT_LIQUIDITY") when the
+    // bin arrays cannot fill the amount; any other failure leaves the impact unknown.
+    const wallet = Keypair.generate();
+    const pool = new SwapPool(wallet, { consumed: "125", out: "2500", fee: "25", impact: "1.8" });
+    const boundary = new OfficialMeteoraDlmmBoundary(
+      {} as Connection,
+      { loadWalletSigner: async (): Promise<Keypair> => wallet },
+      factoryFor(pool),
+    );
+    const thin = new Error("Insufficient liquidity in binArrays");
+    thin.name = "SWAP_QUOTE_INSUFFICIENT_LIQUIDITY";
+
+    pool.quoteFailure = thin;
+    const engine = engineFor(boundary, new FakeRpc());
+    const refused = await engine.simulate(swapCommand(wallet.publicKey.toBase58()));
+
+    expect(refused.success).toBe(false);
+    expect(refused.errors.map((error) => error.code)).toEqual(["SWAP_QUOTE_INSUFFICIENT_LIQUIDITY"]);
+    pool.quoteFailure = new Error("bin array fetch failed");
+    await expect(boundary.build(swapCommand(wallet.publicKey.toBase58()))).rejects.toMatchObject({
+      code: "PRICE_IMPACT_UNAVAILABLE",
+    });
+    expect(pool.swaps).toEqual([]);
+  });
 });
 
 const swapFacts = (impact: number, consumed = "125"): MarketFacts => ({
@@ -439,6 +479,7 @@ function engineFor(
   sdk: SdkBoundary,
   rpc: RpcTransport,
   mode: "LIVE" | "APPROVAL" = "LIVE",
+  store?: ExecutionStateStore,
 ): ExecutionEngine {
   return new ExecutionEngine({
     sdk,
@@ -447,10 +488,101 @@ function engineFor(
     submissionEnabled: true,
     allowedMode: mode,
     livePromotion,
+    ...(store === undefined ? {} : { store }),
   });
 }
 
 const WALLET = "11111111111111111111111111111111";
+
+let recordedCount = 0;
+
+/** A submission the executor recorded earlier, as its durable store holds it. */
+function recorded(
+  operation: "CLOSE" | "REMOVE" | "SWAP",
+  key: string,
+  state: "CONFIRMED" | "SUBMITTED" | "FAILED",
+  options: { deltaX?: string; inAmount?: string; position?: string } = {},
+): PersistedSubmission {
+  recordedCount += 1;
+  const commandId = `10000000-0000-4000-8000-${(900_000 + recordedCount).toString().padStart(12, "0")}`;
+  return {
+    commandId,
+    commandDigest: "a".repeat(64),
+    simulationDigest: "b".repeat(64),
+    idempotencyKey: key,
+    operation,
+    ...(options.inAmount === undefined ? {} : { inAmount: options.inAmount }),
+    settlementBinding: { wallet: WALLET, tokenXMint: MINT_X, tokenYMint: WSOL },
+    receipt: {
+      schema_version: 2,
+      command_id: commandId,
+      command_digest: "a".repeat(64),
+      simulation_digest: "b".repeat(64),
+      idempotency_key: key,
+      state,
+      position_address: options.position ?? POSITION,
+      signature: state === "FAILED" ? null : `${operation.toLowerCase()}-signature`,
+      signatures: state === "FAILED" ? [] : [`${operation.toLowerCase()}-signature`],
+      transaction_count: 1,
+      submitted_at: "2026-10-18T11:59:00.000Z",
+      attempt_count: 1,
+      error: null,
+      settlement:
+        options.deltaX === undefined
+          ? null
+          : {
+              fee_lamports: "5000",
+              priority_fee_lamports: "0",
+              delta_x: options.deltaX,
+              delta_y: "0",
+              mint_x: MINT_X,
+              mint_y: WSOL,
+            },
+    },
+  };
+}
+
+/** The executor's store after the position's exit returned `returned` base units. */
+async function storeAfterExit(
+  returned: string,
+  ...more: PersistedSubmission[]
+): Promise<InMemoryExecutionStateStore> {
+  const store = new InMemoryExecutionStateStore();
+  for (const item of [
+    recorded("CLOSE", `position-action:${POSITION}:2`, "CONFIRMED", { deltaX: returned }),
+    ...more,
+  ]) {
+    await store.reserve(item);
+  }
+  return store;
+}
+
+/** The SDK quoting exactly the part it is asked for. */
+class SaleSdk implements SdkBoundary {
+  async build(command: DlmmCommandV2): Promise<BuiltCommand> {
+    return {
+      command,
+      opaqueTransactions: [new Uint8Array([1])],
+      positionAddress: command.position_address ?? POSITION,
+      market: swapFacts(180, command.in_amount ?? "0"),
+    };
+  }
+}
+
+function part(number: number, inAmount: string, position = POSITION): DlmmCommandV2 {
+  return swapCommand(WALLET, {
+    command_id: `10000000-0000-4000-8000-0000000004${number.toString().padStart(2, "0")}`,
+    idempotency_key: `exit-sale:${position}:2:${number}`,
+    position_address: position,
+    in_amount: inAmount,
+  });
+}
+
+async function sell(engine: ExecutionEngine, command: DlmmCommandV2): Promise<GatewayReceiptV2> {
+  const simulation = await engine.simulate(command);
+  expect(simulation.success).toBe(true);
+  return engine.submit(command, command.idempotency_key, { modeTokenVerified: true });
+}
 
 describe("execution engine: SWAP", () => {
   it("refuses a swap whose quoted impact exceeds its own limit and reports the quote", async () => {
@@ -474,7 +606,7 @@ describe("execution engine: SWAP", () => {
 
   it("simulates a swap within its limit without a bin range and submits it once per key", async () => {
     const rpc = new FakeRpc();
-    const engine = engineFor(new FakeSdk(swapFacts(180)), rpc);
+    const engine = engineFor(new FakeSdk(swapFacts(180)), rpc, "LIVE", await storeAfterExit("125"));
     const command = swapCommand(WALLET);
 
     const simulation = await engine.simulate(command);
@@ -510,7 +642,7 @@ describe("execution engine: SWAP", () => {
 
   it("attaches the chain settlement once the command is confirmed", async () => {
     const rpc = new FakeRpc();
-    const engine = engineFor(new FakeSdk(swapFacts(180)), rpc);
+    const engine = engineFor(new FakeSdk(swapFacts(180)), rpc, "LIVE", await storeAfterExit("125"));
     const command = swapCommand(WALLET);
     await engine.simulate(command);
     await engine.submit(command, command.idempotency_key, { modeTokenVerified: true });
@@ -540,7 +672,7 @@ describe("execution engine: SWAP", () => {
 
   it("serves the swap through the internal routes with an idempotency key", async () => {
     const rpc = new FakeRpc();
-    const engine = engineFor(new FakeSdk(swapFacts(180)), rpc);
+    const engine = engineFor(new FakeSdk(swapFacts(180)), rpc, "LIVE", await storeAfterExit("125"));
     const server = buildServer(
       {},
       { engine, internalToken: "internal", modeToken: "mode", configuredMode: "LIVE" },
@@ -562,6 +694,94 @@ describe("execution engine: SWAP", () => {
     expect(first.json()).toMatchObject({ state: "SUBMITTED", position_address: POSITION });
     expect(again.json()).toMatchObject({ signatures: first.json().signatures });
     expect(rpc.submitCalls).toBe(1);
+  });
+});
+
+describe("execution engine: a sale never exceeds what the position's exits returned", () => {
+  it("submits parts up to the confirmed exits' delta_x and refuses the part beyond it", async () => {
+    // The CLOSE returned 200: 125 + 100 would be 225, so that part is refused unsent;
+    // 125 + 75 is exactly 200.
+    const rpc = new FakeRpc();
+    const engine = engineFor(new SaleSdk(), rpc, "LIVE", await storeAfterExit("200"));
+
+    await sell(engine, part(1, "125"));
+    await expect(sell(engine, part(2, "100"))).rejects.toMatchObject({
+      code: "SWAP_EXCEEDS_EXIT_RETURNS",
+    } satisfies Partial<GatewayError>);
+    const submitsAfterRefusal = rpc.submitCalls;
+    const last = await sell(engine, part(3, "75"));
+
+    expect(submitsAfterRefusal).toBe(1);
+    expect(last.state).toBe("SUBMITTED");
+    expect(rpc.submitCalls).toBe(2);
+    expect(await engine.lookup(part(2, "100").command_id)).toBeUndefined();
+  });
+
+  it("counts sold parts by their settlement and never counts a failed one", async () => {
+    // Exits returned 200 + 50; a part of 150 failed on chain, one of 60 sold 60 by its
+    // settlement: 250 - 60 = 190 may still be sold, 191 may not.
+    const store = await storeAfterExit(
+      "200",
+      recorded("REMOVE", `position-action:${POSITION}:1`, "CONFIRMED", { deltaX: "50" }),
+      recorded("SWAP", `exit-sale:${POSITION}:1:1`, "FAILED", { inAmount: "150" }),
+      recorded("SWAP", `exit-sale:${POSITION}:1:2`, "CONFIRMED", {
+        inAmount: "60",
+        deltaX: "-60",
+      }),
+    );
+    const rpc = new FakeRpc();
+    const engine = engineFor(new SaleSdk(), rpc, "LIVE", store);
+
+    await expect(sell(engine, part(1, "191"))).rejects.toMatchObject({
+      code: "SWAP_EXCEEDS_EXIT_RETURNS",
+    });
+    const receipt = await sell(engine, part(2, "190"));
+
+    expect(receipt.state).toBe("SUBMITTED");
+    expect(rpc.submitCalls).toBe(1);
+  });
+
+  it("refuses a sale of a position whose exit is not confirmed or belongs to another position", async () => {
+    const other = "SysvarStakeHistory1111111111111111111111111";
+    const store = new InMemoryExecutionStateStore();
+    await store.reserve(recorded("CLOSE", `position-action:${POSITION}:1`, "SUBMITTED"));
+    await store.reserve(
+      recorded("CLOSE", `position-action:${other}:1`, "CONFIRMED", { deltaX: "500", position: other }),
+    );
+    const rpc = new FakeRpc();
+    const engine = engineFor(new SaleSdk(), rpc, "LIVE", store);
+
+    await expect(sell(engine, part(1, "1"))).rejects.toMatchObject({
+      code: "SWAP_EXCEEDS_EXIT_RETURNS",
+    });
+    expect(rpc.submitCalls).toBe(0);
+  });
+
+  it("refuses over the internal route with the shared corpus answer", async () => {
+    const v2 = JSON.parse(
+      readFileSync(new URL("../../contracts/execution/v2-corpus.json", import.meta.url), "utf8"),
+    ) as { submit_refusals: Array<{ status: number; body: unknown; outcome: string }> };
+    const refusal = v2.submit_refusals.find((item) => item.outcome === "REJECTED");
+    const engine = engineFor(new SaleSdk(), new FakeRpc(), "LIVE", await storeAfterExit("100"));
+    const server = buildServer(
+      {},
+      { engine, internalToken: "internal", modeToken: "mode", configuredMode: "LIVE" },
+    );
+    const payload = part(1, "125");
+    const headers = { "x-internal-token": "internal" };
+
+    await server.inject({ method: "POST", url: "/v1/simulations", headers, payload });
+    const response = await server.inject({
+      method: "POST",
+      url: "/v1/commands",
+      headers: { ...headers, "x-mode-token": "mode", "idempotency-key": payload.idempotency_key },
+      payload,
+    });
+    await server.close();
+
+    expect(refusal).toBeDefined();
+    expect(response.statusCode).toBe(refusal?.status);
+    expect(response.json()).toEqual(refusal?.body);
   });
 });
 

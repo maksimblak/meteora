@@ -178,6 +178,10 @@ export interface PersistedSubmission {
   approvalId?: string;
   /** Addresses only; absent on submissions recorded before settlements existed. */
   settlementBinding?: SettlementBinding;
+  /** The command's operation; absent on submissions recorded before F4. */
+  operation?: DlmmCommandV2["operation"];
+  /** A SWAP's exact-in amount (base units of X); the bound of the position's sale. */
+  inAmount?: string;
   receipt: GatewayReceiptV2;
 }
 
@@ -192,6 +196,8 @@ export type ReserveSubmissionResult =
 export interface ExecutionStateStore {
   getByKey(idempotencyKey: string): Promise<PersistedSubmission | undefined>;
   getByCommand(commandId: string): Promise<PersistedSubmission | undefined>;
+  /** Every submission whose receipt names `position` (its exits and its sales). */
+  byPosition(position: string): Promise<PersistedSubmission[]>;
   reserve(state: PersistedSubmission): Promise<ReserveSubmissionResult>;
   update(state: PersistedSubmission): Promise<void>;
 }
@@ -208,6 +214,12 @@ export class InMemoryExecutionStateStore implements ExecutionStateStore {
   async getByCommand(commandId: string): Promise<PersistedSubmission | undefined> {
     const key = this.#keyByCommand.get(commandId);
     return key === undefined ? undefined : cloneState(this.#byKey.get(key));
+  }
+
+  async byPosition(position: string): Promise<PersistedSubmission[]> {
+    return [...this.#byKey.values()]
+      .filter((item) => item.receipt.position_address === position)
+      .map((item) => cloneState(item) as PersistedSubmission);
   }
 
   async reserve(state: PersistedSubmission): Promise<ReserveSubmissionResult> {
@@ -275,6 +287,15 @@ export class FileExecutionStateStore implements ExecutionStateStore {
     return this.#locked(async () => {
       const document = await this.#read();
       return cloneState(document.submissions.find((item) => item.commandId === commandId));
+    });
+  }
+
+  async byPosition(position: string): Promise<PersistedSubmission[]> {
+    return this.#locked(async () => {
+      const document = await this.#read();
+      return document.submissions
+        .filter((item) => item.receipt.position_address === position)
+        .map((item) => cloneState(item) as PersistedSubmission);
     });
   }
 
@@ -425,6 +446,7 @@ export class ExecutionEngine {
     string,
     { commandDigest: string; promise: Promise<GatewayReceiptV2> }
   >();
+  #salesTail: Promise<void> = Promise.resolve();
 
   constructor(options: ExecutionEngineOptions) {
     this.#sdk = options.sdk;
@@ -724,6 +746,8 @@ export class ExecutionEngine {
       ...(tokenXMint === undefined || tokenYMint === undefined
         ? {}
         : { settlementBinding: { wallet: command.wallet_address, tokenXMint, tokenYMint } }),
+      operation: command.operation,
+      ...(command.in_amount === undefined ? {} : { inAmount: command.in_amount }),
       receipt: {
         schema_version: 2,
         command_id: command.command_id,
@@ -745,7 +769,16 @@ export class ExecutionEngine {
         },
       },
     };
-    const reserved = await this.#store.reserve(state);
+    const reserved =
+      command.operation === "SWAP"
+        ? await this.#serializeSales(async () => {
+            // A key already reserved is the same submission again, never a new part.
+            if ((await this.#store.getByKey(idempotencyKey)) === undefined) {
+              await this.#assertWithinExitReturns(command);
+            }
+            return this.#store.reserve(state);
+          })
+        : await this.#store.reserve(state);
     if (!reserved.created) {
       if (reserved.state !== undefined) {
         return this.#reconcileReceipt(reserved.state);
@@ -822,6 +855,60 @@ export class ExecutionEngine {
     }
     await this.#store.update(state);
     return state.receipt;
+  }
+
+  /**
+   * Defense in depth of the sale after an exit (G22): the parts of a position's sale sum
+   * to at most the base token its confirmed REMOVE/CLOSE returned - the `delta_x` of their
+   * settlements in this store. A part counts by its settlement once sold, by its `in_amount`
+   * while its outcome is open, not at all once FAILED. An exit not confirmed or not yet
+   * settled returns nothing here, so the sale waits for it (the worker reads the same
+   * settlement before it sells). A submission recorded before operations were stored counts
+   * by the sign of its settlement: a positive `delta_x` returned, a negative one spent.
+   */
+  async #assertWithinExitReturns(command: DlmmCommandV2): Promise<void> {
+    const position = command.position_address;
+    const amount = command.in_amount;
+    if (position === undefined || amount === undefined) {
+      throw new GatewayError(EXCEEDS_EXIT_RETURNS, "a sale names its position and amount");
+    }
+    let returned = 0n;
+    let committed = 0n;
+    for (const item of await this.#store.byPosition(position)) {
+      const { receipt } = item;
+      const settlement = receipt.settlement;
+      const delta =
+        settlement === undefined || settlement === null ? undefined : BigInt(settlement.delta_x);
+      const operation = item.operation ?? legacyOperation(delta);
+      if (operation === "REMOVE" || operation === "CLOSE") {
+        if (receipt.state === "CONFIRMED" && delta !== undefined && delta > 0n) {
+          returned += delta;
+        }
+      } else if (operation === "SWAP" && receipt.state !== "FAILED") {
+        committed += delta !== undefined && delta < 0n ? -delta : BigInt(item.inAmount ?? "0");
+      }
+    }
+    if (committed + BigInt(amount) > returned) {
+      throw new GatewayError(
+        EXCEEDS_EXIT_RETURNS,
+        "the sale exceeds the base token the position's confirmed exits returned",
+      );
+    }
+  }
+
+  /** One sale reservation at a time: the check above and its reservation are atomic. */
+  async #serializeSales<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#salesTail;
+    let release: (() => void) | undefined;
+    this.#salesTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release?.();
+    }
   }
 
   #assertNotExpired(command: DlmmCommandV2): void {
@@ -1020,6 +1107,17 @@ export class ExecutionEngine {
       }
     }
   }
+}
+
+/** A sale beyond what the position's confirmed exits returned (G22, defense in depth). */
+const EXCEEDS_EXIT_RETURNS = "SWAP_EXCEEDS_EXIT_RETURNS";
+
+/** The role of a submission stored without its operation, by what it did to X. */
+function legacyOperation(deltaX: bigint | undefined): "REMOVE" | "SWAP" | undefined {
+  if (deltaX === undefined || deltaX === 0n) {
+    return undefined;
+  }
+  return deltaX > 0n ? "REMOVE" : "SWAP";
 }
 
 function isWhole(value: number, minimum: number, maximum: number): boolean {

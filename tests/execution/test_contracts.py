@@ -153,6 +153,9 @@ def test_v2_extension_swap_simulations_share_their_digests() -> None:
     assert simulations[0].swap_quote.min_out_amount == "2475000000"
     assert simulations[1].errors[0].code == "PRICE_IMPACT_BREACH"
     assert simulations[2].swap_quote is None
+    # F4: a quote refused for the pool's liquidity keeps the SDK's code (the part is split).
+    assert simulations[3].errors[0].code == "SWAP_QUOTE_INSUFFICIENT_LIQUIDITY"
+    assert simulations[3].swap_quote is None and simulations[3].price_impact_bps is None
     assert [canonical_simulation_digest(item) for item in simulations] == v2[
         "swap_simulation_digests"
     ]

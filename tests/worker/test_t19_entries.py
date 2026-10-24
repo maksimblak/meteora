@@ -102,9 +102,11 @@ def test_an_overvolume_spot_enters_with_quote_only_from_a_sol_only_wallet() -> N
     )
 
 
-@pytest.mark.parametrize(("drift", "admitted"), [(17, True), (-17, True), (18, False)])
+@pytest.mark.parametrize(("drift", "admitted"), [(17, True), (-4, True), (18, False)])
 def test_the_active_bin_may_move_thirty_percent_of_the_range(drift: int, admitted: bool) -> None:
     # Bid-Ask at bin step 250: 57 bins below plus the active one = 58; 30% of 58 = 17.4 -> 17.
+    # Downwards the plan's "from the high" binds first: below 1.025**-4 of the high (90%) the
+    # entry is NOT_NEAR_LOCAL_HIGH (F4, tests/worker/test_f4_entries.py).
     outcome, executor, repos = approval_entry(
         guide_history(), StaticPoolStates(ANCHOR.active_bin_id + drift, bin_step=250)
     )

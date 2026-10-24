@@ -311,17 +311,29 @@ class AccountingService:
 
 
 WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112"
+# Model flag of a SHADOW fill (``CommandConfirmed.cost_model_flags``): the modeled priority
+# fee was not booked - the pool's quote token is not wrapped SOL and no SOL price is known.
+PRIORITY_FEE_UNPRICED = "PRIORITY_FEE_UNPRICED"
 
 
 def priority_fee_base_units(cost_model: CostModel, market: PoolSnapshot) -> Decimal:
     """The modeled priority fee of one transaction in the pool's quote base units.
 
     Lamports are quote base units in a pool quoted in wrapped SOL; another quote token has
-    no SOL price here, so nothing is booked for it (the cost model's tip still is)."""
+    no SOL price here, so nothing is booked for it (the cost model's tip still is) and the
+    fill carries ``PRIORITY_FEE_UNPRICED`` (``cost_model_flags``)."""
 
     if market.pool.quote_mint.root != WRAPPED_SOL_MINT:
         return Decimal(0)
     return Decimal(cost_model.priority_fee_lamports)
+
+
+def cost_model_flags(cost_model: CostModel, market: PoolSnapshot) -> tuple[str, ...]:
+    """What the SHADOW cost model of a fill in ``market`` could not price."""
+
+    if cost_model.priority_fee_lamports > 0 and market.pool.quote_mint.root != WRAPPED_SOL_MINT:
+        return (PRIORITY_FEE_UNPRICED,)
+    return ()
 
 
 class ShadowBroker:
@@ -382,7 +394,9 @@ class ShadowBroker:
         fill, step, position, sale_entries = self._book(current, command, market, cost_model, now)
         valuation = self._accounting.value_at(position, fill.price, now)
         entry = _ledger_entry(command, step, fill)
-        events = _lifecycle_events(command, step, valuation, now)
+        events = _lifecycle_events(
+            command, step, valuation, now, flags=cost_model_flags(cost_model, market)
+        )
         fill_digest = _fill_digest(command_digest, fill, market)
         receipt = ShadowReceipt(
             command=command,
@@ -716,8 +730,20 @@ def _lifecycle_events(
     step: LifecycleStep,
     valuation: PositionValuation,
     now: datetime,
+    *,
+    flags: Sequence[str] = (),
 ) -> tuple[AuditEvent, ...]:
     position = step.position
+    confirmed: dict[str, Any] = {
+        "mode": command.mode.value,
+        "operation": command.operation.value,
+        "idempotency_key": command.idempotency_key,
+        "position_id": position.position_id,
+        "ruleset_version": command.ruleset_version,
+        "ledger_kind": step.kind.value,
+    }
+    if flags:
+        confirmed["cost_model_flags"] = list(flags)
 
     def event(kind: EventType, aggregate_id: UUID, payload: dict[str, Any]) -> AuditEvent:
         return AuditEvent(
@@ -731,20 +757,7 @@ def _lifecycle_events(
             payload=payload,
         )
 
-    events = [
-        event(
-            EventType.COMMAND_CONFIRMED,
-            command.command_id,
-            {
-                "mode": command.mode.value,
-                "operation": command.operation.value,
-                "idempotency_key": command.idempotency_key,
-                "position_id": position.position_id,
-                "ruleset_version": command.ruleset_version,
-                "ledger_kind": step.kind.value,
-            },
-        )
-    ]
+    events = [event(EventType.COMMAND_CONFIRMED, command.command_id, confirmed)]
     aggregate = position_aggregate_id(position.position_id)
     if step.kind is LedgerKind.OPEN:
         events.append(

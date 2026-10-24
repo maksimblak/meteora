@@ -43,7 +43,12 @@ from src.domain.models.events import AuditEvent, EventType
 from src.domain.models.primitives import PublicKey
 from src.domain.models.trading import TradingMode
 from src.domain.risk.models import SizedPlan
-from src.domain.strategy import PositionActionKind
+from src.domain.strategy import (
+    PositionActionKind,
+    StrategyPlan,
+    StrategyRejection,
+    StrategySelectionReason,
+)
 from src.execution.contracts import (
     DlmmCommand,
     DlmmCommandV1,
@@ -367,8 +372,9 @@ class SubmitResult:
 
 
 type SubmitGuard = Callable[[], None]
-# Makes the position context durable under the executor-named address; raises to stop.
-type PositionRecorder = Callable[[str], Awaitable[None]]
+# Makes the position context durable under the executor-named address and returns the entry
+# price it recorded (every path books the entry at that one price); raises to stop.
+type PositionRecorder = Callable[[str], Awaitable[Decimal]]
 
 
 class CommandSubmitter(Protocol):
@@ -745,7 +751,9 @@ class GatewaySubmitter:
     step of that stage; ``GatewayEntrySettler`` executes it once approved); LIVE
     submits only after the guard re-checks the durable state *after* simulation.
     ``record_position`` runs right after the simulation, before either: it receives
-    the position the executor created for the OPEN.
+    the position the executor created for the OPEN and returns the context's entry
+    price, which an immediate confirmation is booked at - as the settler and restart
+    booking book it (``PositionContext.entry_price``), never the snapshot's price.
     """
 
     def __init__(
@@ -774,6 +782,7 @@ class GatewaySubmitter:
             return SubmitResult(SubmitStatus.FAILED, detail=str(error))
         finally:
             self._resolver.discard(command.command_id)
+        entry_price = market.price
         if record_position is not None:
             simulation = preview.simulation
             position = (
@@ -784,7 +793,7 @@ class GatewaySubmitter:
             if position is None:
                 return SubmitResult(SubmitStatus.FAILED, detail="POSITION_NOT_ASSIGNED")
             try:
-                await record_position(position)
+                entry_price = await record_position(position)
             except Exception as error:
                 return SubmitResult(
                     SubmitStatus.BLOCKED, detail=getattr(error, "reason", "POSITION_NOT_RECORDED")
@@ -798,7 +807,7 @@ class GatewaySubmitter:
         result = await execute_command(self._service, command)
         if result.status is SubmitStatus.CONFIRMED:
             try:
-                await self._book.book(command.command_id, market.price)
+                await self._book.book(command.command_id, entry_price)
             except Exception as error:
                 # The fill is real: confirm it anyway, the position cycle books it later.
                 self._log.error(
@@ -950,6 +959,11 @@ class EntryExecutor:
                 self._cancel(plan_id)
                 return self._finish(mode, EntryResult(EntryStatus.BLOCKED, plan_id, reason))
             drift = anchor.active_bin_id - planned.active_bin_id
+            refusal = fresh_high_refusal(plan, market, drift)
+            if refusal is not None:
+                self._log.info("entry_not_near_local_high", plan_id=str(plan_id), drift=drift)
+                self._cancel(plan_id)
+                return self._finish(mode, EntryResult(EntryStatus.BLOCKED, plan_id, refusal))
         try:
             self._modes.claim_entry(plan_id, self._clock.now())
         except ValueError as error:
@@ -1078,7 +1092,7 @@ class EntryExecutor:
         range follows the active bin the command was anchored on (``drift`` bins from the
         snapshot's)."""
 
-        async def record(position_id: str) -> None:
+        async def record(position_id: str) -> Decimal:
             context = _position_context(
                 plan_id, decision_id, sized, market, command.mode, command,
                 position_id=position_id,
@@ -1094,6 +1108,7 @@ class EntryExecutor:
                     "position context could not be persisted; money execution was blocked",
                 )
                 raise EntryBlocked("AUDIT_PERSISTENCE_FAILED") from error
+            return context.entry_price
 
         return record
 
@@ -1251,6 +1266,43 @@ def fail_entry_plan(modes: ModeRepository, plan_id: UUID) -> None:
         get_logger("worker.entries").error(
             "entry_fail_not_recorded", plan_id=str(plan_id), **error_fields(error)
         )
+
+
+_NOT_NEAR_LOCAL_HIGH = StrategyRejection.NOT_NEAR_LOCAL_HIGH.value
+
+
+def fresh_high_refusal(plan: StrategyPlan, market: PoolSnapshot, drift: int) -> str | None:
+    """``NOT_NEAR_LOCAL_HIGH`` when a Bid-Ask "from the high" no longer is (spec 6.8, No 31).
+
+    The planner checked the rule on the sweep's price; a non-SHADOW entry opens around the
+    freshly read active bin, ``drift`` bins away, whose price is the sweep's moved as many
+    bin steps - within the liquidity slippage that may be a third of the range below the
+    plan. The rule is re-checked there with the high and the fraction the plan recorded in
+    its evidence (``local_high_price``, the threshold of ``price_to_local_high``); without
+    them nothing proves the entry is from the high, so it is refused. Other plans: ``None``.
+    """
+
+    if plan.selection_reason is not StrategySelectionReason.BID_ASK_FROM_LOCAL_HIGH:
+        return None
+    evidence = {item.name: item for item in plan.selection_evidence}
+    high_item = evidence.get("local_high_price")
+    ratio_item = evidence.get("price_to_local_high")
+    high = _evidence_decimal(None if high_item is None else high_item.value)
+    fraction = _evidence_decimal(None if ratio_item is None else ratio_item.threshold)
+    if high is None or fraction is None or high <= 0 or market.bin_step <= 0:
+        return _NOT_NEAR_LOCAL_HIGH
+    step = Decimal(1) + Decimal(market.bin_step) / _BPS
+    return None if market.price * step**drift >= high * fraction else _NOT_NEAR_LOCAL_HIGH
+
+
+def _evidence_decimal(text: str | None) -> Decimal | None:
+    if text is None:
+        return None
+    try:
+        value = Decimal(text)
+    except ArithmeticError:
+        return None
+    return value if value.is_finite() else None
 
 
 def _claim_reason(error: ValueError) -> str:
@@ -1504,6 +1556,9 @@ _SALE_ACTION_STATUS = {
     SaleStatus.SELLING: PositionActionStatus.SELLING,
 }
 _PRICE_IMPACT_BREACH = "PRICE_IMPACT_BREACH"
+# Refusals of a part that a smaller part may pass: the quote's impact above the limit, or a
+# pool without liquidity for the whole part (the official SDK's quote error, executor sdk.ts).
+_SPLIT_CODES = frozenset({_PRICE_IMPACT_BREACH, "SWAP_QUOTE_INSUFFICIENT_LIQUIDITY"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -1560,14 +1615,15 @@ def _sold_by(record: ExecutionRecord) -> int:
 
 
 def _breached(record: ExecutionRecord) -> bool:
-    """The part was refused for its quoted impact (nothing was sent): sell a smaller one."""
+    """The part was refused for its quoted impact or the pool's liquidity (nothing was
+    sent): sell a smaller one."""
 
     if record.receipt is not None:
         return False
     errors = record.simulation.errors
     if errors:
-        return errors[0].code == _PRICE_IMPACT_BREACH
-    return swap_rejection(record.command, record.simulation) == _PRICE_IMPACT_BREACH
+        return errors[0].code in _SPLIT_CODES
+    return swap_rejection(record.command, record.simulation) in _SPLIT_CODES
 
 
 def _plan_sale(
@@ -1644,11 +1700,20 @@ class _Attempt:
     record: ExecutionRecord
 
 
-# Conditions a later successful gateway action of the same position has cleared.
+# Conditions of a sale that its next confirmed part has cleared: the gateway answered and
+# sold. Never the verdicts that need a person (unsold, failed attempts, unknown amount).
+_CLEARED_BY_SALE_PART = ("EXIT_SALE_GATEWAY_UNAVAILABLE",)
+# Conditions a later successful gateway action of the same position has cleared; a CLOSE is
+# booked only once every sale of the position has ended, so the sales' transient
+# conditions are cleared with it.
 _CLEARED_BY_GATEWAY_SUCCESS = (
     "POSITION_ACTION_FAILED",
     "EXIT_GATEWAY_UNAVAILABLE",
     "EXIT_REQUIRES_EXECUTION_GATEWAY",
+    *_CLEARED_BY_SALE_PART,
+    # Only while a part was live or could not be recorded; the CLOSE books after both ended.
+    "EXIT_SALE_OUTCOME_UNKNOWN",
+    "EXIT_SALE_BLOCKED",
 )
 
 
@@ -2068,7 +2133,7 @@ class GatewayPositionManager:
                     SaleStatus.SELLING, returned, plan.sold, plan.confirmed, "NEXT_PART"
                 )
             if plan.active is not None:
-                progress = await self._continue_part(plan.active.record)
+                progress = await self._continue_part(position_id, attempt, plan.active.record)
                 if progress is not None:
                     return replace(progress, returned=returned, sold=plan.sold)
                 sent = True
@@ -2130,7 +2195,7 @@ class GatewayPositionManager:
                     "EXIT_SALE_IMPACT_EXCEEDED",
                     f"{returned - sold} base units the exit returned stay unsold: even the "
                     f"smallest part quotes above the {self._swap.max_price_impact_bps} bps "
-                    "impact limit; the operator decides",
+                    "impact limit or finds no liquidity in the pool; the operator decides",
                 ),
                 "ATTEMPTS_EXHAUSTED": (
                     "EXIT_SALE_FAILED",
@@ -2142,7 +2207,9 @@ class GatewayPositionManager:
             self._sale_alert(code, position_id, attempt, text)
         return SaleProgress(plan.verdict or SaleStatus.SOLD, returned, sold, confirmed, plan.detail)
 
-    async def _continue_part(self, record: ExecutionRecord) -> SaleProgress | None:
+    async def _continue_part(
+        self, position_id: str, attempt: int, record: ExecutionRecord
+    ) -> SaleProgress | None:
         """Drive the live part; ``None`` when it was just sent (or settled) this cycle."""
 
         if record.phase is ExecutionPhase.AWAITING_APPROVAL:
@@ -2152,13 +2219,67 @@ class GatewayPositionManager:
                 state = await self._service.reconcile(record.command.command_id)
             except Exception as error:
                 self._log.warning("sale_reconcile_failed", **error_fields(error))
-                return SaleProgress(SaleStatus.PENDING, detail="SALE_OUTCOME_UNKNOWN")
+                return self._unresolved_part(
+                    position_id, attempt, record, record.receipt, "SALE_OUTCOME_UNKNOWN"
+                )
             outcome = settled_result(state, record.command, blocked=record.phase.value)
+            if outcome.status is SubmitStatus.PENDING:
+                return self._unresolved_part(
+                    position_id, attempt, record, state.receipt, outcome.detail
+                )
         else:
             outcome = await execute_command(self._service, record.command)
         if outcome.status is SubmitStatus.PENDING:
             return SaleProgress(SaleStatus.PENDING, detail=outcome.detail)
+        if outcome.status is SubmitStatus.CONFIRMED:
+            self._part_sold(position_id, attempt)
         return None
+
+    def _unresolved_part(
+        self,
+        position_id: str,
+        attempt: int,
+        record: ExecutionRecord,
+        receipt: GatewayReceipt | None,
+        detail: str | None,
+    ) -> SaleProgress:
+        """A part still unresolved after reconciliation holds the sale (never resent).
+
+        Past the moment its outcome should be known - its command expired while the
+        executor holds no receipt for it (the executor refuses an expired command), or
+        ``settlement_timeout`` since a receipt it does hold - the hold is no longer
+        silent: a critical alert, once per exit attempt; the operator checks the wallet."""
+
+        now = self._clock.now()
+        overdue = (
+            now >= record.command.expires_at
+            if receipt is None
+            else now - receipt.submitted_at >= self._swap.settlement_timeout
+        )
+        if overdue:
+            self._sale_alert(
+                "EXIT_SALE_OUTCOME_UNKNOWN",
+                position_id,
+                attempt,
+                f"the outcome of sale part {record.command.idempotency_key} is still unknown "
+                "to the executor; nothing more of this exit is sold or booked until it is "
+                "known - the operator checks the wallet",
+            )
+        return SaleProgress(SaleStatus.PENDING, detail=detail)
+
+    def _part_sold(self, position_id: str, attempt: int) -> None:
+        """A part of this exit attempt's sale turned CONFIRMED just now: the gateway carried
+        it, so the attempt's transient conditions raised before this moment are moot (spec
+        7.1: no stale critical alert). Only this attempt's: from here on only later parts of
+        it start, and each part's outage alerts under its own dedupe key (a later outage is
+        a new open alert, never one the reporter already counts as raised)."""
+
+        self._cleared.resolve(
+            _CLEARED_BY_SALE_PART,
+            _sale_subject(position_id, attempt),
+            "a part of the sale after the exit went through the gateway",
+            raised_before=self._clock.now(),
+        )
 
     async def _start_part(
         self, position: ShadowPosition, attempt: int, plan: _SalePlan
@@ -2169,6 +2290,13 @@ class GatewayPositionManager:
         position_id = position.position_id
         context = await self._contexts.get(position_id)
         if context is None:
+            # As the exit's own start: the condition needs a person, never a silent wait.
+            self._alerts.raise_alert(
+                "POSITION_CONTEXT_MISSING",
+                f"open position {position_id} has no durable context; the base token its "
+                "exit returned cannot be sold " + alert_subject("position", position_id),
+                dedupe_key=f"context:{position_id}",
+            )
             return SaleProgress(SaleStatus.PENDING, detail="CONTEXT_MISSING")
         if plan.renew is not None:
             number, preview = plan.renew.number, plan.renew.preview + 1
@@ -2195,15 +2323,15 @@ class GatewayPositionManager:
         try:
             prepared = await self._service.prepare(command.command_id)
         except SimulationRejected as refused:
-            if refused.code == _PRICE_IMPACT_BREACH:
+            if refused.code in _SPLIT_CODES:
                 return _BREACHED
             return SaleProgress(SaleStatus.SELLING, detail=refused.code)
         except GatewayRejected as error:
-            return self._sale_gateway_unavailable(position_id, attempt, error)
+            return self._sale_gateway_unavailable(position_id, attempt, command, error)
         except ExecutionBlocked as error:
-            return SaleProgress(SaleStatus.SELLING, detail=str(error))
+            return await self._sale_blocked(position_id, attempt, command, error)
         except Exception as error:
-            return self._sale_gateway_unavailable(position_id, attempt, error)
+            return self._sale_gateway_unavailable(position_id, attempt, command, error)
         finally:
             self._resolver.discard(command.command_id)
         if prepared.phase is ExecutionPhase.AWAITING_APPROVAL:
@@ -2211,11 +2339,41 @@ class GatewayPositionManager:
         outcome = await execute_command(self._service, command)
         if outcome.status is SubmitStatus.PENDING:
             return SaleProgress(SaleStatus.PENDING, detail=outcome.detail)
+        if outcome.status is SubmitStatus.CONFIRMED:
+            self._part_sold(position_id, attempt)
         return None
 
-    def _sale_gateway_unavailable(
-        self, position_id: str, attempt: int, error: Exception
+    async def _sale_blocked(
+        self, position_id: str, attempt: int, command: DlmmCommand, error: Exception
     ) -> SaleProgress:
+        """``prepare`` refused the part. A stored (FAILED) record is a part the next cycle
+        counts as an attempt; without one nothing would ever count, so the sale's wait
+        becomes a critical alert (once per exit attempt) instead of a silent retry."""
+
+        try:
+            record = await self._executions.get(command.command_id)
+        except Exception as read_error:
+            self._log.error("execution_record_unavailable", **error_fields(read_error))
+            record = None
+        if record is not None:
+            return SaleProgress(SaleStatus.SELLING, detail=str(error))
+        self._log.error("sale_blocked", position_id=position_id, **error_fields(error))
+        self._sale_alert(
+            "EXIT_SALE_BLOCKED",
+            position_id,
+            attempt,
+            f"sale part {command.idempotency_key} was refused before it was recorded "
+            f"({error}); the base token stays unsold until the operator checks it",
+        )
+        return SaleProgress(SaleStatus.SELLING, detail="SALE_BLOCKED")
+
+    def _sale_gateway_unavailable(
+        self, position_id: str, attempt: int, command: DlmmCommand, error: Exception
+    ) -> SaleProgress:
+        """One open alert per outage: keyed by the part (and card) it held up, so the same
+        part failing every cycle raises it once, and an outage after a sold part - which a
+        sold part closed for the earlier ones - raises a new one."""
+
         self._log.error("sale_gateway_unavailable", position_id=position_id, **error_fields(error))
         self._sale_alert(
             "EXIT_SALE_GATEWAY_UNAVAILABLE",
@@ -2223,15 +2381,26 @@ class GatewayPositionManager:
             attempt,
             "the base token the exit returned is not sold yet: the execution gateway is "
             "unavailable; the sale goes on when it answers",
+            dedupe_key=f"exit_sale_gateway_unavailable:{command.idempotency_key}",
         )
         return SaleProgress(SaleStatus.PENDING, detail="GATEWAY_UNAVAILABLE")
 
-    def _sale_alert(self, code: str, position_id: str, attempt: int, text: str) -> None:
+    def _sale_alert(
+        self,
+        code: str,
+        position_id: str,
+        attempt: int,
+        text: str,
+        *,
+        dedupe_key: str | None = None,
+    ) -> None:
         self._alerts.raise_alert(
             code,
             f"position {position_id} (exit attempt {attempt}): {text} "
-            + alert_subject("position", position_id),
-            dedupe_key=f"{code.lower()}:{position_id}:{attempt}",
+            + alert_subject("position", position_id)
+            + " "
+            + _sale_subject(position_id, attempt),
+            dedupe_key=dedupe_key or f"{code.lower()}:{position_id}:{attempt}",
         )
 
     def _sale_fill(self, record: ExecutionRecord, mark: Decimal) -> SaleFill:
@@ -2367,6 +2536,12 @@ async def _gallop(
 
 # A sale part refused for its quoted impact: the caller simulates a smaller one.
 _BREACHED = object()
+
+
+def _sale_subject(position_id: str, attempt: int) -> str:
+    """The tag of an alert about the sale of what one exit attempt returned."""
+
+    return alert_subject("exit-sale", f"{position_id}:{attempt}")
 
 
 def _expired_unapproved(record: ExecutionRecord, now: datetime) -> bool:

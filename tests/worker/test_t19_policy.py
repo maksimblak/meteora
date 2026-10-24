@@ -1,4 +1,5 @@
-"""T19: the SHADOW cost model pays the executor's priority fee ceiling (spec 6.8, No 49)."""
+"""T19: the SHADOW cost model books a priority fee bounded by the executor's ceiling (spec 6.8,
+No 49); since F4 it books the guide-v1 estimate, not the ceiling (tests/worker/test_f4_policy)."""
 
 from decimal import Decimal
 
@@ -12,18 +13,19 @@ from src.worker.policy import (
 )
 
 
-def test_shadow_costs_pay_the_priority_fee_ceiling_of_the_executor() -> None:
+def test_shadow_costs_never_book_more_than_the_priority_fee_ceiling_of_the_executor() -> None:
     default = load_pipeline_policy({})
-    tuned = load_pipeline_policy({PRIORITY_FEE_MAX_ENV: "5000000"})
-    legacy = load_pipeline_policy({RULESET_VERSION_ENV: LEGACY_RULESET_VERSION})
+    capped = load_pipeline_policy({PRIORITY_FEE_MAX_ENV: "5000"})
+    legacy = load_pipeline_policy(
+        {RULESET_VERSION_ENV: LEGACY_RULESET_VERSION, PRIORITY_FEE_MAX_ENV: "5000"}
+    )
 
     # PRIORITY_FEE_MAX_LAMPORTS defaults to 0.015 SOL a transaction, as in the executor.
-    assert default.shadow_costs.priority_fee_lamports == 15_000_000
-    assert default.conservative_costs.priority_fee_lamports == 15_000_000
-    assert tuned.shadow_costs.priority_fee_lamports == 5_000_000
-    assert tuned.conservative_costs.priority_fee_lamports == 5_000_000
+    assert 0 < default.shadow_costs.priority_fee_lamports < 15_000_000
+    assert capped.shadow_costs.priority_fee_lamports == 5_000
+    assert capped.conservative_costs.priority_fee_lamports == 5_000
     # A cost of the network, not of a ruleset.
-    assert legacy.shadow_costs.priority_fee_lamports == 15_000_000
+    assert legacy.shadow_costs.priority_fee_lamports == 5_000
     assert default.shadow_costs.slippage_bps == 50
 
 
