@@ -1,10 +1,12 @@
 """Hard filters run before a transparent weighted score."""
 
+import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
-from enum import StrEnum
+from functools import lru_cache
 
 from src.domain.features import SignalReadiness, VolumeSpikeFeatures
 from src.domain.models.trading import TradingMode
@@ -24,10 +26,12 @@ from src.domain.screening.models import (
     ScoreComponent,
     ScreeningPolicy,
     TokenSelection,
+    TokenVolumeSource,
     VolumeIntegrityAssessment,
     VolumeIntegrityMode,
     VolumeRegime,
 )
+from src.domain.screening.pairs import PairShape, pair_token
 from src.market.models import (
     AuthorityStatus,
     DataQuality,
@@ -244,14 +248,6 @@ _SHORT_MINUTES = Decimal(5)
 _HOUR_MINUTES = Decimal(60)
 
 
-class TokenVolumeSource(StrEnum):
-    """Where the token-level volume of a decision came from (G24)."""
-
-    GMGN = "GMGN"  # a fresh enhanced reading over every pool of the token
-    DLMM_POOLS = "DLMM_POOLS"  # the sum of the token's DLMM pools (``TOKEN_VOLUME_POOL_ONLY``)
-    PENDING = "PENDING"  # the enhanced source is asked only after the cheap filters
-
-
 @dataclass(frozen=True, slots=True)
 class _TokenVolume:
     source: TokenVolumeSource
@@ -268,12 +264,13 @@ def _fresh_reading(token: TokenRiskSnapshot) -> EnhancedTokenSignals | None:
 def _token_volume(
     token: TokenRiskSnapshot, features: VolumeSpikeFeatures, selection: TokenSelection
 ) -> _TokenVolume:
-    """The token's volume as the author reads it in GMGN: over every pool of the token.
+    """The token's volume as the author reads it: GMGN's token volume, as in Trending.
 
-    A fresh enhanced reading with both windows is that figure. Without one the token's
-    DLMM pools are summed - this pool's own windows plus its siblings' - and the decision is
-    flagged ``TOKEN_VOLUME_POOL_ONLY``; on other venues the token may trade far more. While
-    an enhanced source is still to be asked (``enhanced_pending``), nothing is decided.
+    A fresh enhanced reading with both windows is that figure (GMGN does not say which
+    venues it counts, F5). Without one the token's DLMM pools are summed - this pool's own
+    windows plus its siblings' - and the decision is flagged ``TOKEN_VOLUME_POOL_ONLY``; on
+    other venues the token may trade far more. While an enhanced source is still to be asked
+    (``enhanced_pending``), nothing is decided.
     """
 
     pools = 1 + selection.sibling_pools
@@ -314,19 +311,62 @@ def _normalized_text(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold().replace("ё", "е")
 
 
-def _theme(pool: PoolSnapshot, words: tuple[str, ...]) -> str | None:
-    """The first excluded word found in the base token's name or ticker, if any."""
+_LETTER_RUN = re.compile(r"[^\W\d_]+")
 
-    texts = [
-        _normalized_text(text)
-        for text in (pool.base_token_name, pool.base_token_symbol)
-        if text is not None
-    ]
-    for word in words:
-        needle = _normalized_text(word.strip())
-        if any(needle in text for text in texts):
+
+def _words(text: str) -> set[str]:
+    """The words of a name or ticker: each run of letters whole and split where its case
+    turns from lower to upper (``ElonDoge`` -> ``elondoge``, ``elon``, ``doge``)."""
+
+    found: set[str] = set()
+    for run in _LETTER_RUN.findall(unicodedata.normalize("NFKC", text)):
+        found.add(_normalized_text(run))
+        start = 0
+        for index in range(1, len(run)):
+            if run[index - 1].islower() and run[index].isupper():
+                found.add(_normalized_text(run[start:index]))
+                start = index
+        if start:
+            found.add(_normalized_text(run[start:]))
+    return found
+
+
+@lru_cache(maxsize=8)
+def _theme_matchers(
+    words: tuple[str, ...], affixes: tuple[str, ...]
+) -> tuple[tuple[str, re.Pattern[str]], ...]:
+    """Per excluded word, the pattern a whole word must match: the theme word, glued to
+    meme affixes or other theme words on either side; a final ``*`` makes it a stem."""
+
+    cores = [_normalized_text(word.strip()).removesuffix("*") for word in words]
+    pieces = sorted({*(_normalized_text(affix.strip()) for affix in affixes), *cores},
+                    key=len, reverse=True)
+    glue = "(?:" + "|".join(re.escape(piece) for piece in pieces) + ")*"
+    return tuple(
+        (word, re.compile(glue + re.escape(core) + (r"\w*" if word.strip().endswith("*")
+                                                    else glue)))
+        for word, core in zip(words, cores, strict=True)
+    )
+
+
+def _theme(pool: PoolSnapshot, rules: GuideScreeningRules) -> str | None:
+    """The first excluded word that a word of the base token's name or ticker is (F5)."""
+
+    found: set[str] = set()
+    for text in (pool.base_token_name, pool.base_token_symbol):
+        if text is not None:
+            found |= _words(text)
+    for word, pattern in _theme_matchers(rules.excluded_theme_words, rules.theme_affixes):
+        if any(pattern.fullmatch(item) for item in found):
             return word
     return None
+
+
+_PAIR_REASONS = {
+    PairShape.TOKEN_SECOND: RejectionCode.TOKEN_SECOND_IN_PAIR,
+    PairShape.QUOTE_ONLY: RejectionCode.PAIR_OF_QUOTE_TOKENS,
+    PairShape.NO_QUOTE: RejectionCode.PAIR_WITHOUT_QUOTE_TOKEN,
+}
 
 
 def assess_guide_thresholds(
@@ -352,7 +392,14 @@ def assess_guide_thresholds(
     flags: list[DecisionFlag] = []
     reading = _fresh_reading(token)
 
-    theme = _theme(pool, rules.excluded_theme_words)
+    # Only the coin first and a quote token second can be priced and entered (F5).
+    pair = pair_token(pool.pool)
+    pair_reason = _PAIR_REASONS.get(pair.shape)
+    if pair_reason is not None:
+        reasons.append(pair_reason)
+    evidence.append(EvidenceItem(name="pool_pair", value=pair.shape.value))
+
+    theme = _theme(pool, rules)
     if theme is not None:
         reasons.append(RejectionCode.THEME_EXCLUDED)
     named = pool.base_token_name is not None or pool.base_token_symbol is not None
@@ -824,6 +871,13 @@ class PoolScreener:
                         else str(selection.rank_limit),
                     ),
                 )
+                if selection.rank_source is not None:
+                    evidence = (
+                        *evidence,
+                        EvidenceItem(
+                            name="token_volume_rank_source", value=selection.rank_source.value
+                        ),
+                    )
                 if selection.rank_limit is not None and selection.rank > selection.rank_limit:
                     reasons.append(RejectionCode.CANDIDATE_RANK_BELOW_LIMIT)
         reasons = list(dict.fromkeys(reasons))
@@ -998,6 +1052,32 @@ class PoolScreener:
         ):
             reasons.append(RejectionCode.VOLUME_SIGNAL_BELOW_THRESHOLD)
         return reasons
+
+
+def refuse_candidate(
+    decision: CandidateDecision,
+    reasons: Sequence[RejectionCode],
+    evidence: Sequence[EvidenceItem] = (),
+) -> CandidateDecision:
+    """An accepted candidate the strategy found no plan for (spec 6.8, F5): plan-less, so
+    not accepted - REJECT with the strategy's ``reasons``. The score and the screening's
+    evidence stay; the strategy's ``evidence`` is added under the names not yet recorded."""
+
+    if decision.status is not CandidateStatus.ACCEPT:
+        raise ValueError("only an accepted candidate can be refused by its strategy")
+    if not reasons:
+        raise ValueError("a refused candidate needs the strategy's reasons")
+    recorded = {item.name for item in decision.evidence}
+    data = decision.model_dump()
+    data.update(
+        status=CandidateStatus.REJECT,
+        reasons=tuple(dict.fromkeys((*decision.reasons, *reasons))),
+        evidence=(
+            *decision.evidence,
+            *(item for item in evidence if item.name not in recorded),
+        ),
+    )
+    return CandidateDecision.model_validate(data)
 
 
 def _holder_concentration_high(share: Decimal | None, policy: ScreeningPolicy) -> bool:

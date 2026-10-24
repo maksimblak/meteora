@@ -652,6 +652,9 @@ def _quote(value: Any, arrived_at: datetime) -> _PoolQuote:
         raise _Rejected("malformed")
     token_x = _section(value, "token_x")
     token_y = _section(value, "token_y")
+    # ``base_mint``/``quote_mint`` are the pair's sides in on-chain order: the price is
+    # token_y per token_x and the active bin and decimals are read by side. Which side is
+    # the coin (SOL-MEME is a pool of MEME) is decided by ``pair_token`` (F5), not here.
     pool = PoolRef(
         address=_key(value, "address", "address"),
         base_mint=_key(token_x, "address", "token_x.address"),

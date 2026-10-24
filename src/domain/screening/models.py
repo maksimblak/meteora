@@ -1,5 +1,6 @@
 """Immutable screening inputs, policy, and audit-ready decisions."""
 
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -87,6 +88,15 @@ class RejectionCode(StrEnum):
     DEVELOPER_HOLDS_TOKENS = "DEVELOPER_HOLDS_TOKENS"  # noqa: S105 - stable domain code
     # A candidate whose token ranked below the cycle's deep-check limit by hourly volume.
     CANDIDATE_RANK_BELOW_LIMIT = "CANDIDATE_RANK_BELOW_LIMIT"
+    # The pair (``pairs.pair_token``, F5): prices, bins and quotes are taken from token_x,
+    # so guide-v1 enters only a pool of the coin first and a quote token second.
+    TOKEN_SECOND_IN_PAIR = "TOKEN_SECOND_IN_PAIR"  # noqa: S105 - stable domain code
+    PAIR_OF_QUOTE_TOKENS = "PAIR_OF_QUOTE_TOKENS"  # noqa: S105 - stable domain code
+    PAIR_WITHOUT_QUOTE_TOKEN = "PAIR_WITHOUT_QUOTE_TOKEN"  # noqa: S105 - stable domain code
+    # The strategy found no plan for a screened candidate (spec 6.8, F5): the candidate's
+    # outcome, recorded with ``refuse_candidate``; same names as ``StrategyRejection``.
+    NOT_NEAR_LOCAL_HIGH = "NOT_NEAR_LOCAL_HIGH"
+    RANGE_TOO_NARROW = "RANGE_TOO_NARROW"
 
 
 class DecisionFlag(StrEnum):
@@ -116,8 +126,8 @@ class DecisionFlag(StrEnum):
     TOKEN_RISK_UNAVAILABLE = "TOKEN_RISK_UNAVAILABLE"  # noqa: S105 - stable domain code
     # G24: the 5m window spiked (ratio, robust z and 30m confirmation): a score bonus.
     VOLUME_SPIKE = "VOLUME_SPIKE"
-    # G24: token volume is the sum of the token's DLMM pools, not GMGN's figure over every
-    # pool of the token (no key, or no fresh GMGN reading).
+    # G24: token volume is the sum of the token's DLMM pools, not GMGN's token volume as in
+    # Trending (no key, or no fresh GMGN reading).
     TOKEN_VOLUME_POOL_ONLY = "TOKEN_VOLUME_POOL_ONLY"  # noqa: S105 - stable domain code
     # GMGN counts more launch snipers than the guide-v1 maximum ("большие - ждать").
     SNIPERS_HIGH = "SNIPERS_HIGH"
@@ -306,9 +316,12 @@ class GmgnScreeningRules(BaseModel):
 
 
 # The author skips coins about Elon and Trump "in 99% of cases" (guide, video 2 19:05) and
-# tries to skip political and stream coins (guide, "щитки"). Matched as substrings of the
-# token's name and ticker, case-insensitively, in Latin and Cyrillic; "MELON" contains "elon"
-# and is skipped too - a missed coin is the safe side. The list is a guide-v1 setting.
+# tries to skip political and stream coins (guide, "щитки"). Matched against the words of the
+# token's name and ticker, case-insensitively, in Latin and Cyrillic (F5): a word is the
+# theme word itself, or the theme word glued to meme affixes and other theme words
+# (ELONDOGE, BABYTRUMP, ELONMUSK); a word ending with ``*`` is a stem ("politic*" -
+# Political, Politics). A word merely containing one (WATERMELON, Trumpet, MAGAZINE,
+# Маска, Mainstream) is an ordinary coin. The list is a guide-v1 setting.
 DEFAULT_THEME_WORDS: tuple[str, ...] = (
     "elon",
     "musk",
@@ -328,19 +341,77 @@ DEFAULT_THEME_WORDS: tuple[str, ...] = (
     "обама",
     "putin",
     "путин",
-    "zelensky",
-    "зеленск",
-    "politic",
-    "политик",
-    "president",
-    "президент",
-    "election",
+    "zelensk*",
+    "зеленск*",
+    "politic*",
+    "политик*",
+    "president*",
+    "президент*",
+    "election*",
     "выборы",
-    "stream",
-    "стрим",
+    "stream*",
+    "стрим*",
     "twitch",
     "твич",
 )
+# Meme words glued to a theme word in a ticker (BABYTRUMP, ELONDOGE, MAGAHAT). None is a
+# piece of an ordinary word around a theme word (no "s", "et", "zine", "а", "up", "main").
+DEFAULT_THEME_AFFIXES: tuple[str, ...] = (
+    "baby",
+    "mini",
+    "lil",
+    "little",
+    "big",
+    "fat",
+    "based",
+    "super",
+    "mega",
+    "ultra",
+    "king",
+    "queen",
+    "lord",
+    "sir",
+    "mister",
+    "mr",
+    "dr",
+    "dark",
+    "real",
+    "official",
+    "pepe",
+    "doge",
+    "shib",
+    "inu",
+    "wif",
+    "hat",
+    "cat",
+    "dog",
+    "frog",
+    "bonk",
+    "coin",
+    "token",
+    "meme",
+    "ai",
+    "gpt",
+    "moon",
+    "sol",
+    "fan",
+    "fans",
+    "army",
+    "classic",
+    "бэби",
+    "беби",
+    "мини",
+    "супер",
+    "мега",
+    "кинг",
+    "кот",
+    "пес",
+    "доге",
+    "коин",
+    "токен",
+    "мем",
+)
+_LETTERS_ONLY = re.compile(r"[^\W\d_]+")
 
 
 class GuideScoreWeights(BaseModel):
@@ -402,6 +473,8 @@ class GuideScreeningRules(BaseModel):
     excluded_theme_words: tuple[str, ...] = DEFAULT_THEME_WORDS
     revived_token_age: timedelta = timedelta(days=60)
     weights: GuideScoreWeights = GuideScoreWeights()
+    # Meme words a theme word may be glued to in one word (see ``DEFAULT_THEME_WORDS``).
+    theme_affixes: tuple[str, ...] = DEFAULT_THEME_AFFIXES
 
     _reject_float = field_validator(
         "minimum_market_cap",
@@ -441,9 +514,25 @@ class GuideScreeningRules(BaseModel):
             raise ValueError("preferred_market_cap is below minimum_market_cap")
         if self.overvolume_volume_per_minute < self.minimum_volume_per_minute:
             raise ValueError("overvolume threshold is below the working volume threshold")
-        if any(not word.strip() for word in self.excluded_theme_words):
-            raise ValueError("an excluded theme word must not be blank")
+        if not all(
+            _LETTERS_ONLY.fullmatch(word.strip().removesuffix("*"))
+            for word in self.excluded_theme_words
+        ):
+            raise ValueError(
+                "an excluded theme word is one word of letters, optionally ending with *"
+            )
+        if not all(_LETTERS_ONLY.fullmatch(affix.strip()) for affix in self.theme_affixes):
+            raise ValueError("a theme affix is one word of letters")
         return self
+
+
+class TokenVolumeSource(StrEnum):
+    """Where a token-level volume of a decision came from (G24)."""
+
+    # A fresh GMGN reading: the token's volume as GMGN reports it, as in Trending (F5).
+    GMGN = "GMGN"
+    DLMM_POOLS = "DLMM_POOLS"  # the sum of the token's DLMM pools (``TOKEN_VOLUME_POOL_ONLY``)
+    PENDING = "PENDING"  # the enhanced source is asked only after the cheap filters
 
 
 class TokenSelection(BaseModel):
@@ -455,7 +544,8 @@ class TokenSelection(BaseModel):
     in flight already holds the token. ``enhanced_pending``: an enhanced source (GMGN) will
     report the token's own volume after the cheap filters, so pool sums must not decide it
     yet. ``rank``/``rank_limit``: the token's place among the cycle's candidates by hourly
-    volume and how many of them are checked in depth.
+    volume and how many of them are checked in depth; ``rank_source``: whose hourly volume
+    ranked it - GMGN's reading already held for the token, else its DLMM pools' sum (F5).
     """
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
@@ -468,6 +558,7 @@ class TokenSelection(BaseModel):
     enhanced_pending: bool = False
     rank: int | None = None
     rank_limit: int | None = None
+    rank_source: TokenVolumeSource | None = None
 
     _reject_float = field_validator("sibling_volume_1h", "sibling_volume_5m", mode="before")(
         _exact_decimal

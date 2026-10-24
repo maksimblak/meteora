@@ -20,7 +20,8 @@ def test_the_guide_defaults_are_the_spec_6_8_starting_values() -> None:
     assert guide.maximum_hourly_turnover == Decimal("10")
     assert guide.revived_token_age == timedelta(days=60)
     assert guide.gmgn.maximum_sniper_count == 20
-    assert {"elon", "илон", "trump", "трамп", "maga", "stream", "стрим"} <= set(
+    # F5: "stream*" is a stem (Streamer, Стример), not a substring (Mainstream).
+    assert {"elon", "илон", "trump", "трамп", "maga", "stream*", "стрим*"} <= set(
         guide.excluded_theme_words
     )
     assert guide.excluded_theme_words == DEFAULT_THEME_WORDS

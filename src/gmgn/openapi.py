@@ -304,10 +304,20 @@ class GmgnOpenApiProvider:
             ProviderState.DEGRADED, self._unavailable_in_row, self._last_detail, None
         )
 
+    def cached_signals(self, mint: PublicKey) -> EnhancedTokenSignals | None:
+        """The good reading of ``mint`` still in the cache, or ``None``; never a request.
+
+        The candidate cycle ranks tokens by the GMGN volume it already holds (F5)."""
+
+        cached = self._cache.get(mint.root)
+        if cached is not None and self._clock.now() - cached.source_at < self._cache_ttl:
+            return cached
+        return None
+
     async def get_token_signals(self, mint: PublicKey) -> EnhancedTokenSignals:
         key = mint.root
-        cached = self._cache.get(key)
-        if cached is not None and self._clock.now() - cached.source_at < self._cache_ttl:
+        cached = self.cached_signals(mint)
+        if cached is not None:
             return cached
         task = self._inflight.get(key)
         if task is None:
@@ -622,10 +632,13 @@ def _market(
     """Token-level market figures of token info (T18) - the same request, no extra weight.
 
     Source, checked against gmgn-token SKILL.md and the live answers of 2026-10-24 (WIF and
-    a trending pump.fun token): ``price.volume_5m``/``price.volume_1h`` are USD over every
-    pool of the token (the "1h" volume matched the trending rank's own hourly volume), so
-    no kline request is needed; ``price.price`` is USD and the market cap, which info does
-    not serve, is ``price.price x circulating_supply`` as the SKILL.md says; ``ath_price``
+    a trending pump.fun token): ``price.volume_5m``/``price.volume_1h`` are the token's
+    volume in USD as GMGN reports it, as in Trending - the "1h" figure matched the trending
+    rank's own hourly volume of a one-pool pump.fun token. Which venues GMGN counts is not
+    documented and was not checked (WIF's 1h figure is far below its known turnover), so it
+    is not taken for a sum over the token's pools; no kline request is made. ``price.price``
+    is USD and the market cap, which info does not serve, is
+    ``price.price x circulating_supply`` as the SKILL.md says; ``ath_price``
     is the token's own ATH in USD (``dev.ath_token_info`` is the creator's best token, not
     this one). Snipers: ``wallet_tags_stat.sniper_wallets`` (security's documented
     ``sniper_count`` when info has none) and ``stat.top70_sniper_hold_rate``. The creator's

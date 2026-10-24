@@ -80,6 +80,19 @@ REJECTION = {
     "CANDIDATE_RANK_BELOW_LIMIT": (
         "токен ниже лимита глубокой проверки по часовому объёму — в этом цикле не проверялся"
     ),
+    # The pair (F5): prices, bins and quotes are taken from the first token of the pair.
+    "TOKEN_SECOND_IN_PAIR": (
+        "монета стоит в паре второй (первым — SOL, USDC или USDT): вход в такой пул "
+        "в этой сборке не поддержан, пул считается пулом этой монеты"
+    ),
+    "PAIR_OF_QUOTE_TOKENS": "пара из двух quote-токенов (SOL, USDC, USDT) — это не монета",
+    "PAIR_WITHOUT_QUOTE_TOKEN": "в паре нет SOL, USDC или USDT — вход не поддержан",
+    # The strategy found no plan for a screened candidate (spec 6.8, F5).
+    "NOT_NEAR_LOCAL_HIGH": "цена ниже 90% локального хая за час — бид-аск не с хаёв, плана нет",
+    "RANGE_TOO_NARROW": (
+        "bin step пула не даёт бид-аску глубины 70% в одной позиции SDK — пул не годится, "
+        "плана нет"
+    ),
 }
 
 # D03 / D07 / G18 / D09: the operator-facing line for each non-blocking decision flag.

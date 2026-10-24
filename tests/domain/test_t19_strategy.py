@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from src.domain.risk import LiquidityState, PositionSizer, RiskPolicy, RiskRejection
+from src.domain.risk import LiquidityState, PositionSizer, RiskPolicy
 from src.domain.screening import CandidateDecision, EvidenceItem
 from src.domain.strategy import (
     PositionActionKind,
@@ -130,17 +130,19 @@ def test_bid_ask_needs_seventy_percent_within_one_sdk_position(
 
 
 def test_a_too_narrow_bid_ask_gets_no_size_and_no_plan() -> None:
+    """F5: the refusal is the candidate's outcome (REJECT with the code, see
+    tests/worker/test_f5_strategy_outcome.py); the sizer never takes such a plan."""
+
     result = plan_for(guide_history(bin_step=100))
 
-    sized = PositionSizer().size(
-        result,
-        PORTFOLIO,
-        LiquidityState(depth_base_units=10**12, price_impact_cap_base_units=10**12),
-        RiskPolicy(ruleset_version=RULESET, config_version=CONFIG),
-    )
-
-    assert isinstance(sized, RiskRejection)
-    assert [reason.value for reason in sized.reasons] == ["RANGE_TOO_NARROW"]
+    assert result.blocked_by == (StrategyRejection.RANGE_TOO_NARROW,)
+    with pytest.raises(ValueError, match="refused"):
+        PositionSizer().size(
+            result,
+            PORTFOLIO,
+            LiquidityState(depth_base_units=10**12, price_impact_cap_base_units=10**12),
+            RiskPolicy(ruleset_version=RULESET, config_version=CONFIG),
+        )
 
 
 def test_bid_ask_enters_only_within_ninety_percent_of_the_hours_high() -> None:
@@ -156,18 +158,17 @@ def test_bid_ask_enters_only_within_ninety_percent_of_the_hours_high() -> None:
     assert near.selection_reason is StrategySelectionReason.BID_ASK_FROM_LOCAL_HIGH
 
 
-def test_a_plan_away_from_the_high_is_refused_by_the_sizer_with_its_code() -> None:
+def test_a_plan_away_from_the_high_is_never_sized() -> None:
     result = plan_for(guide_history(prices=("1", "1", "1.25", "1", "1", "1", "1.1")))
 
-    sized = PositionSizer().size(
-        result,
-        PORTFOLIO,
-        LiquidityState(depth_base_units=10**12, price_impact_cap_base_units=10**12),
-        RiskPolicy(ruleset_version=RULESET, config_version=CONFIG),
-    )
-
-    assert isinstance(sized, RiskRejection)
-    assert [reason.value for reason in sized.reasons] == ["NOT_NEAR_LOCAL_HIGH"]
+    assert result.blocked_by == (StrategyRejection.NOT_NEAR_LOCAL_HIGH,)
+    with pytest.raises(ValueError, match="refused"):
+        PositionSizer().size(
+            result,
+            PORTFOLIO,
+            LiquidityState(depth_base_units=10**12, price_impact_cap_base_units=10**12),
+            RiskPolicy(ruleset_version=RULESET, config_version=CONFIG),
+        )
 
 
 # --- Spot on an ATH breakout: the token's ATH, high caps only --------------------------------

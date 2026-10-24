@@ -28,14 +28,9 @@ class PositionSizer:
         if plan.config_version != policy.config_version:
             raise ValueError("plan and risk config versions differ")
         if plan.blocked_by:
-            # The strategy refused the plan (spec 6.8): no capacity, its codes as reasons.
-            return RiskRejection(
-                reasons=tuple(RiskReason(code.value) for code in plan.blocked_by),
-                caps=None,
-                ruleset_version=policy.ruleset_version,
-                config_version=policy.config_version,
-                correlation_id=plan.correlation_id,
-            )
+            # A plan its strategy refused (spec 6.8) is the candidate's outcome - REJECT with
+            # the strategy's code (``refuse_candidate``, F5) - never a size or a risk reason.
+            raise ValueError("a plan its strategy refused cannot be sized")
         loss_fraction = plan.loss_fraction_at_invalidation
         if not Decimal(0) < loss_fraction <= Decimal(1):
             return RiskRejection(

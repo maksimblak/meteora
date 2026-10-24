@@ -38,10 +38,11 @@ import contextlib
 import os
 import signal
 import socket
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Protocol
+from decimal import Decimal
+from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 import httpx
@@ -52,7 +53,8 @@ from src.core.config import AppConfig
 from src.core.logging import configure_logging
 from src.domain.models.primitives import PublicKey
 from src.domain.models.trading import TradingMode
-from src.domain.screening.selection import TokenGroup, token_groups
+from src.domain.screening.pairs import pair_token
+from src.domain.screening.selection import TokenGroup, TokenVolumeLookup, token_groups
 from src.execution.contracts import LivePromotionEvidence
 from src.execution.http_gateway import HttpExecutionGateway, HttpQuoteClient
 from src.execution.service import (
@@ -70,6 +72,7 @@ from src.market.contracts import MarketDataProvider, OnChainProvider, VolumeHist
 from src.market.models import (
     AuthorityStatus,
     DataQuality,
+    EnhancedTokenSignals,
     Freshness,
     PoolSnapshot,
     ProviderHealth,
@@ -198,6 +201,14 @@ class GatewayReadiness(Protocol):
     async def ready(self, mode: TradingMode) -> bool: ...
 
 
+@runtime_checkable
+class CachedTokenSignals(Protocol):
+    """An enhanced source that can say what it already holds, without a request
+    (``GmgnOpenApiProvider.cached_signals``)."""
+
+    def cached_signals(self, mint: PublicKey) -> EnhancedTokenSignals | None: ...
+
+
 class InFlightEntryUnresolved(RuntimeError):
     """An entry in flight whose pool is unknown: no candidate is evaluated this cycle."""
 
@@ -208,7 +219,7 @@ class InFlightEntryUnresolved(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class _BusyEntries:
-    """Pools with an open position or an entry in flight, and their base mints."""
+    """Pools with an open position or an entry in flight, and their tokens' mints."""
 
     pools: set[str] = field(default_factory=set)
     mints: set[str] = field(default_factory=set)
@@ -506,9 +517,11 @@ class WorkerRuntime:
     async def candidate_job(self, context: JobContext) -> None:
         """One candidate cycle, by token as the author works (spec 6.8, G24).
 
-        1. The universe is grouped by base token, tokens ranked by hourly volume summed
-           over their DLMM pools. Pools with an open position or an entry in flight are not
-           evaluated; the token of such a pool is held (``TOKEN_ALREADY_HELD``).
+        1. The universe is grouped by token (the side of a pair that is not a quote token,
+           F5), tokens ranked by hourly volume: GMGN's figure where the OpenAPI source
+           already holds a reading of the token, else the sum over its DLMM pools. Pools
+           with an open position or an entry in flight are not evaluated; the token of such
+           a pool is held (``TOKEN_ALREADY_HELD``).
         2. Cheap filters, no request: a token's pools are tried main pool first (largest
            LP fees in the hour, then TVL); the first that passes is the token's candidate,
            the ones before it are recorded with their rejects, the rest wait.
@@ -524,10 +537,10 @@ class WorkerRuntime:
             # Approved and interrupted entries first, under this job's lease.
             await self.gateway_entries.run()
         snapshots = await self.repositories.history.latest_universe()
-        busy = await self._busy_entries()
+        busy = await self._busy_entries(snapshots)
         queue = [
             (group, [item for item in group.pools if item.pool.address.root not in busy.pools])
-            for group in token_groups(snapshots)
+            for group in token_groups(snapshots, token_volume_1h=self._held_token_volume())
         ]
         queue = [(group, pools) for group, pools in queue if pools]
         remaining = sum(len(pools) for _, pools in queue)
@@ -547,7 +560,9 @@ class WorkerRuntime:
             remaining -= count
             self.metrics.queue_depth("candidate_pipeline", remaining)
 
-        async def screen_token(group: TokenGroup, pools: list[PoolSnapshot]) -> ScreenedPool | None:
+        async def screen_token(
+            group: TokenGroup, pools: list[PoolSnapshot]
+        ) -> tuple[TokenGroup, ScreenedPool] | None:
             async with slots:
                 held = group.base_mint in busy.mints
                 for index, snapshot in enumerate(pools):
@@ -562,7 +577,7 @@ class WorkerRuntime:
                         if isinstance(screened, ScreenedPool):
                             if screened.candidate:
                                 done(len(pools) - index - 1)  # the token's other pools wait
-                                return screened
+                                return group, screened
                             await self.pipeline.complete(screened)
                     except Exception as error:
                         self._log.error(
@@ -576,7 +591,7 @@ class WorkerRuntime:
         candidates = [item for item in screened if item is not None]
         limit = self.policy.deep_candidate_limit
 
-        async def complete(rank: int, candidate: ScreenedPool) -> None:
+        async def complete(rank: int, group: TokenGroup, candidate: ScreenedPool) -> None:
             async with slots:
                 try:
                     await self.pipeline.complete(
@@ -584,6 +599,7 @@ class WorkerRuntime:
                         deep=limit is None or rank <= limit,
                         rank=None if limit is None else rank,
                         rank_limit=limit,
+                        rank_source=None if limit is None else group.rank_source,
                     )
                 except Exception as error:
                     self._log.error(
@@ -593,7 +609,10 @@ class WorkerRuntime:
                     )
 
         await asyncio.gather(
-            *(complete(rank, item) for rank, item in enumerate(candidates, start=1))
+            *(
+                complete(rank, group, item)
+                for rank, (group, item) in enumerate(candidates, start=1)
+            )
         )
 
     async def universe_job(self, context: JobContext) -> None:
@@ -634,6 +653,20 @@ class WorkerRuntime:
     async def retention_job(self, context: JobContext) -> None:
         if self.retention is not None:
             await self.retention.purge(self.clock.now())
+
+    def _held_token_volume(self) -> TokenVolumeLookup | None:
+        """GMGN's hourly volume of a token from readings the OpenAPI source already holds
+        (``cached_signals``: no request), for ranking (F5); ``None`` without such a source."""
+
+        source = self.gmgn
+        if not isinstance(source, CachedTokenSignals):
+            return None
+
+        def volume(mint: str) -> Decimal | None:
+            reading = source.cached_signals(PublicKey(mint))
+            return None if reading is None else reading.volume_1h_usd
+
+        return volume
 
     # --- lifecycle --------------------------------------------------------------------
 
@@ -704,20 +737,30 @@ class WorkerRuntime:
             if context.position_id in open_ids
         }
 
-    async def _busy_entries(self) -> _BusyEntries:
-        """Pools and base tokens no new entry is planned for: an open position, or an entry
+    async def _busy_entries(self, universe: Sequence[PoolSnapshot]) -> _BusyEntries:
+        """Pools and tokens no new entry is planned for: an open position, or an entry
         still in flight - a PENDING plan before its expiry, or EXECUTING (awaiting the
         operator, or an unknown outcome being reconciled). One pool never takes two slots,
-        and one token never two positions in any of its pools (G24, ``TOKEN_ALREADY_HELD``)."""
+        and one token never two positions in any of its pools (G24, ``TOKEN_ALREADY_HELD``).
+
+        The token of a pool is the side of its pair that is not a quote token
+        (``pair_token``, F5): an entry in SOL-MEME holds MEME in MEME-SOL and back. A
+        position's pool is named by the universe, else by its decision record."""
 
         busy = _BusyEntries()
+        pools = {snapshot.pool.address.root: snapshot.pool for snapshot in universe}
+        decisions = self.repositories.decisions
         open_ids = set(self.repositories.mode.open_positions())
         for position in await self.repositories.positions.all():
-            if position.position_id in open_ids:
-                busy.pools.add(position.pool_address)
-                busy.mints.add(position.base_mint)
+            if position.position_id not in open_ids:
+                continue
+            busy.pools.add(position.pool_address)
+            pool = pools.get(position.pool_address)
+            if pool is None:
+                opened = await decisions.decision(position.decision_id)
+                pool = None if opened is None else opened.market.pool
+            busy.mints.add(position.base_mint if pool is None else pair_token(pool).mint)
         now = self.clock.now()
-        decisions = self.repositories.decisions
         for plan in self.repositories.mode.entry_plans():
             in_flight = plan.status is PendingPlanStatus.EXECUTING or (
                 plan.status is PendingPlanStatus.PENDING and plan.expires_at > now
@@ -730,7 +773,7 @@ class WorkerRuntime:
                 # Fail closed: without its pool, any candidate could be a second entry.
                 raise InFlightEntryUnresolved(plan.plan_id)
             busy.pools.add(decision.market.pool.address.root)
-            busy.mints.add(decision.market.pool.base_mint.root)
+            busy.mints.add(pair_token(decision.market.pool).mint)
         return busy
 
     def close(self) -> None:

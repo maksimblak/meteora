@@ -43,6 +43,9 @@ ARRIVALS: dict[str, str] = json.loads((SERIES / "arrivals.json").read_text(encod
 SWEEPS = sorted(ARRIVALS)
 CADENCE = timedelta(seconds=90)
 SOL_USDC = "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6"
+SOL_HYPE = "6oQ9wVex4mKZti2GsGCfD8FWTMMC9PLQkztRU5cd6MK8"
+# A valid mint that is no quote token, standing in for a coin in a recorded pool.
+STAND_IN_COIN = "Stake11111111111111111111111111111111111111"
 RELAXED = GuidePolicySettings(
     minimum_volume_per_minute=Decimal("10"),
     # G24: the hour's average is a second volume minimum; opened like the current one.
@@ -87,11 +90,14 @@ def recorded_prices() -> dict[str, Any]:
 PRICES = recorded_prices()
 
 
-def priced(body: bytes) -> bytes:
-    """The sweep with each token's recorded price where the series has none."""
+def priced(body: bytes, coin_x: dict[str, str] | None = None) -> bytes:
+    """The sweep with each token's recorded price where the series has none; ``coin_x``
+    renames ``token_x`` of the pools it names (pool address -> stand-in mint)."""
 
     sweep = json.loads(body)
     for pool in sweep["data"]:
+        if coin_x and pool["address"] in coin_x:
+            pool["token_x"]["address"] = coin_x[pool["address"]]
         for side in ("token_x", "token_y"):
             token = pool[side]
             if "price" not in token and token["address"] in PRICES:
@@ -102,14 +108,15 @@ def priced(body: bytes) -> bytes:
 class SeriesApi:
     """Serves the current recorded sweep and the recorded volume histories."""
 
-    def __init__(self) -> None:
+    def __init__(self, coin_x: dict[str, str] | None = None) -> None:
         self.current = SWEEPS[0]
+        self.coin_x = coin_x
         self.history_requests: list[str] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path == "/pools":
-            body = priced((SERIES / f"{self.current}.json").read_bytes())
+            body = priced((SERIES / f"{self.current}.json").read_bytes(), self.coin_x)
         else:
             address = path.removeprefix("/pools/").removesuffix("/volume/history")
             self.history_requests.append(address)
@@ -183,10 +190,13 @@ def provider(api: SeriesApi, clock: FrozenClock) -> tuple[MeteoraDataApiProvider
 
 
 def sync_series(
-    store: InMemoryUniverseStore, policy: PipelinePolicy, sweeps: list[str]
+    store: InMemoryUniverseStore,
+    policy: PipelinePolicy,
+    sweeps: list[str],
+    coin_x: dict[str, str] | None = None,
 ) -> tuple[SeriesApi, MeteoraDataApiProvider, FrozenClock]:
     clock = FrozenClock(at(sweeps[0]))
-    api = SeriesApi()
+    api = SeriesApi(coin_x)
     data_api, client = provider(api, clock)
 
     async def run() -> None:
@@ -209,11 +219,15 @@ def sync_series(
 
 
 def live_harness(
-    settings: GuidePolicySettings | None, sweeps: list[str], *, warmup: bool = False
+    settings: GuidePolicySettings | None,
+    sweeps: list[str],
+    *,
+    warmup: bool = False,
+    coin_x: dict[str, str] | None = None,
 ) -> tuple[Harness, FlatQuotes, SeriesApi, list[PoolSnapshot]]:
     policy = guide_policy(settings, universe_interval=CADENCE)
     store = InMemoryUniverseStore()
-    api, data_api, _ = sync_series(store, policy, sweeps)
+    api, data_api, _ = sync_series(store, policy, sweeps, coin_x)
     assert store.current is not None
     universe = list(store.current.snapshots)
     clock = FrozenClock(at(sweeps[-1]))
@@ -288,14 +302,13 @@ def test_on_live_data_some_pools_become_candidates_and_shadow_accepts() -> None:
     for decision in accepted:
         depth = decision.depth
         assert depth is not None
-        if quote_mints[decision.pool_address.root] in PRICES:
-            assert depth.source is DepthSource.QUOTE
-            assert depth.quote_price_usd == Decimal(
-                repr(PRICES[quote_mints[decision.pool_address.root]])
-            )
-        else:  # the HYPE-quoted pool: no USD price, so nothing to quote or size with
-            assert (depth.source, depth.detail) == (DepthSource.UNAVAILABLE, "QUOTE_PRICE_UNKNOWN")
-            assert DecisionFlag.DEPTH_UNAVAILABLE in decision.flags
+        # The unpriced HYPE side stands in SOL-HYPE, a pool of HYPE with the coin second:
+        # skipped since F5 (TOKEN_SECOND_IN_PAIR), so every accepted pool is priced.
+        assert quote_mints[decision.pool_address.root] in PRICES
+        assert depth.source is DepthSource.QUOTE
+        assert depth.quote_price_usd == Decimal(
+            repr(PRICES[quote_mints[decision.pool_address.root]])
+        )
         # The Data API has no participant counts or total fees: flagged, not UNKNOWN.
         assert DecisionFlag.VOLUME_PARTICIPANTS_UNAVAILABLE in decision.flags
         assert DecisionFlag.TOTAL_FEES_UNAVAILABLE in decision.flags
@@ -311,12 +324,36 @@ def test_on_live_data_some_pools_become_candidates_and_shadow_accepts() -> None:
 
 
 def test_a_new_live_pool_is_decided_from_its_volume_history() -> None:
+    """SOL-USDC is two quote tokens, never a candidate since F5, and the other recorded
+    history (TTWO) keeps a freeze authority: the recorded SOL-USDC series stands in for a
+    coin pool, with only the mint of its ``token_x`` renamed - every number as recorded."""
+
+    harness, _, api, universe = live_harness(
+        RELAXED, SWEEPS[:2], warmup=True, coin_x={SOL_USDC: STAND_IN_COIN}
+    )
+
+    decisions = decide_all(harness, universe)
+
+    coin = decisions[SOL_USDC]
+    assert coin.features.readiness is SignalReadiness.READY
+    assert coin.features.baseline_origin is WindowOrigin.VOLUME_HISTORY
+    assert coin.status is not CandidateStatus.WARMING_UP
+    assert api.history_requests.count(SOL_USDC) == 1
+
+
+def test_on_live_data_pools_without_the_coin_first_are_skipped_without_a_request() -> None:
+    """F5: the recorded SOL-USDC/USDC-SOL pools are two quote tokens, SOL-HYPE has the
+    coin second; each is skipped with its reason before any history request."""
+
     harness, _, api, universe = live_harness(RELAXED, SWEEPS[:2], warmup=True)
 
     decisions = decide_all(harness, universe)
 
-    sol = decisions[SOL_USDC]
-    assert sol.features.readiness is SignalReadiness.READY
-    assert sol.features.baseline_origin is WindowOrigin.VOLUME_HISTORY
-    assert sol.status is not CandidateStatus.WARMING_UP
-    assert api.history_requests.count(SOL_USDC) == 1
+    for address, code in (
+        (SOL_USDC, RejectionCode.PAIR_OF_QUOTE_TOKENS),
+        ("HRYEjwdo3bZ1TpXKWKcezqiwSV2Ywuh4LxMa2PzoCnG6", RejectionCode.PAIR_OF_QUOTE_TOKENS),
+        (SOL_HYPE, RejectionCode.TOKEN_SECOND_IN_PAIR),
+    ):
+        assert decisions[address].status is CandidateStatus.REJECT
+        assert code in decisions[address].reasons
+        assert api.history_requests.count(address) == 0

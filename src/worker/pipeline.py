@@ -34,7 +34,7 @@ from src.core.clock import Clock
 from src.domain.features import SignalReadiness, VolumeFeatureEngine, VolumeSpikeFeatures
 from src.domain.models.events import EventType
 from src.domain.models.trading import TradingMode
-from src.domain.risk.models import LiquidityState, RiskRejection
+from src.domain.risk.models import LiquidityState, PortfolioState, RiskRejection
 from src.domain.risk.sizing import PositionSizer
 from src.domain.screening import (
     CandidateDecision,
@@ -43,12 +43,15 @@ from src.domain.screening import (
     DecisionFlag,
     DepthEvidence,
     DepthSource,
+    EvidenceItem,
     PoolScreener,
     RejectionCode,
     TokenSelection,
+    TokenVolumeSource,
     merge_pool_token_signals,
+    refuse_candidate,
 )
-from src.domain.strategy import StrategyPlanner
+from src.domain.strategy import StrategyPlan, StrategyPlanner, StrategyRejection
 from src.execution.contracts import QuoteDirection, QuoteRequestV1, QuoteResultV1
 from src.market.contracts import OnChainProvider, VolumeHistorySource
 from src.market.models import (
@@ -109,6 +112,11 @@ _DATA_GAPS = frozenset(
 _GAP_FLAGS = frozenset({DecisionFlag.DEPTH_UNAVAILABLE, DecisionFlag.TOKEN_RISK_UNAVAILABLE})
 _BPS = Decimal(10_000)
 _MINIMUM_IMPACT = Decimal(1) / _BPS
+# The strategy's refusals (spec 6.8) as the candidate's own reasons (F5).
+_STRATEGY_REFUSALS = {
+    StrategyRejection.NOT_NEAR_LOCAL_HIGH: RejectionCode.NOT_NEAR_LOCAL_HIGH,
+    StrategyRejection.RANGE_TOO_NARROW: RejectionCode.RANGE_TOO_NARROW,
+}
 
 
 class QuoteSource(Protocol):
@@ -243,14 +251,16 @@ class CandidatePipeline:
         deep: bool = True,
         rank: int | None = None,
         rank_limit: int | None = None,
+        rank_source: TokenVolumeSource | None = None,
     ) -> CandidateOutcome:
         """Record the decision of a screened pool. A candidate is checked in depth (volume
         history, token risk, quote) only with ``deep``; ``rank`` of ``rank_limit`` is its
-        token's place by hourly volume among the cycle's candidates (G24)."""
+        token's place by hourly volume among the cycle's candidates (G24), ranked by the
+        volume of ``rank_source`` (F5)."""
 
         if rank is not None:
             selection = (screened.selection or TokenSelection()).model_copy(
-                update={"rank": rank, "rank_limit": rank_limit}
+                update={"rank": rank, "rank_limit": rank_limit, "rank_source": rank_source}
             )
             screened = replace(screened, selection=selection)
         with cycle_context(
@@ -350,6 +360,23 @@ class CandidatePipeline:
             depth=depth,
             selection=selection,
         )
+        portfolio: PortfolioState | None = None
+        plan: StrategyPlan | None = None
+        if decision.status is CandidateStatus.ACCEPT:
+            # The plan comes before the record: a candidate the strategy finds no plan for
+            # is recorded as refused with the strategy's code, never as accepted (F5).
+            portfolio = self._portfolio.state(self._clock.now())
+            plan = StrategyPlanner().plan(decision, market, portfolio, policy.strategy)
+            if plan.blocked_by:
+                decision = refuse_candidate(
+                    decision,
+                    tuple(_STRATEGY_REFUSALS[code] for code in plan.blocked_by),
+                    (
+                        EvidenceItem(name="strategy", value=plan.strategy.value),
+                        *plan.selection_evidence,
+                    ),
+                )
+                plan = None
         decision_id = uuid5(
             NAMESPACE_URL,
             f"meteora-volume-bot:decision:{pool_address}:{decision_at.isoformat()}:"
@@ -409,9 +436,11 @@ class CandidatePipeline:
         )
         if decision.status is not CandidateStatus.ACCEPT:
             return outcome
-        assert evaluated_event is not None  # an accepted candidate is always recorded
+        # An accepted candidate is always recorded and always has its plan.
+        assert evaluated_event is not None and plan is not None and portfolio is not None
         return await self._plan_and_enter(
-            outcome, decision, market, correlation, evaluated_event.event_id, depth
+            outcome, decision, plan, portfolio, market, correlation, evaluated_event.event_id,
+            depth,
         )
 
     def _context(self, mode: TradingMode, correlation: UUID) -> DecisionContext:
@@ -531,6 +560,8 @@ class CandidatePipeline:
         self,
         outcome: CandidateOutcome,
         decision: CandidateDecision,
+        plan: StrategyPlan,
+        portfolio: PortfolioState,
         market: PoolSnapshot,
         correlation: UUID,
         causation_id: UUID,
@@ -540,8 +571,6 @@ class CandidatePipeline:
         now = self._clock.now()
         decision_id = outcome.decision_id
         assert decision_id is not None
-        portfolio = self._portfolio.state(now)
-        plan = StrategyPlanner().plan(decision, market, portfolio, policy.strategy)
         sized = PositionSizer().size(
             plan, portfolio, self._liquidity(market, depth), policy.risk
         )
