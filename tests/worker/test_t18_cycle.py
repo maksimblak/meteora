@@ -154,6 +154,63 @@ def test_a_main_pool_failing_a_cheap_filter_hands_over_to_the_next_one() -> None
     assert world.onchain.reads == Counter({MINT_A.root: 1})
 
 
+def test_a_main_pool_too_narrow_for_bid_ask_hands_over_to_a_pool_that_holds_the_range() -> None:
+    """D10: 70 bins of bin step 100 reach 49.7% down, short of the 70% of Bid-Ask; the
+    token's next pool whose bin step holds it is entered instead of missing the token."""
+
+    world = World(
+        [
+            pool_history(P1, MINT_A, hour_fees="100", tvl="150000"),  # bin step 250
+            pool_history(P2, MINT_A, hour_fees="300", tvl="150000", bin_step=80),
+            pool_history(P3, MINT_A, hour_fees="300", tvl="160000", bin_step=100),
+        ]
+    )
+
+    world.cycle()
+
+    (main,) = world.records(P3)
+    assert main.decision.reasons == (RejectionCode.RANGE_TOO_NARROW,)
+    assert world.records(P2) == []  # bin step 80 cannot hold the range either: not tried
+    (entered,) = world.records(P1)
+    assert entered.decision.status is CandidateStatus.ACCEPT, entered.decision.reasons
+    (position_id,) = world.repos.mode.open_positions()
+    context = asyncio.run(world.repos.positions.get(position_id))
+    assert context is not None and context.pool_address == P1.root
+    assert world.onchain.reads == Counter({MINT_A.root: 2})  # the hand-over is checked in depth
+
+
+def test_no_hand_over_when_no_pool_holds_the_range_or_the_strategy_refused_more() -> None:
+    narrow = World(
+        [
+            pool_history(P1, MINT_A, hour_fees="100", tvl="150000", bin_step=80),
+            pool_history(P3, MINT_A, hour_fees="300", tvl="160000", bin_step=100),
+        ]
+    )
+    # Below 90% of the hour's high as well: the token is not "from the high" in any pool.
+    below_high = World(
+        [
+            pool_history(P1, MINT_A, hour_fees="100", tvl="150000"),
+            pool_history(
+                P3,
+                MINT_A,
+                prices=("1", "1", "1.25", "1", "1", "1", "1.1"),
+                hour_fees="300",
+                tvl="160000",
+                bin_step=100,
+            ),
+        ]
+    )
+
+    for world in (narrow, below_high):
+        world.cycle()
+
+        (main,) = world.records(P3)
+        assert RejectionCode.RANGE_TOO_NARROW in main.decision.reasons
+        assert world.records(P1) == []
+        assert world.onchain.reads == Counter({MINT_A.root: 1})
+        assert world.repos.mode.open_positions() == ()
+
+
 def test_only_the_top_tokens_by_hourly_volume_are_checked_in_depth() -> None:
     hours = ["1400000", "1200000", "1000000", "900000"]
     pools = [mint_number(21 + index) for index in range(4)]

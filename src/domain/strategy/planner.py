@@ -417,10 +417,8 @@ def _guide_plan(
         )
 
     # Bins up to a higher local high would need base liquidity: only their distance is kept.
-    target = _bins_for_depth(step, rules.bid_ask_target_depth, rules.bid_ask_maximum_depth)
-    below = min(target, rules.maximum_position_bins - 1)
+    target, below, depth = _bid_ask_range(step, rules)
     to_high = 0 if high is None or high <= market.price else _bins_between(step, market.price, high)
-    depth = Decimal(1) - step ** (-below)
     blocked: list[StrategyRejection] = []
     if depth < rules.bid_ask_minimum_depth:
         blocked.append(StrategyRejection.RANGE_TOO_NARROW)
@@ -462,6 +460,22 @@ def _guide_plan(
         blocked_by=tuple(blocked),
         flags=flags,
     )
+
+
+def bid_ask_range_fits(bin_step: int, rules: GuideStrategyRules) -> bool:
+    """One position at ``bin_step`` reaches ``bid_ask_minimum_depth`` below the price, so
+    Bid-Ask in such a pool is not refused as ``RANGE_TOO_NARROW`` (D10)."""
+
+    _, _, depth = _bid_ask_range(Decimal(1) + Decimal(bin_step) / Decimal(10_000), rules)
+    return depth >= rules.bid_ask_minimum_depth
+
+
+def _bid_ask_range(step: Decimal, rules: GuideStrategyRules) -> tuple[int, int, Decimal]:
+    """Bins Bid-Ask wants below the price, the bins one position holds, and their depth."""
+
+    target = _bins_for_depth(step, rules.bid_ask_target_depth, rules.bid_ask_maximum_depth)
+    below = min(target, rules.maximum_position_bins - 1)
+    return target, below, Decimal(1) - step ** (-below)
 
 
 def _ath_breakout(

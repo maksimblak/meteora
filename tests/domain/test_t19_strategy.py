@@ -24,6 +24,7 @@ from src.domain.strategy import (
     StrategyPlanner,
     StrategyRejection,
     StrategySelectionReason,
+    bid_ask_range_fits,
     developer_sold,
 )
 from src.market.models import (
@@ -127,6 +128,23 @@ def test_bid_ask_needs_seventy_percent_within_one_sdk_position(
     assert depth_of(result, bin_step).quantize(Decimal("0.0001")) == lower_edge
     assert (StrategyRejection.RANGE_TOO_NARROW in result.blocked_by) is blocked
     assert recorded(result)["range_limited_by_bins"] == "true"
+
+
+@pytest.mark.parametrize(
+    ("bin_step", "fits"), [(100, False), (176, False), (177, True), (200, True)]
+)
+def test_the_cycle_knows_by_bin_step_alone_where_bid_ask_is_not_too_narrow(
+    bin_step: int, fits: bool
+) -> None:
+    """D10, "bin step from about 176": 1 - 1.0176^-69 = 0.69996 is short of 70%,
+    1 - 1.0177^-69 = 0.70199 is not - the same answer the planner gives."""
+
+    rules = GUIDE_STRATEGY.guide
+    assert rules is not None
+
+    blocked = plan_for(guide_history(bin_step=bin_step)).blocked_by
+    assert bid_ask_range_fits(bin_step, rules) is fits
+    assert (StrategyRejection.RANGE_TOO_NARROW not in blocked) is fits
 
 
 def test_a_too_narrow_bid_ask_gets_no_size_and_no_plan() -> None:

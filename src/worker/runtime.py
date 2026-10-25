@@ -43,7 +43,7 @@ import contextlib
 import os
 import signal
 import socket
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -60,6 +60,7 @@ from src.domain.models.primitives import PublicKey
 from src.domain.models.trading import TradingMode
 from src.domain.screening.pairs import pair_token
 from src.domain.screening.selection import TokenGroup, TokenVolumeLookup, token_groups
+from src.domain.strategy import StrategyRejection, bid_ask_range_fits
 from src.execution.contracts import LivePromotionEvidence
 from src.execution.http_gateway import HttpExecutionGateway, HttpQuoteClient
 from src.execution.service import (
@@ -127,7 +128,7 @@ from src.worker.execution import (
     shadow_address,
     snapshot_anchor,
 )
-from src.worker.pipeline import CandidatePipeline, QuoteSource, ScreenedPool
+from src.worker.pipeline import CandidateOutcome, CandidatePipeline, QuoteSource, ScreenedPool
 from src.worker.policy import PipelinePolicy, load_pipeline_policy, universe_interval
 from src.worker.portfolio import RiskDayKeeper, ShadowPortfolio
 from src.worker.positions import DEFAULT_SNAPSHOT_INTERVAL, PoolSnapshotSource, PositionCycle
@@ -570,7 +571,10 @@ class WorkerRuntime:
            the ones before it are recorded with their rejects, the rest wait.
         3. Candidates in rank order: the first ``deep_candidate_limit`` are checked in depth
            (volume history, token risk with GMGN, quote) and may enter; the rest are recorded
-           as ``CANDIDATE_RANK_BELOW_LIMIT``.
+           as ``CANDIDATE_RANK_BELOW_LIMIT``. A deep candidate whose plan is refused only as
+           ``RANGE_TOO_NARROW`` (its bin step, D10) hands over to the token's next pool whose
+           bin step holds the Bid-Ask range and that passes the cheap filters - checked in
+           depth in its place, so the token is read once more.
         """
 
         self.keeper.ensure_open()
@@ -602,64 +606,94 @@ class WorkerRuntime:
             mode=self.repositories.mode.mode_state().mode,
         )
         slots = asyncio.Semaphore(self.settings.candidate_concurrency)
+        rules = self.policy.strategy.guide
 
         def done(count: int = 1) -> None:
             nonlocal remaining
             remaining -= count
             self.metrics.queue_depth("candidate_pipeline", remaining)
 
+        async def first_candidate(
+            group: TokenGroup, pools: Sequence[PoolSnapshot], tried: Callable[[], None]
+        ) -> tuple[int, ScreenedPool] | None:
+            """The first of ``pools`` to pass the cheap filters, with its index; the ones
+            before it are recorded with their rejects."""
+
+            held = group.base_mint in busy.mints
+            for index, snapshot in enumerate(pools):
+                address = snapshot.pool.address.root
+                try:
+                    screened = await self.pipeline.screen(
+                        address,
+                        decided_at,
+                        causation_id=context.correlation_id,
+                        selection=group.selection_for(address, held=held),
+                    )
+                    if isinstance(screened, ScreenedPool):
+                        if screened.candidate:
+                            return index, screened
+                        await self.pipeline.complete(screened)
+                except Exception as error:
+                    self._log.error("candidate_failed", pool_address=address, **error_fields(error))
+                finally:
+                    tried()
+            return None
+
         async def screen_token(
             group: TokenGroup, pools: list[PoolSnapshot]
-        ) -> tuple[TokenGroup, ScreenedPool] | None:
+        ) -> tuple[TokenGroup, ScreenedPool, list[PoolSnapshot]] | None:
             async with slots:
-                held = group.base_mint in busy.mints
-                for index, snapshot in enumerate(pools):
-                    address = snapshot.pool.address.root
-                    try:
-                        screened = await self.pipeline.screen(
-                            address,
-                            decided_at,
-                            causation_id=context.correlation_id,
-                            selection=group.selection_for(address, held=held),
-                        )
-                        if isinstance(screened, ScreenedPool):
-                            if screened.candidate:
-                                done(len(pools) - index - 1)  # the token's other pools wait
-                                return group, screened
-                            await self.pipeline.complete(screened)
-                    except Exception as error:
-                        self._log.error(
-                            "candidate_failed", pool_address=address, **error_fields(error)
-                        )
-                    finally:
-                        done()
+                found = await first_candidate(group, pools, done)
+            if found is None:
                 return None
+            index, candidate = found
+            rest = pools[index + 1 :]
+            done(len(rest))  # the token's other pools wait
+            return group, candidate, rest
 
         screened = await asyncio.gather(*(screen_token(group, pools) for group, pools in queue))
         candidates = [item for item in screened if item is not None]
         limit = self.policy.deep_candidate_limit
 
-        async def complete(rank: int, group: TokenGroup, candidate: ScreenedPool) -> None:
-            async with slots:
+        async def complete(
+            rank: int, group: TokenGroup, candidate: ScreenedPool, rest: list[PoolSnapshot]
+        ) -> None:
+            deep = limit is None or rank <= limit
+
+            async def decide(pool: ScreenedPool) -> CandidateOutcome | None:
                 try:
-                    await self.pipeline.complete(
-                        candidate,
-                        deep=limit is None or rank <= limit,
+                    return await self.pipeline.complete(
+                        pool,
+                        deep=deep,
                         rank=None if limit is None else rank,
                         rank_limit=limit,
                         rank_source=None if limit is None else group.rank_source,
                     )
                 except Exception as error:
                     self._log.error(
-                        "candidate_failed",
-                        pool_address=candidate.pool_address,
-                        **error_fields(error),
+                        "candidate_failed", pool_address=pool.pool_address, **error_fields(error)
                     )
+                    return None
+
+            async with slots:
+                outcome = await decide(candidate)
+                if (
+                    rules is None
+                    or outcome is None
+                    or outcome.refusals != (StrategyRejection.RANGE_TOO_NARROW,)
+                ):
+                    return
+                # Only the bin step of the token's pool stood in the way (D10): the next of
+                # its pools whose one position holds the Bid-Ask range is decided in its place.
+                wide = [item for item in rest if bid_ask_range_fits(item.bin_step, rules)]
+                found = await first_candidate(group, wide, lambda: None)
+                if found is not None:
+                    await decide(found[1])
 
         await asyncio.gather(
             *(
-                complete(rank, group, item)
-                for rank, (group, item) in enumerate(candidates, start=1)
+                complete(rank, group, item, rest)
+                for rank, (group, item, rest) in enumerate(candidates, start=1)
             )
         )
 

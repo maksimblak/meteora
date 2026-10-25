@@ -17,7 +17,12 @@ from src.domain.strategy.models import (
     StrategyRejection,
     StrategySelectionReason,
 )
-from src.domain.strategy.planner import PositionMonitor, StrategyPlanner, developer_sold
+from src.domain.strategy.planner import (
+    PositionMonitor,
+    StrategyPlanner,
+    bid_ask_range_fits,
+    developer_sold,
+)
 
 __all__ = [
     "Direction",
@@ -37,5 +42,6 @@ __all__ = [
     "StrategyPolicy",
     "StrategyRejection",
     "StrategySelectionReason",
+    "bid_ask_range_fits",
     "developer_sold",
 ]

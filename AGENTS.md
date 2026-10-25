@@ -42,7 +42,7 @@ PowerShell 5.1, из корня репозитория. Прогнано 2026-10
 - `docker compose down -v` стирает базу: историю, позиции, журнал аудита.
 - Первые ~40 мин после старта кандидатов нет: пулы копят историю (`WARMING_UP`).
 - Пороги автора строгие: на живых данных большинство пулов отсеивается по устойчивому объёму 14 000 USD/мин — пустой список кандидатов не баг. Смягчены пороги только для smoke (`tests/acceptance/acceptance-rules.yaml`).
-- Позиция не шире 70 бинов (ADR 0010): Bid-Ask ≥70% вниз — только в пулах с bin step ≳176, иначе `RANGE_TOO_NARROW`; поднимать `maximum_position_bins` нельзя.
+- Позиция не шире 70 бинов (ADR 0010): Bid-Ask ≥70% вниз — только в пулах с bin step от 177, иначе `RANGE_TOO_NARROW` (цикл тогда пробует соседний пул токена с крупным bin step); поднимать `maximum_position_bins` нельзя.
 - Тейк-профит работает только в SHADOW; в APPROVAL/LIVE `take_profit=UNMEASURED`.
 - Без `SOLANA_RPC_URL` обзор показывает worker DEGRADED (`PROVIDER_DEGRADED:solana`) и executor NOT_CONFIGURED — так задумано, SHADOW идёт с флагами.
 - `TRADING_MODE` режим не включает: режим живёт в БД. `POST /api/v1/mode/transitions` SHADOW→APPROVAL даёт 409, пока нет ≥7 суток SHADOW, ≥20 закрытых позиций, положительного ожидания и покрытия данных ≥99% (`src/modes/models.py`).

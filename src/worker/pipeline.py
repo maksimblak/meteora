@@ -18,9 +18,10 @@ input is newer than the decision.
 
 The worker's cycle (G24) runs the two halves apart: ``screen`` (cheap filters, nothing
 recorded) for the pools of every token, main pool first, and ``complete`` for the one pool
-per token it keeps - in depth only for the top-ranked candidates. ``evaluate`` is both at
-once. A ``TokenSelection`` brings what the cycle knows about the token beyond the pool; with
-an enhanced source (``enhanced_signals``) the token volume waits for its reading.
+per token it keeps - in depth only for the top-ranked candidates; ``refusals`` of the outcome
+tell the cycle when only the strategy stood in the way. ``evaluate`` is both at once. A
+``TokenSelection`` brings what the cycle knows about the token beyond the pool; with an
+enhanced source (``enhanced_signals``) the token volume waits for its reading.
 
 The free token sources (T22): the Jupiter reading the cycle prefetched for the token
 (``token_market``, no request here) joins the token from the cheap filters on, so its token
@@ -148,6 +149,8 @@ class CandidateOutcome:
     plan_id: UUID | None = None
     entry: EntryResult | None = None
     reasons: tuple[str, ...] = ()
+    # Why the strategy found no plan for a candidate the screening accepted (F5).
+    refusals: tuple[StrategyRejection, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,12 +394,14 @@ class CandidatePipeline:
         )
         portfolio: PortfolioState | None = None
         plan: StrategyPlan | None = None
+        refusals: tuple[StrategyRejection, ...] = ()
         if decision.status is CandidateStatus.ACCEPT:
             # The plan comes before the record: a candidate the strategy finds no plan for
             # is recorded as refused with the strategy's code, never as accepted (F5).
             portfolio = self._portfolio.state(self._clock.now())
             plan = StrategyPlanner().plan(decision, market, portfolio, policy.strategy)
             if plan.blocked_by:
+                refusals = plan.blocked_by
                 decision = refuse_candidate(
                     decision,
                     tuple(_STRATEGY_REFUSALS[code] for code in plan.blocked_by),
@@ -461,7 +466,11 @@ class CandidatePipeline:
         if self._evidence is not None:
             self._evidence.decision(decision_at, candidate=candidate, covered=_covered(decision))
         outcome = CandidateOutcome(
-            pool_address, str(correlation), decision_id=decision_id, status=decision.status
+            pool_address,
+            str(correlation),
+            decision_id=decision_id,
+            status=decision.status,
+            refusals=refusals,
         )
         if decision.status is not CandidateStatus.ACCEPT:
             return outcome

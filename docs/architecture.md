@@ -63,7 +63,7 @@
 2. Последний universe → Jupiter читает верхние `JUPITER_MAX_TOKENS` монет пачками по 100 (до момента решения) → группы по монете (`token_groups`, сторона пары не quote-токен); пулы с открытой позицией или входом в полёте пропускаются, их монета — `TOKEN_ALREADY_HELD`.
 3. `screen` — дешёвые фильтры без запросов (с показанием Jupiter: объём и капа токена, органичность, mint/freeze), основной пул монеты первым (наибольшие LP-комиссии за час).
 4. Ранг по часовому объёму (GMGN из кэша, иначе Jupiter, иначе сумма пулов); глубоко — первые `maximum_deep_candidates` (50), остальные `CANDIDATE_RANK_BELOW_LIMIT`.
-5. `complete`: прогрев истории из `volume/history`, token risk (RPC + GMGN) и отчёт RugCheck, котировка `executor-quotes` → `PoolScreener.evaluate` → `StrategyPlanner.plan` (отказ стратегии = REJECT) → решение записывается **до** любого денежного шага → `PositionSizer.size` → `EntryGate.admit` (PENDING-план) → `EntryExecutor`.
+5. `complete`: прогрев истории из `volume/history`, token risk (RPC + GMGN) и отчёт RugCheck, котировка `executor-quotes` → `PoolScreener.evaluate` → `StrategyPlanner.plan` (отказ стратегии = REJECT, причины — `CandidateOutcome.refusals`) → решение записывается **до** любого денежного шага → `PositionSizer.size` → `EntryGate.admit` (PENDING-план) → `EntryExecutor`. Отказ одним `RANGE_TOO_NARROW` → `screen` + `complete` для следующего пула монеты, чей bin step вмещает Bid-Ask (`bid_ask_range_fits`), с тем же рангом.
 
 ## Денежный путь
 
