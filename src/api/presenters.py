@@ -51,6 +51,9 @@ _TRIGGERS: dict[str, frozenset[str]] = {
     "token_volume_rank": frozenset({"CANDIDATE_RANK_BELOW_LIMIT"}),
     "fee_tvl": frozenset({"FEE_TVL_BELOW_THRESHOLD"}),
     "developer_share": frozenset({"DEVELOPER_HOLDS_TOKENS"}),
+    # The wait after an exit: neither the volume nor the price outdid the last entry.
+    "reentry_volume_per_minute": frozenset({"NO_NEW_VOLUME_OR_HIGH"}),
+    "reentry_price": frozenset({"NO_NEW_VOLUME_OR_HIGH"}),
     "tvl": frozenset({"LOW_TVL"}),
     "depth": frozenset({"LOW_DEPTH"}),
     "price_impact": frozenset({"PRICE_IMPACT_HIGH"}),

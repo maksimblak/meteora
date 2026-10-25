@@ -30,7 +30,7 @@ volume, cap, organic grade and authorities can reject before any request; RugChe
 """
 
 import asyncio
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
@@ -40,6 +40,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from src.core.clock import Clock
 from src.domain.features import SignalReadiness, VolumeFeatureEngine, VolumeSpikeFeatures
 from src.domain.models.events import EventType
+from src.domain.models.primitives import PublicKey
 from src.domain.models.trading import TradingMode
 from src.domain.risk.models import LiquidityState, PortfolioState, RiskRejection
 from src.domain.risk.sizing import PositionSizer
@@ -141,6 +142,17 @@ class QuoteSource(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class TokenReads:
+    """The token's own readings of a deep check - its risk (RPC, with GMGN when enhanced)
+    and RugCheck's report: the same for every pool of the token at one decision instant."""
+
+    mint: PublicKey
+    decision_at: datetime
+    risk: TokenRiskSnapshot
+    report: RugCheckReading | None
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateOutcome:
     pool_address: str
     correlation_id: str
@@ -151,6 +163,8 @@ class CandidateOutcome:
     reasons: tuple[str, ...] = ()
     # Why the strategy found no plan for a candidate the screening accepted (F5).
     refusals: tuple[StrategyRejection, ...] = ()
+    # What the deep check read about the token itself, when it ran.
+    token_reads: TokenReads | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,11 +289,13 @@ class CandidatePipeline:
         rank: int | None = None,
         rank_limit: int | None = None,
         rank_source: TokenVolumeSource | None = None,
+        token_reads: TokenReads | None = None,
     ) -> CandidateOutcome:
         """Record the decision of a screened pool. A candidate is checked in depth (volume
         history, token risk, quote) only with ``deep``; ``rank`` of ``rank_limit`` is its
         token's place by hourly volume among the cycle's candidates (G24), ranked by the
-        volume of ``rank_source`` (F5)."""
+        volume of ``rank_source`` (F5). ``token_reads``: another pool of the token already
+        read it at this decision instant, so the token is not asked again."""
 
         if rank is not None:
             selection = (screened.selection or TokenSelection()).model_copy(
@@ -291,11 +307,13 @@ class CandidatePipeline:
             causation_id=screened.causation_id,
             pool_address=screened.pool_address,
         ):
-            return await self._completed(screened, deep=deep)
+            return await self._completed(screened, deep=deep, known=token_reads)
 
-    async def _completed(self, screened: ScreenedPool, *, deep: bool) -> CandidateOutcome:
+    async def _completed(
+        self, screened: ScreenedPool, *, deep: bool, known: TokenReads | None = None
+    ) -> CandidateOutcome:
         try:
-            return await self._complete(screened, deep=deep)
+            return await self._complete(screened, deep=deep, known=known)
         except PersistenceFailure as failure:
             return CandidateOutcome(
                 screened.pool_address, str(screened.correlation), reasons=(str(failure),)
@@ -316,6 +334,7 @@ class CandidatePipeline:
         if not history:
             return CandidateOutcome(pool_address, str(correlation), reasons=("NO_HISTORY",))
         market = history[-1]
+        selection = _with_reentry_high(selection, history)
         features = VolumeFeatureEngine().compute(history, policy.features, decision_at=decision_at)
         unchecked = merge_token_sources(
             merge_pool_token_signals(_unchecked_token(market, decision_at), market),
@@ -340,7 +359,9 @@ class CandidatePipeline:
             return selection
         return (selection or TokenSelection()).model_copy(update={"enhanced_pending": True})
 
-    async def _complete(self, screened: ScreenedPool, *, deep: bool) -> CandidateOutcome:
+    async def _complete(
+        self, screened: ScreenedPool, *, deep: bool, known: TokenReads | None
+    ) -> CandidateOutcome:
         policy = self._policy
         pool_address = screened.pool_address
         decision_at = screened.decision_at
@@ -367,13 +388,14 @@ class CandidatePipeline:
         token = unchecked
         depth = _snapshot_depth(market, "NOT_A_CANDIDATE")
         selection = self._unread(screened.selection)
+        reads: TokenReads | None = None
         if candidate:
-            risk, report = await asyncio.gather(
-                self._token_risk(market, decision_at), self._rugcheck_report(market)
-            )
+            reads = await self._read_token(market, decision_at, known)
             # The very Jupiter reading the cheap filters judged, even if the cache let it go.
             token = merge_token_sources(
-                merge_pool_token_signals(risk, market), jupiter=unchecked.jupiter, rugcheck=report
+                merge_pool_token_signals(reads.risk, market),
+                jupiter=unchecked.jupiter,
+                rugcheck=reads.report,
             )
             evaluated_at = _evaluation_instant(decision_at, token)
             if evaluated_at != decision_at:
@@ -471,6 +493,7 @@ class CandidatePipeline:
             decision_id=decision_id,
             status=decision.status,
             refusals=refusals,
+            token_reads=reads,
         )
         if decision.status is not CandidateStatus.ACCEPT:
             return outcome
@@ -717,6 +740,20 @@ class CandidatePipeline:
             return None
         return reading
 
+    async def _read_token(
+        self, market: PoolSnapshot, decision_at: datetime, known: TokenReads | None
+    ) -> TokenReads:
+        """The token's risk and RugCheck report, or ``known`` when it holds them for this
+        token and decision instant."""
+
+        mint = market.pool.base_mint
+        if known is not None and known.mint == mint and known.decision_at == decision_at:
+            return known
+        risk, report = await asyncio.gather(
+            self._token_risk(market, decision_at), self._rugcheck_report(market)
+        )
+        return TokenReads(mint=mint, decision_at=decision_at, risk=risk, report=report)
+
     async def _rugcheck_report(self, market: PoolSnapshot) -> RugCheckReading | None:
         source = self._token_audit
         if source is None:
@@ -867,6 +904,20 @@ def _unchecked_token(market: PoolSnapshot, decision_at: datetime) -> TokenRiskSn
         missing_signals=_UNKNOWN_SIGNALS,
         provider="not_checked",
     )
+
+
+def _with_reentry_high(
+    selection: TokenSelection | None, history: Sequence[PoolSnapshot]
+) -> TokenSelection | None:
+    """The token's last exit with this pool's highest price observed since that entry, the
+    current snapshot aside: a new high stands above all of them."""
+
+    mark = None if selection is None else selection.reentry
+    if selection is None or mark is None:
+        return selection
+    since = [item.price for item in history[:-1] if item.observed_at >= mark.since]
+    high = max(since, default=None)
+    return selection.model_copy(update={"reentry": mark.model_copy(update={"price_high": high})})
 
 
 def _evaluation_instant(decision_at: datetime, token: TokenRiskSnapshot) -> datetime:

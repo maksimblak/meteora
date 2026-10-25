@@ -25,7 +25,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
-from src.domain.screening.models import TokenSelection, TokenVolumeSource
+from src.domain.screening.models import ReentryMark, TokenSelection, TokenVolumeSource
 from src.domain.screening.pairs import pair_token
 from src.market.models import PoolSnapshot
 
@@ -82,9 +82,15 @@ class TokenGroup:
         return self.volume_1h
 
     def selection_for(
-        self, pool_address: str, *, held: bool = False, enhanced_pending: bool = False
+        self,
+        pool_address: str,
+        *,
+        held: bool = False,
+        enhanced_pending: bool = False,
+        reentry: ReentryMark | None = None,
     ) -> TokenSelection:
-        """The token as one of its pools sees it: the other pools' volumes and counts."""
+        """The token as one of its pools sees it: the other pools' volumes and counts, and
+        the token's last exit (``reentry``)."""
 
         siblings = [item for item in self.pools if item.pool.address.root != pool_address]
         with_short = [item.windows[_SHORT] for item in siblings if _SHORT in item.windows]
@@ -95,6 +101,7 @@ class TokenGroup:
             sibling_pools_without_5m=len(siblings) - len(with_short),
             held=held,
             enhanced_pending=enhanced_pending,
+            reentry=reentry,
         )
 
 

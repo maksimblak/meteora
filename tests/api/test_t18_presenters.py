@@ -68,6 +68,17 @@ def test_each_new_row_is_marked_by_its_own_code() -> None:
     assert marked(rows, "FEE_TVL_BELOW_THRESHOLD") == {"fee_tvl"}
 
 
+def test_the_wait_after_an_exit_marks_the_volume_and_the_price_it_compared() -> None:
+    rows = (
+        EvidenceItem(name="reentry_last_exit_at", value="2026-10-18T11:50:00+00:00"),
+        EvidenceItem(name="reentry_volume_per_minute", value="18000", threshold=">20000 (JUPITER)"),
+        EvidenceItem(name="reentry_price", value="1", threshold=">1"),
+        EvidenceItem(name="volume_per_minute", value="18000", threshold="14000"),
+    )
+
+    assert marked(rows, "NO_NEW_VOLUME_OR_HIGH") == {"reentry_volume_per_minute", "reentry_price"}
+
+
 def test_the_legacy_spike_reason_still_marks_its_rows_below_their_minimum() -> None:
     rows = (
         EvidenceItem(name="short_ratio", value="1.5", threshold="4"),

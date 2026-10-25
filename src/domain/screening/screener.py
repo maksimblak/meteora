@@ -22,6 +22,7 @@ from src.domain.screening.models import (
     GuideAssessment,
     GuideScreeningRules,
     IntegrityStatus,
+    ReentryMark,
     RejectionCode,
     ScoreComponent,
     ScreeningPolicy,
@@ -327,6 +328,47 @@ def _token_volume(
     )
 
 
+def _reentry_wait(
+    pool: PoolSnapshot, volume: _TokenVolume, mark: ReentryMark
+) -> tuple[bool, tuple[EvidenceItem, ...]]:
+    """Whether the token still waits after its last exit, and the evidence.
+
+    New volumes: the token's 5m volume a minute above the one its last entry was decided
+    with, by the same source - figures of different sources are not compared. A new high:
+    the pool's price above every price it had since that entry. While an enhanced source
+    has still to read the token (``PENDING``), only a new high decides; the volume waits
+    for the reading."""
+
+    louder: bool | None = None
+    if volume.source is not TokenVolumeSource.PENDING:
+        louder = (
+            volume.source is mark.volume_source
+            and volume.per_minute is not None
+            and mark.volume_per_minute is not None
+            and volume.per_minute > mark.volume_per_minute
+        )
+    higher = mark.price_high is not None and pool.price > mark.price_high
+    source = "UNKNOWN" if mark.volume_source is None else mark.volume_source.value
+    evidence = (
+        EvidenceItem(name="reentry_last_exit_at", value=mark.exited_at.isoformat()),
+        EvidenceItem(
+            name="reentry_volume_per_minute",
+            value=_or_unknown(volume.per_minute),
+            threshold=f">{_or_unknown(mark.volume_per_minute)} ({source})",
+        ),
+        EvidenceItem(
+            name="reentry_price",
+            value=str(pool.price),
+            threshold=f">{_or_unknown(mark.price_high)}",
+        ),
+    )
+    return not higher and louder is False, evidence
+
+
+def _or_unknown(value: Decimal | None) -> str:
+    return "UNKNOWN" if value is None else str(value)
+
+
 def _volume_spike(features: VolumeSpikeFeatures, policy: ScreeningPolicy) -> bool | None:
     """Spec 6.2's spike: 5m against the baseline median, robust z and 30m confirmation."""
 
@@ -531,6 +573,11 @@ def assess_guide_thresholds(
             ),
         )
     )
+    if chosen.reentry is not None:
+        waits, reentry_evidence = _reentry_wait(pool, volume, chosen.reentry)
+        if waits:
+            reasons.append(RejectionCode.NO_NEW_VOLUME_OR_HIGH)
+        evidence.extend(reentry_evidence)
     spike = _volume_spike(features, policy)
     if spike:
         flags.append(DecisionFlag.VOLUME_SPIKE)

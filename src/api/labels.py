@@ -137,6 +137,10 @@ REJECTION = {
         "RugCheck отмечает у токена риск уровня danger: кит среди холдеров, mint authority "
         "или незалоченный LP"
     ),
+    "NO_NEW_VOLUME_OR_HIGH": (
+        "после выхода из монеты нет ни новых объёмов (выше, чем при прошлом входе), "
+        "ни нового хая — автор ждёт их перед новым входом"
+    ),
 }
 
 # D03 / D07 / G18 / D09: the operator-facing line for each non-blocking decision flag.

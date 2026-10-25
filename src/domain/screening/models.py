@@ -100,6 +100,9 @@ class RejectionCode(StrEnum):
     # T22: RugCheck rates at least one risk of the token ``danger`` (a whale holder, mint
     # authority, unlocked LP), in every mode.
     RUGCHECK_DANGER = "RUGCHECK_DANGER"
+    # After an exit from the token the author waits for new volumes or a new high
+    # (``ReentryMark``); neither has come yet.
+    NO_NEW_VOLUME_OR_HIGH = "NO_NEW_VOLUME_OR_HIGH"
 
 
 class DecisionFlag(StrEnum):
@@ -545,6 +548,30 @@ class TokenVolumeSource(StrEnum):
     PENDING = "PENDING"  # the enhanced source is asked only after the cheap filters
 
 
+class ReentryMark(BaseModel):
+    """The token's last closed position, against which a new entry is judged (guide-v1).
+
+    The author leaves when the volumes fall and enters the coin again only on new volumes or
+    a new high ("Если АТХ пробьёт, то перезайдём"; "подожду ... на более уверенных
+    объёмах"). ``since``: the observation of that entry's market snapshot;
+    ``volume_per_minute``/``volume_source``: the token's 5m volume a minute the entry was
+    decided with and whose figure it was; ``price_high``: the evaluated pool's highest price
+    observed since, read from its history by the pipeline - ``None`` while none is known.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    exited_at: datetime
+    since: datetime
+    volume_per_minute: Decimal | None = None
+    volume_source: TokenVolumeSource | None = None
+    price_high: Decimal | None = None
+
+    _reject_float = field_validator("volume_per_minute", "price_high", mode="before")(
+        _exact_decimal
+    )
+
+
 class TokenSelection(BaseModel):
     """What the cycle knows about the pool's base token beyond this pool (G24).
 
@@ -556,7 +583,7 @@ class TokenSelection(BaseModel):
     yet. ``rank``/``rank_limit``: the token's place among the cycle's candidates by hourly
     volume and how many of them are checked in depth; ``rank_source``: whose hourly volume
     ranked it - GMGN's reading already held for the token, else Jupiter's (T22), else its
-    DLMM pools' sum (F5).
+    DLMM pools' sum (F5). ``reentry``: the token's last exit the cycle still sees.
     """
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
@@ -570,6 +597,7 @@ class TokenSelection(BaseModel):
     rank: int | None = None
     rank_limit: int | None = None
     rank_source: TokenVolumeSource | None = None
+    reentry: ReentryMark | None = None
 
     _reject_float = field_validator("sibling_volume_1h", "sibling_volume_5m", mode="before")(
         _exact_decimal

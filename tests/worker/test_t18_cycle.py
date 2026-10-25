@@ -7,6 +7,7 @@ guide-v1 rules and recorded-style guide snapshots; token risk is a counting fake
 
 import asyncio
 from collections import Counter
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
@@ -23,6 +24,7 @@ from src.persistence.contracts import DecisionRecord, JobLease
 from src.persistence.memory import InMemoryEventSink
 from src.providers.fixtures import FixtureOnChainProvider
 from src.worker.execution import EntryResult, EntryStatus
+from src.worker.pipeline import ScreenedPool
 from src.worker.policy import GuidePolicySettings, guide_policy
 from src.worker.runtime import WorkerRuntime, WorkerSettings
 from src.worker.scheduler import JobContext
@@ -176,7 +178,31 @@ def test_a_main_pool_too_narrow_for_bid_ask_hands_over_to_a_pool_that_holds_the_
     (position_id,) = world.repos.mode.open_positions()
     context = asyncio.run(world.repos.positions.get(position_id))
     assert context is not None and context.pool_address == P1.root
-    assert world.onchain.reads == Counter({MINT_A.root: 2})  # the hand-over is checked in depth
+    # The hand-over is checked in depth with the token's reading of the main pool: the same
+    # coin at the same instant is not asked twice.
+    assert world.onchain.reads == Counter({MINT_A.root: 1})
+
+
+def test_a_token_reading_of_another_coin_or_instant_is_not_taken_over() -> None:
+    world = World([pool_history(P1, MINT_A)])
+    pipeline = world.runtime.pipeline
+
+    async def run() -> None:
+        world.runtime.keeper.ensure_open()
+        screened = await pipeline.screen(P1.root, NOW)
+        assert isinstance(screened, ScreenedPool)
+        reads = (await pipeline.complete(screened)).token_reads
+        assert reads is not None
+        for foreign in (
+            replace(reads, mint=mint_number(2)),
+            replace(reads, decision_at=NOW - timedelta(minutes=1)),
+            reads,  # the same coin at the same instant: taken over, not read
+        ):
+            await pipeline.complete(screened, token_reads=foreign)
+
+    asyncio.run(run())
+
+    assert world.onchain.reads == Counter({MINT_A.root: 3})
 
 
 def test_the_hand_over_skips_a_wide_pool_failing_a_cheap_filter_and_records_its_reject() -> None:

@@ -58,6 +58,7 @@ from src.core.config import AppConfig
 from src.core.logging import configure_logging
 from src.domain.models.primitives import PublicKey
 from src.domain.models.trading import TradingMode
+from src.domain.screening import ReentryMark, TokenVolumeSource
 from src.domain.screening.pairs import pair_token
 from src.domain.screening.selection import TokenGroup, TokenVolumeLookup, token_groups
 from src.domain.strategy import StrategyRejection, bid_ask_range_fits
@@ -107,8 +108,9 @@ from src.observability.instrumented import (
 from src.observability.logging import error_fields, get_logger
 from src.observability.metrics import WorkerMetrics
 from src.observability.sinks import LoggingEventSink
-from src.persistence.contracts import EventSink
+from src.persistence.contracts import DecisionRecord, EventSink, PositionContext
 from src.persistence.factory import PersistenceBackend, Repositories, open_repositories
+from src.portfolio.models import TimeWindow
 from src.providers.contracts import PoolStateReader, ProviderUnavailableError
 from src.providers.jupiter import JupiterTokensProvider
 from src.providers.rugcheck import RugCheckProvider
@@ -128,7 +130,13 @@ from src.worker.execution import (
     shadow_address,
     snapshot_anchor,
 )
-from src.worker.pipeline import CandidateOutcome, CandidatePipeline, QuoteSource, ScreenedPool
+from src.worker.pipeline import (
+    CandidateOutcome,
+    CandidatePipeline,
+    QuoteSource,
+    ScreenedPool,
+    TokenReads,
+)
 from src.worker.policy import PipelinePolicy, load_pipeline_policy, universe_interval
 from src.worker.portfolio import RiskDayKeeper, ShadowPortfolio
 from src.worker.positions import DEFAULT_SNAPSHOT_INTERVAL, PoolSnapshotSource, PositionCycle
@@ -138,6 +146,8 @@ from src.worker.scheduler import JobContext, JobSpec, Scheduler
 # may be running" and its TTL as the age after which a claim counts as abandoned.
 CANDIDATE_JOB = "candidate_pipeline"
 CANDIDATE_LEASE_TTL = timedelta(minutes=2)
+# An exit closed at the cycle's own instant is already behind it.
+_INSTANT = timedelta(microseconds=1)
 # The executor readiness probe runs on the health tick, but not more often than this.
 GATEWAY_READINESS_INTERVAL = timedelta(seconds=15)
 UNIVERSE_FILTER_ENV = "METEORA_UNIVERSE_FILTER"
@@ -254,6 +264,29 @@ class _BusyEntries:
 
     pools: set[str] = field(default_factory=set)
     mints: set[str] = field(default_factory=set)
+
+
+def _reentry_mark(
+    closed_at: datetime, position: PositionContext, entry: DecisionRecord | None
+) -> ReentryMark:
+    """A closed position as a new entry in its token is judged against: since the entry's
+    market snapshot, with the token volume a minute that entry was decided with. Without
+    the entry's record only a new high since the opening can lift the wait."""
+
+    if entry is None:
+        return ReentryMark(exited_at=closed_at, since=position.opened_at)
+    found = {item.name: item.value for item in entry.decision.evidence}
+    try:
+        volume: Decimal | None = Decimal(found.get("volume_per_minute", "UNKNOWN"))
+    except ArithmeticError:
+        volume = None
+    source = found.get("token_volume_source")
+    return ReentryMark(
+        exited_at=closed_at,
+        since=entry.market.observed_at,
+        volume_per_minute=volume if volume is not None and volume.is_finite() else None,
+        volume_source=next((item for item in TokenVolumeSource if item.value == source), None),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,7 +607,7 @@ class WorkerRuntime:
            as ``CANDIDATE_RANK_BELOW_LIMIT``. A deep candidate whose plan is refused only as
            ``RANGE_TOO_NARROW`` (its bin step, D10) hands over to the token's next pool whose
            bin step holds the Bid-Ask range and that passes the cheap filters - checked in
-           depth in its place, so the token is read once more.
+           depth in its place with the token's reading of the main pool (``TokenReads``).
         """
 
         self.keeper.ensure_open()
@@ -605,6 +638,7 @@ class WorkerRuntime:
             and decided_at - last_sync <= self.settings.universe_interval * 2,
             mode=self.repositories.mode.mode_state().mode,
         )
+        exits = await self._last_exits(snapshots, decided_at)
         slots = asyncio.Semaphore(self.settings.candidate_concurrency)
         rules = self.policy.strategy.guide
 
@@ -620,6 +654,7 @@ class WorkerRuntime:
             before it are recorded with their rejects."""
 
             held = group.base_mint in busy.mints
+            reentry = exits.get(group.base_mint)
             for index, snapshot in enumerate(pools):
                 address = snapshot.pool.address.root
                 try:
@@ -627,7 +662,7 @@ class WorkerRuntime:
                         address,
                         decided_at,
                         causation_id=context.correlation_id,
-                        selection=group.selection_for(address, held=held),
+                        selection=group.selection_for(address, held=held, reentry=reentry),
                     )
                     if isinstance(screened, ScreenedPool):
                         if screened.candidate:
@@ -660,7 +695,9 @@ class WorkerRuntime:
         ) -> None:
             deep = limit is None or rank <= limit
 
-            async def decide(pool: ScreenedPool) -> CandidateOutcome | None:
+            async def decide(
+                pool: ScreenedPool, reads: TokenReads | None = None
+            ) -> CandidateOutcome | None:
                 try:
                     return await self.pipeline.complete(
                         pool,
@@ -668,6 +705,7 @@ class WorkerRuntime:
                         rank=None if limit is None else rank,
                         rank_limit=limit,
                         rank_source=None if limit is None else group.rank_source,
+                        token_reads=reads,
                     )
                 except Exception as error:
                     self._log.error(
@@ -696,7 +734,8 @@ class WorkerRuntime:
                         to_pool_address=wider.pool_address,
                         to_bin_step=wider.market.bin_step,
                     )
-                    await decide(wider)
+                    # The same coin at the same instant: the main pool's reading of it.
+                    await decide(wider, outcome.token_reads)
 
         await asyncio.gather(
             *(
@@ -903,6 +942,39 @@ class WorkerRuntime:
             busy.pools.add(decision.market.pool.address.root)
             busy.mints.add(pair_token(decision.market.pool).mint)
         return busy
+
+    async def _last_exits(
+        self, universe: Sequence[PoolSnapshot], now: datetime
+    ) -> dict[str, ReentryMark]:
+        """Each token's last closed position, which a new entry must outdo with new volumes
+        or a new high (guide-v1, ``NO_NEW_VOLUME_OR_HIGH``).
+
+        An exit counts while the pool history the screening reads (``maximum_history_points``
+        sweeps of the universe) can still show the high since its entry; an older one is
+        forgotten. The token of a position is named as in ``_busy_entries``."""
+
+        if self.policy.screening.guide is None:
+            return {}
+        span = self.settings.universe_interval * self.policy.features.maximum_history_points
+        closed = self.repositories.accounting.outcomes_in(
+            TimeWindow(start=now - span, end=now + _INSTANT)
+        )
+        if not closed:
+            return {}
+        contexts = {item.position_id: item for item in await self.repositories.positions.all()}
+        pools = {snapshot.pool.address.root: snapshot.pool for snapshot in universe}
+        exits: dict[str, ReentryMark] = {}
+        for outcome in closed:  # by closing time: a token's latest exit is kept
+            position = contexts.get(outcome.position_id)
+            if position is None:
+                continue
+            record = await self.repositories.decisions.decision(position.decision_id)
+            pool = pools.get(position.pool_address)
+            if pool is None and record is not None:
+                pool = record.market.pool
+            mint = position.base_mint if pool is None else pair_token(pool).mint
+            exits[mint] = _reentry_mark(outcome.closed_at, position, record)
+        return exits
 
     def close(self) -> None:
         self.repositories.close()
