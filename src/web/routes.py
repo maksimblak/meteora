@@ -386,8 +386,10 @@ def install_web(app: FastAPI) -> None:
 
     @router.get("/approvals", response_class=HTMLResponse)
     async def approvals(request: Request) -> Response:
-        queue = await _services(request).approvals.queue()
-        return await render(request, "approvals.html", queue=queue)
+        services = _services(request)
+        queue = await services.approvals.queue()
+        state = await services.context.mode_state()
+        return await render(request, "approvals.html", queue=queue, mode=state.mode.value)
 
     @router.get("/approvals/{command_id}", response_class=HTMLResponse)
     async def approval(request: Request, command_id: UUID) -> Response:

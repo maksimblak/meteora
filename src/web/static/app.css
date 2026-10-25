@@ -147,6 +147,9 @@ footer { width: 100%; max-width: 1320px; margin: 0 auto; padding: 0 28px 28px; f
 .card.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); background: linear-gradient(0deg, var(--warn-soft), var(--warn-soft)), var(--panel); }
 .card.danger { border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
 .card.danger h2 { color: var(--bad); }
+.card.info { border-color: color-mix(in srgb, var(--info) 40%, var(--line)); background: linear-gradient(0deg, var(--info-soft), var(--info-soft)), var(--panel); }
+.card.info h2 { color: var(--info); }
+.card details.missing { margin-top: 10px; }
 .card.warn h2 { color: var(--warn); }
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
 .card-head h2 { margin: 0; }

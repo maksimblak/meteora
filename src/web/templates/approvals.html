@@ -8,7 +8,19 @@
     <p class="sub">В режиме APPROVAL каждая on-chain команда ждёт ручного подтверждения по свежей симуляции.</p>
   </div>
 </div>
-{% if queue.blockers %}
+{% if mode == 'SHADOW' %}
+{# Nothing to approve in SHADOW: the APPROVAL gaps are a to-do for later, not an alarm. #}
+<section class="card info">
+  <h2>Сейчас подтверждать нечего</h2>
+  <p>Бот в режиме SHADOW: сделки виртуальные, команды в сеть не уходят. Подтверждения появятся в режиме APPROVAL — после допуска на странице <a href="/mode">«Режим»</a>.</p>
+  {% if queue.blockers %}
+  <details class="missing">
+    <summary>Что понадобится для APPROVAL ({{ queue.blockers | length }})</summary>
+    <ul>{% for item in queue.blockers %}<li>{{ item.message }} <code>{{ item.code }}</code></li>{% endfor %}</ul>
+  </details>
+  {% endif %}
+</section>
+{% elif queue.blockers %}
 <section class="card warn">
   <h2>Почему команды сейчас не готовы к подтверждению</h2>
   <ul>{% for item in queue.blockers %}<li>{{ item.message }} <code>{{ item.code }}</code></li>{% endfor %}</ul>

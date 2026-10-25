@@ -159,6 +159,28 @@ def test_with_the_kill_switch_on_the_overview_says_the_bot_is_stopped(panel: Pan
     assert "реальные деньги не тратятся" not in now
 
 
+def test_in_shadow_the_approval_queue_explains_calmly_and_folds_what_is_missing(
+    panel: Panel,
+) -> None:
+    page = panel.get("/approvals").text
+
+    # SHADOW has nothing to approve: no alarm, a plain note, the APPROVAL gaps folded away.
+    assert "появятся в режиме APPROVAL" in page
+    assert '<details class="missing">' in page
+    assert "<code>MODE_NOT_APPROVAL</code>" in page.split('<details class="missing">', 1)[1]
+    assert "Почему команды сейчас не готовы к подтверждению" not in page
+
+
+def test_in_approval_the_queue_still_warns_why_commands_are_not_ready(
+    approval: tuple[Panel, ApprovalCase],
+) -> None:
+    panel, _ = approval
+
+    page = panel.get("/approvals").text
+
+    assert "появятся в режиме APPROVAL" not in page
+
+
 def test_every_screen_renders_in_russian_with_data(panel: Panel) -> None:
     scenario = populated(panel.harness)
     position_id = scenario.accepted.entry.position_id
