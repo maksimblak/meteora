@@ -35,6 +35,8 @@ SECRETS: tuple[SecretSetting, ...] = (
     SecretSetting("GMGN_API_KEY", "gmgn_api_key", ("worker",)),
     # The shared token of the GMGN browser bridge on the host (G25): worker and bridge only.
     SecretSetting("GMGN_BRIDGE_TOKEN", "gmgn_bridge_token", ("worker",)),
+    # The optional free key of Jupiter Tokens API v2 (T22): twice the keyless rate.
+    SecretSetting("JUPITER_API_KEY", "jupiter_api_key", ("worker",)),
     SecretSetting("TELEGRAM_BOT_TOKEN", "telegram_bot_token", ()),
     SecretSetting("WALLET_KEYPAIR_FILE", "wallet_keypair_file", ("executor",), file_variant=False),
 )

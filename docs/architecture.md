@@ -26,7 +26,7 @@
 | `domain/strategy` | выбор Bid-Ask / Spot, диапазон бинов, выходы | `StrategyPlanner.plan`, `PositionMonitor.evaluate` |
 | `domain/risk` | лимиты 10% / 1% / 3 позиции / 4% / 10% ликвидности, promotion | `PositionSizer.size`, `RiskEngine`, `PromotionPolicy`, `RiskPolicy` |
 | `market` | типы рынка (`PoolSnapshot`, `TokenRiskSnapshot`, `EnhancedTokenSignals`, `Freshness`, `DataQuality`), протоколы провайдеров (`contracts.py`), синхронизация universe, производные короткие окна (`windows.py`) | `UniverseSync.run`, `MarketDataProvider`, `OnChainProvider` |
-| `providers` | Meteora Data API (`meteora.py`), Solana RPC (`solana.py`), лимиты/ретраи/breaker (`resilience.py`), синтетические фикстуры | реализации протоколов `market`; URL, сырой JSON и ключи наружу не выходят |
+| `providers` | Meteora Data API (`meteora.py`), Solana RPC (`solana.py`), Jupiter Tokens API v2 (`jupiter.py`) и RugCheck (`rugcheck.py`) — ADR 0014, лимиты/ретраи/breaker (`resilience.py`), синтетические фикстуры | реализации протоколов `market`; URL, сырой JSON и ключи наружу не выходят |
 | `gmgn` | GMGN OpenAPI (`openapi.py`, основной), клиент сервиса-браузера (`client.py`, запасной) | `EnrichedOnChainProvider` — подмешивает GMGN к token risk только кандидатов |
 | `accounting`, `portfolio` | shadow-заполнения, комиссии, IL, издержки, P&L, HODL-бенчмарк | `ShadowBroker`, `AccountingService`, `PerformanceService` |
 | `modes` | режимы, promotion gates, одноразовые approvals, дневной стоп, вход, kill switch, алерты | `ModeService`, `ApprovalService`, `DailyRiskService`, `EntryGate`, `PromotionEvidenceService`; протокол `ModeRepository` |
@@ -60,10 +60,10 @@
 Цикл кандидатов (`WorkerRuntime.candidate_job` → `CandidatePipeline`):
 
 1. Открыть UTC-сутки риска (`RiskDayKeeper.ensure_open`), закрыть прошлые сутки в evidence, продолжить одобренные/прерванные входы (`GatewayEntrySettler`).
-2. Последний universe → группы по монете (`token_groups`, сторона пары не quote-токен); пулы с открытой позицией или входом в полёте пропускаются, их монета — `TOKEN_ALREADY_HELD`.
-3. `screen` — дешёвые фильтры без запросов, основной пул монеты первым (наибольшие LP-комиссии за час).
-4. Ранг по часовому объёму (GMGN из кэша, иначе сумма пулов); глубоко — первые `maximum_deep_candidates` (50), остальные `CANDIDATE_RANK_BELOW_LIMIT`.
-5. `complete`: прогрев истории из `volume/history`, token risk (RPC + GMGN), котировка `executor-quotes` → `PoolScreener.evaluate` → `StrategyPlanner.plan` (отказ стратегии = REJECT) → решение записывается **до** любого денежного шага → `PositionSizer.size` → `EntryGate.admit` (PENDING-план) → `EntryExecutor`.
+2. Последний universe → Jupiter читает верхние `JUPITER_MAX_TOKENS` монет пачками по 100 (до момента решения) → группы по монете (`token_groups`, сторона пары не quote-токен); пулы с открытой позицией или входом в полёте пропускаются, их монета — `TOKEN_ALREADY_HELD`.
+3. `screen` — дешёвые фильтры без запросов (с показанием Jupiter: объём и капа токена, органичность, mint/freeze), основной пул монеты первым (наибольшие LP-комиссии за час).
+4. Ранг по часовому объёму (GMGN из кэша, иначе Jupiter, иначе сумма пулов); глубоко — первые `maximum_deep_candidates` (50), остальные `CANDIDATE_RANK_BELOW_LIMIT`.
+5. `complete`: прогрев истории из `volume/history`, token risk (RPC + GMGN) и отчёт RugCheck, котировка `executor-quotes` → `PoolScreener.evaluate` → `StrategyPlanner.plan` (отказ стратегии = REJECT) → решение записывается **до** любого денежного шага → `PositionSizer.size` → `EntryGate.admit` (PENDING-план) → `EntryExecutor`.
 
 ## Денежный путь
 

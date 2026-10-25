@@ -141,6 +141,18 @@ services:
       GMGN_BRIDGE_TOKEN_FILE: ${GMGN_BRIDGE_TOKEN_FILE:-}
       GMGN_TIMEOUT_SECONDS: ${GMGN_TIMEOUT_SECONDS:-}
       GMGN_STALE_AFTER_SECONDS: ${GMGN_STALE_AFTER_SECONDS:-}
+      # Free token sources (T22), no key needed: Jupiter Tokens API v2 for the cycle's top
+      # JUPITER_MAX_TOKENS tokens (token volume, trades and traders, organic grade, authorities)
+      # and RugCheck for deep candidates (a "danger" risk rejects). On by default; an empty
+      # value in .env (JUPITER_API_URL= or RUGCHECK_API_URL=) switches one off. The optional
+      # free JUPITER_API_KEY (or *_FILE inside this container) doubles Jupiter's rate.
+      JUPITER_API_URL: ${JUPITER_API_URL-https://api.jup.ag}
+      JUPITER_API_KEY: ${JUPITER_API_KEY:-}
+      JUPITER_API_KEY_FILE: ${JUPITER_API_KEY_FILE:-}
+      JUPITER_CACHE_SECONDS: ${JUPITER_CACHE_SECONDS:-}
+      JUPITER_MAX_TOKENS: ${JUPITER_MAX_TOKENS:-}
+      RUGCHECK_API_URL: ${RUGCHECK_API_URL-https://api.rugcheck.xyz}
+      RUGCHECK_CACHE_SECONDS: ${RUGCHECK_CACHE_SECONDS:-}
       # Open positions reread their pool from the Data API this often (empty = 30 s).
       WORKER_POSITION_SNAPSHOT_SECONDS: ${WORKER_POSITION_SNAPSHOT_SECONDS:-}
       # The sale of the base token an exit returned (G22); empty = the defaults.

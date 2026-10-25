@@ -32,11 +32,14 @@ from src.domain.screening.models import (
     VolumeRegime,
 )
 from src.domain.screening.pairs import PairShape, pair_token
+from src.domain.screening.sources import assess_token_sources, fresh_jupiter
 from src.market.models import (
     AuthorityStatus,
     DataQuality,
     EnhancedTokenSignals,
     Freshness,
+    JupiterTokenReading,
+    OrganicScoreLabel,
     PoolSnapshot,
     RiskSignal,
     TokenRiskSnapshot,
@@ -53,9 +56,10 @@ def assess_volume_integrity(
 
     ``PARTICIPANTS``: transaction and participant counts and a wash-trading verdict are
     mandatory. ``AVAILABLE_SIGNALS`` (D07, the Data API has no counts): burst
-    self-similarity is mandatory (G24 dropped fee organicity); counts are checked when present,
-    and their absence (with no wash-trading verdict either) is the
-    ``VOLUME_PARTICIPANTS_UNAVAILABLE`` flag instead of an unknown.
+    self-similarity is mandatory (G24 dropped fee organicity); counts are checked when present.
+    Without the pool's own counts a fresh Jupiter reading's 5-minute trades and traders of
+    the token are checked instead (T22); with neither (and no wash-trading verdict) the
+    decision carries the ``VOLUME_PARTICIPANTS_UNAVAILABLE`` flag instead of an unknown.
     """
 
     reasons: list[str] = []
@@ -68,8 +72,12 @@ def assess_volume_integrity(
     participants = features.unique_participants
     if policy.volume_integrity is VolumeIntegrityMode.AVAILABLE_SIGNALS:
         reasons.extend(_available_signal_reasons(features, policy, missing))
-        if (count is None or participants is None) and token.wash_trading is RiskSignal.UNKNOWN:
-            flags.append(DecisionFlag.VOLUME_PARTICIPANTS_UNAVAILABLE)
+        if count is None or participants is None:
+            jupiter = fresh_jupiter(token)
+            if jupiter is not None and None not in (jupiter.trades_5m, jupiter.traders_5m):
+                reasons.extend(_token_activity_reasons(jupiter, policy))
+            elif token.wash_trading is RiskSignal.UNKNOWN:
+                flags.append(DecisionFlag.VOLUME_PARTICIPANTS_UNAVAILABLE)
     else:
         if count is None:
             missing.append("transaction_count")
@@ -135,6 +143,30 @@ def _available_signal_reasons(
         missing.append("short_burst_spread")
     elif spread <= policy.maximum_burst_spread:
         reasons.append("self_similar_bursts")
+    return reasons
+
+
+def _token_activity_reasons(reading: JupiterTokenReading, policy: ScreeningPolicy) -> list[str]:
+    """The pool-level count checks on the token's 5-minute window as Jupiter counts it (T22).
+
+    Token-wide, so they find a token whose whole volume is a handful of wallets trading
+    with themselves, not one pool washed among many.
+    """
+
+    trades, traders, volume = reading.trades_5m, reading.traders_5m, reading.volume_5m_usd
+    assert trades is not None and traders is not None
+    reasons: list[str] = []
+    if volume is not None and volume > 0 and trades == 0:
+        reasons.append("token_volume_without_transactions")
+    if trades > 0 and traders == 0:
+        reasons.append("token_transactions_without_participants")
+    if traders > trades:
+        reasons.append("token_participants_exceed_transactions")
+    if (
+        0 < traders < policy.minimum_unique_participants
+        and Decimal(trades) / Decimal(traders) > policy.maximum_transactions_per_participant
+    ):
+        reasons.append("token_concentrated_participant_activity")
     return reasons
 
 
@@ -267,20 +299,22 @@ def _token_volume(
     """The token's volume as the author reads it: GMGN's token volume, as in Trending.
 
     A fresh enhanced reading with both windows is that figure (GMGN does not say which
-    venues it counts, F5). Without one the token's DLMM pools are summed - this pool's own
+    venues it counts, F5); else a fresh Jupiter reading's, over every venue Jupiter routes
+    (T22). While an enhanced source is still to be asked (``enhanced_pending``), nothing
+    else is decided. Without either the token's DLMM pools are summed - this pool's own
     windows plus its siblings' - and the decision is flagged ``TOKEN_VOLUME_POOL_ONLY``; on
-    other venues the token may trade far more. While an enhanced source is still to be asked
-    (``enhanced_pending``), nothing is decided.
+    other venues the token may trade far more.
     """
 
     pools = 1 + selection.sibling_pools
-    reading = _fresh_reading(token)
-    short = reading.volume_5m_usd if reading is not None else None
-    hour = reading.volume_1h_usd if reading is not None else None
-    if short is not None and hour is not None:
-        return _TokenVolume(
-            TokenVolumeSource.GMGN, short / _SHORT_MINUTES, hour / _HOUR_MINUTES, pools
-        )
+    for source, reading in (
+        (TokenVolumeSource.GMGN, _fresh_reading(token)),
+        (TokenVolumeSource.JUPITER, fresh_jupiter(token)),
+    ):
+        short = reading.volume_5m_usd if reading is not None else None
+        hour = reading.volume_1h_usd if reading is not None else None
+        if short is not None and hour is not None:
+            return _TokenVolume(source, short / _SHORT_MINUTES, hour / _HOUR_MINUTES, pools)
     if selection.enhanced_pending:
         return _TokenVolume(TokenVolumeSource.PENDING, None, None, pools)
     own_now = features.volume_per_minute
@@ -379,7 +413,8 @@ def assess_guide_thresholds(
     """Apply the guide-v1 table (spec 6.6) and the author's selection (spec 6.8, G24).
 
     A signal no source reported is UNKNOWN. Volume, market cap and total fees are the
-    token's (see ``_token_volume``); a fresh GMGN market cap replaces the Data API's.
+    token's (see ``_token_volume``); a fresh GMGN market cap replaces the Data API's, and
+    so does a fresh Jupiter one without it (T22).
     """
 
     rules = policy.guide
@@ -411,17 +446,24 @@ def assess_guide_thresholds(
         EvidenceItem(name="theme", value=theme or ("none" if named else "UNKNOWN"))
     )
 
-    gmgn_cap = reading.market_cap_usd if reading is not None else None
-    cap = gmgn_cap if gmgn_cap is not None else pool.base_token_market_cap
+    # The cap as the author reads it in GMGN; else Jupiter's (circulating supply, T22); else
+    # the Data API's.
+    jupiter = fresh_jupiter(token)
+    cap: Decimal | None = None
+    cap_source = "UNKNOWN"
+    for source, value in (
+        ("GMGN", reading.market_cap_usd if reading is not None else None),
+        ("JUPITER", jupiter.market_cap_usd if jupiter is not None else None),
+        ("DATA_API", pool.base_token_market_cap),
+    ):
+        if value is not None:
+            cap, cap_source = value, source
+            break
     if cap is None:
         missing.append("market_cap")
     elif cap < rules.minimum_market_cap:
         reasons.append(RejectionCode.MARKET_CAP_BELOW_THRESHOLD)
     evidence.append(_item("market_cap", cap, rules.minimum_market_cap))
-    if gmgn_cap is not None:
-        cap_source = "GMGN"
-    else:
-        cap_source = "DATA_API" if cap is not None else "UNKNOWN"
     evidence.append(EvidenceItem(name="market_cap_source", value=cap_source))
     evidence.append(
         EvidenceItem(
@@ -570,7 +612,8 @@ def _artificial_volume(
     cap (``minimum_total_fees_sol x cap / total_fees_reference_market_cap``; both sides are
     SOL, so no SOL price is needed) - while the pool turned over at least
     ``maximum_hourly_turnover`` times its TVL in the hour. GMGN's own wash-trading verdict
-    rejects too. Without total fees the rule waits (D03 flag).
+    rejects too, and so does Jupiter grading the token's organic activity ``low`` (T22).
+    Without total fees the rule waits (D03 flag).
     """
 
     reasons: list[RejectionCode] = []
@@ -613,6 +656,22 @@ def _artificial_volume(
                 value=reading.wash_trading.value if fresh else _UNAVAILABLE,
             )
         )
+    jupiter = fresh_jupiter(token)
+    label = jupiter.organic_score_label if jupiter is not None else None
+    if label is OrganicScoreLabel.LOW:
+        reasons.append(RejectionCode.ARTIFICIAL_VOLUME_SUSPECTED)
+    evidence.extend(
+        (
+            EvidenceItem(
+                name="jupiter_organic_score_label",
+                value=_UNAVAILABLE if label is None else label.value,
+                threshold=f"not {OrganicScoreLabel.LOW.value}",
+            ),
+            _reported(
+                "jupiter_organic_score", jupiter.organic_score if jupiter is not None else None
+            ),
+        )
+    )
     return reasons
 
 
@@ -754,14 +813,19 @@ def _token_age(
 ) -> tuple[timedelta, bool]:
     """Lower bound on token age and whether it is exact.
 
-    A pool cannot predate its base mint, so pool age bounds token age from below; the
-    oldest mint activity from RPC is exact only when the signature history was exhausted.
-    A fresh enhanced reading's creation time (GMGN ``creation_timestamp``) is exact.
+    A pool cannot predate its base mint, so pool age bounds token age from below, and so
+    does the token's first pool as a fresh Jupiter reading names it (T22); the oldest mint
+    activity from RPC is exact only when the signature history was exhausted. A fresh
+    enhanced reading's creation time (GMGN ``creation_timestamp``) is exact.
     """
 
     bounds = [decision_at - pool.created_at]
     if token.earliest_activity_at is not None:
         bounds.append(decision_at - token.earliest_activity_at)
+    jupiter = fresh_jupiter(token)
+    first_pool = jupiter.first_pool_at if jupiter is not None else None
+    if first_pool is not None and first_pool <= decision_at:
+        bounds.append(decision_at - first_pool)
     reading = _fresh_reading(token)
     created = reading.created_at if reading is not None else None
     if created is not None and created <= decision_at:
@@ -839,6 +903,17 @@ class PoolScreener:
                 reasons.extend(gmgn_reasons)
                 evidence = (*evidence, *gmgn_evidence)
                 flags.extend(gmgn_flags)
+            gmgn = _fresh_reading(token)
+            source_reasons, source_evidence, source_flags = assess_token_sources(
+                token,
+                context.mode,
+                gmgn_developer_known=policy.guide.gmgn is not None
+                and gmgn is not None
+                and gmgn.developer_share is not None,
+            )
+            reasons.extend(source_reasons)
+            evidence = (*evidence, *source_evidence)
+            flags.extend(source_flags)
         flags.extend(integrity.flags)
         if DecisionFlag.THEME_UNKNOWN in flags and context.mode is not TradingMode.SHADOW:
             missing.add("theme")

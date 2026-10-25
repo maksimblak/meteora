@@ -97,6 +97,9 @@ class RejectionCode(StrEnum):
     # outcome, recorded with ``refuse_candidate``; same names as ``StrategyRejection``.
     NOT_NEAR_LOCAL_HIGH = "NOT_NEAR_LOCAL_HIGH"
     RANGE_TOO_NARROW = "RANGE_TOO_NARROW"
+    # T22: RugCheck rates at least one risk of the token ``danger`` (a whale holder, mint
+    # authority, unlocked LP), in every mode.
+    RUGCHECK_DANGER = "RUGCHECK_DANGER"
 
 
 class DecisionFlag(StrEnum):
@@ -109,9 +112,10 @@ class DecisionFlag(StrEnum):
     # D07: no quote measured depth and price impact. SHADOW goes on with a conservative
     # slippage model; APPROVAL and LIVE are closed (reason ``DEPTH_UNAVAILABLE``).
     DEPTH_UNAVAILABLE = "DEPTH_UNAVAILABLE"
-    # D07: no transaction or participant counts (none from the Data API). Artificial volume
-    # is judged on turnover, fee organicity and burst self-similarity; SHADOW and APPROVAL go
-    # on, LIVE is closed (reason ``VOLUME_PARTICIPANTS_UNAVAILABLE``) until a provider has them.
+    # D07: no transaction or participant counts (none from the Data API, and no fresh
+    # Jupiter reading of the token's 5m trades and traders, T22). Artificial volume is
+    # judged on turnover, fee organicity and burst self-similarity; SHADOW and APPROVAL go
+    # on, LIVE is closed (reason ``VOLUME_PARTICIPANTS_UNAVAILABLE``).
     VOLUME_PARTICIPANTS_UNAVAILABLE = "VOLUME_PARTICIPANTS_UNAVAILABLE"
     # G18: no fresh GMGN reading of every threshold metric. SHADOW and APPROVAL go on (the
     # approval preview asks for a manual check); LIVE is closed (reason ``GMGN_UNAVAILABLE``)
@@ -127,7 +131,7 @@ class DecisionFlag(StrEnum):
     # G24: the 5m window spiked (ratio, robust z and 30m confirmation): a score bonus.
     VOLUME_SPIKE = "VOLUME_SPIKE"
     # G24: token volume is the sum of the token's DLMM pools, not GMGN's token volume as in
-    # Trending (no key, or no fresh GMGN reading).
+    # Trending (no fresh GMGN reading, and no fresh Jupiter reading either, T22).
     TOKEN_VOLUME_POOL_ONLY = "TOKEN_VOLUME_POOL_ONLY"  # noqa: S105 - stable domain code
     # GMGN counts more launch snipers than the guide-v1 maximum ("большие - ждать").
     SNIPERS_HIGH = "SNIPERS_HIGH"
@@ -136,6 +140,9 @@ class DecisionFlag(StrEnum):
     # The source reports neither the token's name nor its ticker, so the theme filter could
     # not run. SHADOW goes on; APPROVAL and LIVE are closed (missing signal ``theme``).
     THEME_UNKNOWN = "THEME_UNKNOWN"
+    # T22: RugCheck was asked for the token but gave no fresh report; an optional source, so
+    # nothing is closed - the operator checks the token on RugCheck by hand.
+    RUGCHECK_UNAVAILABLE = "RUGCHECK_UNAVAILABLE"
 
 
 class VolumeIntegrityMode(StrEnum):
@@ -531,6 +538,9 @@ class TokenVolumeSource(StrEnum):
 
     # A fresh GMGN reading: the token's volume as GMGN reports it, as in Trending (F5).
     GMGN = "GMGN"
+    # T22: no fresh GMGN figure, a fresh Jupiter reading: the token's volume over every venue
+    # Jupiter routes.
+    JUPITER = "JUPITER"
     DLMM_POOLS = "DLMM_POOLS"  # the sum of the token's DLMM pools (``TOKEN_VOLUME_POOL_ONLY``)
     PENDING = "PENDING"  # the enhanced source is asked only after the cheap filters
 
@@ -545,7 +555,8 @@ class TokenSelection(BaseModel):
     report the token's own volume after the cheap filters, so pool sums must not decide it
     yet. ``rank``/``rank_limit``: the token's place among the cycle's candidates by hourly
     volume and how many of them are checked in depth; ``rank_source``: whose hourly volume
-    ranked it - GMGN's reading already held for the token, else its DLMM pools' sum (F5).
+    ranked it - GMGN's reading already held for the token, else Jupiter's (T22), else its
+    DLMM pools' sum (F5).
     """
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")

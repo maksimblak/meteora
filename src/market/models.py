@@ -524,6 +524,131 @@ class EnhancedTokenSignals(BaseModel):
         return self
 
 
+class OrganicScoreLabel(StrEnum):
+    """Jupiter's own grade of a token's ``organicScore`` (Tokens API v2)."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+# Token-level USD figures of a Jupiter reading (T22); never negative.
+_JUPITER_USD_FIELDS = (
+    "volume_5m_usd",
+    "volume_1h_usd",
+    "price_usd",
+    "market_cap_usd",
+    "liquidity_usd",
+)
+
+
+class JupiterTokenReading(BaseModel):
+    """One token as Jupiter Tokens API v2 (``/tokens/v2/search``) reports it (T22).
+
+    Token-level figures over every venue Jupiter routes, as the author reads a token in
+    GMGN: ``volume_5m_usd`` and ``volume_1h_usd`` (buy plus sell volume of the window),
+    ``price_usd``, ``market_cap_usd`` and ``liquidity_usd``. ``trades_5m`` (buys plus sells)
+    and ``traders_5m`` are the 5-minute window's transaction and wallet counts.
+    ``organic_score`` (0..100) is Jupiter's measure of organic activity, graded
+    ``organic_score_label``. ``mint_authority`` and ``freeze_authority``: REVOKED when
+    Jupiter reports the authority disabled, PRESENT when it names one. ``top_holders_share``
+    and ``developer_share`` are fractions in [0, 1]; ``first_pool_at`` is the creation of
+    the token's first pool Jupiter knows - a lower bound on the token's age, not its mint
+    time. ``None`` = not reported; ``detail`` says why a reading is unavailable.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    mint: PublicKey
+    provider: str = "jupiter"
+    source_at: datetime
+    freshness: Freshness
+    detail: str | None = None
+    volume_5m_usd: Decimal | None = None
+    volume_1h_usd: Decimal | None = None
+    price_usd: Decimal | None = None
+    market_cap_usd: Decimal | None = None
+    liquidity_usd: Decimal | None = None
+    trades_5m: int | None = None
+    traders_5m: int | None = None
+    organic_score: Decimal | None = None
+    organic_score_label: OrganicScoreLabel | None = None
+    mint_authority: AuthorityStatus = AuthorityStatus.UNKNOWN
+    freeze_authority: AuthorityStatus = AuthorityStatus.UNKNOWN
+    top_holders_share: Decimal | None = None
+    developer_share: Decimal | None = None
+    holder_count: int | None = None
+    first_pool_at: datetime | None = None
+
+    _reject_binary_float = field_validator(
+        *_JUPITER_USD_FIELDS,
+        "organic_score",
+        "top_holders_share",
+        "developer_share",
+        mode="before",
+    )(_exact_decimal)
+    _normalize_utc = field_validator("source_at")(_utc)
+
+    @field_validator("first_pool_at")
+    @classmethod
+    def _normalize_first_pool(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _utc(value)
+
+    @model_validator(mode="after")
+    def validate_reading(self) -> "JupiterTokenReading":
+        for name in _JUPITER_USD_FIELDS:
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must not be negative")
+        for name in ("top_holders_share", "developer_share"):
+            value = getattr(self, name)
+            if value is not None and not Decimal(0) <= value <= Decimal(1):
+                raise ValueError(f"{name} must be a fraction in [0, 1]")
+        if self.organic_score is not None and not Decimal(0) <= self.organic_score <= 100:
+            raise ValueError("organic_score must be in [0, 100]")
+        for name in ("trades_5m", "traders_5m", "holder_count"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must not be negative")
+        return self
+
+
+class RugCheckReading(BaseModel):
+    """RugCheck's summary report of one token (``/v1/tokens/{mint}/report/summary``, T22).
+
+    ``danger``: the names of the risks RugCheck rates ``danger`` (a whale holder, mint
+    authority, unlocked LP); ``warnings``: the names of every other risk it lists.
+    ``score`` is ``score_normalised`` (0..100, higher is riskier) and ``lp_locked_share``
+    the locked share of the token's LP in [0, 1]. ``detail`` says why a report is
+    unavailable.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    mint: PublicKey
+    provider: str = "rugcheck"
+    source_at: datetime
+    freshness: Freshness
+    detail: str | None = None
+    score: int | None = None
+    danger: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    lp_locked_share: Decimal | None = None
+
+    _reject_binary_float = field_validator("lp_locked_share", mode="before")(_exact_decimal)
+    _normalize_utc = field_validator("source_at")(_utc)
+
+    @model_validator(mode="after")
+    def validate_report(self) -> "RugCheckReading":
+        if self.score is not None and not 0 <= self.score <= 100:
+            raise ValueError("score must be in [0, 100]")
+        if self.lp_locked_share is not None and not (
+            Decimal(0) <= self.lp_locked_share <= Decimal(1)
+        ):
+            raise ValueError("lp_locked_share must be a fraction in [0, 1]")
+        return self
+
+
 class TokenRiskSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True)
 
@@ -553,6 +678,10 @@ class TokenRiskSnapshot(BaseModel):
     # D09: ``False`` when no on-chain source is configured at all (no RPC): every base
     # signal is unknown by deployment, not by a failure, and the snapshot is UNAVAILABLE.
     source_configured: bool = True
+    # The free token sources as received (T22), each with its own source time and
+    # freshness; ``None`` when the source was not asked for this token.
+    jupiter: JupiterTokenReading | None = None
+    rugcheck: RugCheckReading | None = None
 
     _reject_binary_float = field_validator("holder_concentration", "total_fees_sol", mode="before")(
         _exact_decimal

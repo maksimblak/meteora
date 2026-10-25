@@ -1,15 +1,18 @@
 """Stable provider and storage ports for the market-data domain."""
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
 from src.domain.models.primitives import PublicKey
 from src.market.models import (
+    JupiterTokenReading,
     PoolPage,
     PoolRef,
     PoolSnapshot,
     ProviderHealth,
+    RugCheckReading,
     TokenRiskSnapshot,
     VolumeBucket,
     WalletState,
@@ -40,6 +43,32 @@ class OnChainProvider(Protocol):
     async def get_token_risk(self, mint: PublicKey) -> TokenRiskSnapshot: ...
 
     async def get_wallet_state(self, wallet: PublicKey) -> WalletState: ...
+
+
+class TokenMarketSource(Protocol):
+    """Token readings asked for many tokens at once, before the cycle screens (T22)."""
+
+    @property
+    def health(self) -> ProviderHealth: ...
+
+    async def prefetch(self, mints: Sequence[str]) -> None:
+        """Read the tokens not held fresh; never raises (a failure is a reading)."""
+        ...
+
+    def reading(self, mint: PublicKey) -> JupiterTokenReading | None:
+        """The fresh reading held, else the last failure of the token; never a request."""
+        ...
+
+
+class TokenAuditSource(Protocol):
+    """A token's audit report, asked for one deep candidate at a time (T22)."""
+
+    @property
+    def health(self) -> ProviderHealth: ...
+
+    async def report(self, mint: PublicKey) -> RugCheckReading:
+        """The fresh report held or read now; never raises (a failure is a reading)."""
+        ...
 
 
 class UniverseSnapshotStage(Protocol):

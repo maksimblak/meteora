@@ -18,7 +18,7 @@ from src.domain.screening.models import (
 )
 from src.domain.screening.pairs import PairShape
 from src.domain.strategy.models import PositionReason, StrategyFlag
-from src.market.models import DeveloperStatus
+from src.market.models import DeveloperStatus, OrganicScoreLabel
 from src.modes.models import CriticalAlert
 from src.worker.execution import SaleStatus
 
@@ -175,6 +175,28 @@ GMGN_STATUSES = (
 )
 
 
+# ``jupiter_status`` / ``rugcheck_status`` (T22): src/domain/screening/sources.py and the
+# reasons of src/providers/jupiter.py, rugcheck.py and the pipeline's own PROVIDER_ERROR.
+SOURCE_STATUSES = [
+    "FRESH",
+    "STALE",
+    "NOT_READ",
+    *(
+        f"UNAVAILABLE:{reason}"
+        for reason in (
+            "NOT_LISTED",
+            "RATE_LIMITED",
+            "CIRCUIT_OPEN",
+            "API_TIMEOUT",
+            "API_UNAVAILABLE",
+            "API_PAYLOAD_INVALID",
+            "HTTP_403",
+            "PROVIDER_ERROR",
+        )
+    ),
+]
+
+
 def russian(text: str, code: str) -> None:
     assert text != code and CYRILLIC.search(text), f"{code}: {text!r}"
 
@@ -264,8 +286,15 @@ def test_the_event_and_plan_codes_of_t19_and_f4_have_russian_lines(table: str, c
         ("pool_pair", [item.value for item in PairShape]),
         ("token_volume_source", [item.value for item in TokenVolumeSource]),
         ("token_volume_rank_source", [item.value for item in TokenVolumeSource]),
-        ("market_cap_source", ["GMGN", "DATA_API", "UNKNOWN"]),
+        ("market_cap_source", ["GMGN", "JUPITER", "DATA_API", "UNKNOWN"]),
         ("developer_status", [*(item.value for item in DeveloperStatus), "UNAVAILABLE"]),
+        # T22: Jupiter's organic grade and the two free sources' statuses.
+        (
+            "jupiter_organic_score_label",
+            [*(item.value for item in OrganicScoreLabel), "UNAVAILABLE"],
+        ),
+        ("jupiter_status", [*SOURCE_STATUSES, "UNAVAILABLE:HTTP_401"]),
+        ("rugcheck_status", SOURCE_STATUSES),
     ],
 )
 def test_every_code_valued_evidence_row_is_explained(name: str, values: list[str]) -> None:

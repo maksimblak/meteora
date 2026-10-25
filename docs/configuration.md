@@ -7,7 +7,7 @@
 1. `docker compose` читает `.env` из корня проекта **только для подстановки** `${ИМЯ:-}` в `docker-compose.yml`. Директивы `env_file` нет: в контейнер попадает лишь то, что явно перечислено у сервиса.
 2. Поэтому у каждой переменной ниже есть колонка «compose»: **да** — достаточно вписать значение в `.env`; **нет** — переменная читается кодом, но `docker-compose.yml` её не передаёт; чтобы её задать, нужен свой `docker-compose.override.yml` (Compose подхватывает его автоматически рядом с основным файлом; в Git его не кладите, если там пути к секретам).
 3. Пустое значение = «не задано». Подстановка `${X:-}` превращает отсутствующую переменную в пустую строку, и код считает её отсутствующей.
-4. Секреты (их единый список — реестр `src/core/secrets.py`: `DATABASE_URL`, `APP_OPERATOR_TOKEN`, `APP_SESSION_SECRET`, `HELIUS_API_KEY`, `EXECUTOR_INTERNAL_TOKEN`, `EXECUTOR_MODE_TOKEN`, `EXECUTOR_APPROVAL_SECRET`, `GMGN_API_KEY`, `TELEGRAM_BOT_TOKEN`, `WALLET_KEYPAIR_FILE`) задаются **либо** `ИМЯ`, **либо** `ИМЯ_FILE` (путь к файлу **внутри контейнера**; файл монтируется через override). Python отказывается стартовать, если заданы оба; executor при обоих берёт прямое значение. Пустой файл секрета — ошибка.
+4. Секреты (их единый список — реестр `src/core/secrets.py`: `DATABASE_URL`, `APP_OPERATOR_TOKEN`, `APP_SESSION_SECRET`, `HELIUS_API_KEY`, `EXECUTOR_INTERNAL_TOKEN`, `EXECUTOR_MODE_TOKEN`, `EXECUTOR_APPROVAL_SECRET`, `GMGN_API_KEY`, `GMGN_BRIDGE_TOKEN`, `JUPITER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `WALLET_KEYPAIR_FILE`) задаются **либо** `ИМЯ`, **либо** `ИМЯ_FILE` (путь к файлу **внутри контейнера**; файл монтируется через override). Python отказывается стартовать, если заданы оба; executor при обоих берёт прямое значение. Пустой файл секрета — ошибка.
 5. `DATABASE_URL` и `APP_ENV` для Python-сервисов зашиты в `docker-compose.yml` (`postgresql+asyncpg://meteora@postgres:5432/meteora`, `development`); значения из `.env` для них не используются.
 
 Пример override для настроек, которых нет в compose (впишите свои значения):
@@ -167,6 +167,19 @@ OpenAPI работает только с IPv4 (по IPv6 GMGN отвечает 4
 | `GMGN_BASE_URL` (только https), `GMGN_HOST`, `GMGN_PORT`, `GMGN_SETTLE_SECONDS` (8), `GMGN_MAX_PENDING` (16), `GMGN_RESPONSE_WAIT_SECONDS` (10), `GMGN_BACKOFF_SECONDS` (60), `GMGN_BACKOFF_MAX_SECONDS` (1800), `GMGN_BREAKER_THRESHOLD` (3) | в скобках | нет |
 
 **Ограничения.** Headless-сервис построен, но gmgn.ai через Cloudflare отдаёт headless-браузеру 403, и сервис отвечает `UNAVAILABLE` (причина `ACCESS_BLOCKED` или `API_BLOCKED`). Посредник работает только в видимом окне, пока оно открыто и ПК не спит; так пользоваться GMGN — против его правил. Обхода защит нет и не будет: никаких решателей капч, плагинов маскировки, подмены отпечатков и выноса cookie (§6.7). Без ключа и без посредника бот работает с флагом `GMGN_UNAVAILABLE`: в APPROVAL карточка подтверждения пишет «GMGN недоступен — проверь вручную», а автоматический LIVE закрыт, пока `GMGN_REQUIRED_FOR_LIVE` не выставлен в `false`. Единица `total_fee` (SOL) выведена сборкой по совпадению со страницей токена — документация GMGN её не называет.
+
+## Бесплатные источники токена: Jupiter и RugCheck (T22, ADR 0014)
+
+Без ключей и денег. Jupiter Tokens API v2 читается на весь цикл кандидатов до решений (пачками по 100 токенов): объём токена по всем площадкам (если нет свежего GMGN), капитализация, сделки и трейдеры за 5 минут, органичность (`low` — отказ как накрутка), mint/freeze, доля девелопера. RugCheck — только для кандидатов глубокой проверки: любой риск `danger` — отказ `RUGCHECK_DANGER`. Оба необязательны: сбой или выключенный источник ничего не закрывает, решение показывает `jupiter_status` / `rugcheck_status`.
+
+| Переменная | По умолчанию | compose | Что делает |
+|---|---|---|---|
+| `JUPITER_API_URL` | compose: `https://api.jup.ag`; без compose — выключен | да (worker) | адрес Jupiter; пустая строка `JUPITER_API_URL=` в `.env` выключает источник |
+| `JUPITER_API_KEY` / `_FILE` | — | да (worker) | необязательный бесплатный ключ (portal.jup.ag): 1 запрос в секунду вместо 0,5 (клиент держит 80%). Идёт только в заголовке `x-api-key`. Секрет |
+| `JUPITER_CACHE_SECONDS` | 120 | да | сколько держится показание токена; старше — спрашивается снова |
+| `JUPITER_MAX_TOKENS` | 500 | да | сколько верхних токенов цикла спрашивать (100 на запрос): 500 — 5 запросов, около 10 секунд без ключа |
+| `RUGCHECK_API_URL` | compose: `https://api.rugcheck.xyz`; без compose — выключен | да (worker) | адрес RugCheck; `RUGCHECK_API_URL=` выключает |
+| `RUGCHECK_CACHE_SECONDS` | 1800 | да | сколько держится отчёт по токену (сбой — 2 минуты); не чаще запроса в секунду |
 
 ## Пороги `guide-v1` и `RULESET_OVERRIDES_FILE`
 

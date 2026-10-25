@@ -20,6 +20,11 @@ watches the developer through the same GMGN source every 5 minutes (``DEV_SOLD``
 Without either nothing is asked and nothing changes, except that the loaded guide-v1 rules
 keep LIVE closed until ``GMGN_REQUIRED_FOR_LIVE=false``.
 
+Free token sources (T22): with ``JUPITER_API_URL`` the candidate job first reads Jupiter
+Tokens API v2 for the cycle's top ``JUPITER_MAX_TOKENS`` tokens, 100 to a request, and
+ranks and screens them with those readings; with ``RUGCHECK_API_URL`` every deep candidate
+also gets RugCheck's report. Compose sets both public URLs by default; empty = off.
+
 Open positions (T19, spec 6.8): the position job rereads each position's pool from the
 Data API every ``WORKER_POSITION_SNAPSHOT_SECONDS`` (30) through the universe adapter, so
 under its rate limit. The sale after an exit (``SWAP_*``) is read here with the other
@@ -69,7 +74,13 @@ from src.gmgn import GmgnOpenApiProvider, GmgnProvider, OpenApiSettings
 from src.gmgn.client import bridge_token
 from src.gmgn.enrichment import EnhancedSignalSource, EnrichedOnChainProvider
 from src.gmgn.openapi import openapi_client
-from src.market.contracts import MarketDataProvider, OnChainProvider, VolumeHistorySource
+from src.market.contracts import (
+    MarketDataProvider,
+    OnChainProvider,
+    TokenAuditSource,
+    TokenMarketSource,
+    VolumeHistorySource,
+)
 from src.market.models import (
     AuthorityStatus,
     DataQuality,
@@ -98,6 +109,8 @@ from src.observability.sinks import LoggingEventSink
 from src.persistence.contracts import EventSink
 from src.persistence.factory import PersistenceBackend, Repositories, open_repositories
 from src.providers.contracts import PoolStateReader, ProviderUnavailableError
+from src.providers.jupiter import JupiterTokensProvider
+from src.providers.rugcheck import RugCheckProvider
 from src.recovery.service import ExecutorLease, RecoveryService
 from src.worker.evidence import DailyEvidence
 from src.worker.execution import (
@@ -133,6 +146,12 @@ GMGN_URL_ENV = "GMGN_URL"
 GMGN_TIMEOUT_ENV = "GMGN_TIMEOUT_SECONDS"
 GMGN_STALE_AFTER_ENV = "GMGN_STALE_AFTER_SECONDS"
 POSITION_SNAPSHOT_INTERVAL_ENV = "WORKER_POSITION_SNAPSHOT_SECONDS"
+# Free token sources (T22); an empty URL is off.
+JUPITER_API_URL_ENV = "JUPITER_API_URL"
+JUPITER_CACHE_ENV = "JUPITER_CACHE_SECONDS"
+JUPITER_MAX_TOKENS_ENV = "JUPITER_MAX_TOKENS"
+RUGCHECK_API_URL_ENV = "RUGCHECK_API_URL"
+RUGCHECK_CACHE_ENV = "RUGCHECK_CACHE_SECONDS"
 
 _UNKNOWN_SIGNALS = (
     "blacklisted",
@@ -157,6 +176,13 @@ def _integer(environ: Mapping[str, str], name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def _positive(environ: Mapping[str, str], name: str, default: int) -> int:
+    value = _integer(environ, name, default)
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerSettings:
     position_interval: timedelta = timedelta(seconds=15)
@@ -171,6 +197,8 @@ class WorkerSettings:
     candidate_concurrency: int = 4
     universe_concurrency: int = 8
     universe_batch_size: int = 50
+    # The cycle's tokens Jupiter is asked for (T22), top of the ranking first: 5 requests.
+    jupiter_max_tokens: int = 500
     shadow_equity_base_units: int = 1_000_000_000
     metrics_host: str = "127.0.0.1"
     metrics_port: int | None = 9100
@@ -192,6 +220,7 @@ class WorkerSettings:
             # The same reading the policy's observation gap is derived from.
             universe_interval=universe_interval(environ),
             max_concurrency=_integer(environ, "WORKER_MAX_CONCURRENCY", 2),
+            jupiter_max_tokens=_positive(environ, JUPITER_MAX_TOKENS_ENV, 500),
             shadow_equity_base_units=_integer(environ, "SHADOW_EQUITY_BASE_UNITS", 1_000_000_000),
             metrics_host=environ.get("WORKER_METRICS_HOST") or "127.0.0.1",
             metrics_port=9100 if not port else (None if port == "0" else int(port)),
@@ -304,13 +333,17 @@ class WorkerRuntime:
         pool_snapshots: PoolSnapshotSource | None = None,
         developer: EnhancedSignalSource | None = None,
         swap: SwapSettings | None = None,
+        jupiter: TokenMarketSource | None = None,
+        rugcheck: TokenAuditSource | None = None,
     ) -> None:
         """``pool_states`` re-reads the active bin before a non-SHADOW entry, ``quotes``
         measures candidates' depth (``POST /v1/quotes``) and ``warmup`` serves a new
         candidate's volume history (D07); each is optional and its absence fails closed.
         ``gmgn`` attaches GMGN metrics to candidates' token risk (G18). ``pool_snapshots``
         rereads open positions' pools and ``developer`` watches their developers (T19);
-        ``swap``: the sale after an exit (``SWAP_*``; the defaults without it)."""
+        ``swap``: the sale after an exit (``SWAP_*``; the defaults without it).
+        ``jupiter`` reads the cycle's tokens before screening and ``rugcheck`` the deep
+        candidates (T22); each is optional."""
 
         self.settings = settings
         self.policy = policy
@@ -322,6 +355,8 @@ class WorkerRuntime:
         self._onchain = onchain
         self.gmgn = gmgn
         self.developer = developer
+        self.jupiter = jupiter
+        self.rugcheck = rugcheck
         self.swap = swap if swap is not None else SwapSettings()
         self._log = get_logger("worker.runtime")
         repos = repositories
@@ -429,6 +464,8 @@ class WorkerRuntime:
             warmup=warmup,
             evidence=self.evidence,
             enhanced_signals=gmgn is not None,
+            token_market=jupiter,
+            token_audit=rugcheck,
         )
         self.positions = PositionCycle(
             modes=repos.mode,
@@ -474,6 +511,10 @@ class WorkerRuntime:
         self.health.register_provider("solana", lambda: onchain.health)
         if gmgn is not None:
             self.health.register_provider("gmgn", lambda: gmgn.health)
+        if jupiter is not None:
+            self.health.register_provider("jupiter", lambda: jupiter.health)
+        if rugcheck is not None:
+            self.health.register_provider("rugcheck", lambda: rugcheck.health)
         self.scheduler = Scheduler(
             self.jobs(),
             repos.leases,
@@ -520,9 +561,10 @@ class WorkerRuntime:
 
         1. The universe is grouped by token (the side of a pair that is not a quote token,
            F5), tokens ranked by hourly volume: GMGN's figure where the OpenAPI source
-           already holds a reading of the token, else the sum over its DLMM pools. Pools
-           with an open position or an entry in flight are not evaluated; the token of such
-           a pool is held (``TOKEN_ALREADY_HELD``).
+           already holds a reading of the token, else Jupiter's - read now for the top
+           ``jupiter_max_tokens`` tokens, before the cycle's decision instant (T22) - else
+           the sum over its DLMM pools. Pools with an open position or an entry in flight
+           are not evaluated; the token of such a pool is held (``TOKEN_ALREADY_HELD``).
         2. Cheap filters, no request: a token's pools are tried main pool first (largest
            LP fees in the hour, then TVL); the first that passes is the token's candidate,
            the ones before it are recorded with their rejects, the rest wait.
@@ -539,9 +581,14 @@ class WorkerRuntime:
             await self.gateway_entries.run()
         snapshots = await self.repositories.history.latest_universe()
         busy = await self._busy_entries(snapshots)
+        await self._read_token_markets(snapshots)
         queue = [
             (group, [item for item in group.pools if item.pool.address.root not in busy.pools])
-            for group in token_groups(snapshots, token_volume_1h=self._held_token_volume())
+            for group in token_groups(
+                snapshots,
+                token_volume_1h=self._held_token_volume(),
+                jupiter_volume_1h=self._jupiter_volume(),
+            )
         ]
         queue = [(group, pools) for group, pools in queue if pools]
         remaining = sum(len(pools) for _, pools in queue)
@@ -669,6 +716,40 @@ class WorkerRuntime:
 
         return volume
 
+    def _jupiter_volume(self) -> TokenVolumeLookup | None:
+        """Jupiter's hourly volume of a token from its fresh reading held (T22)."""
+
+        source = self.jupiter
+        if source is None:
+            return None
+
+        def volume(mint: str) -> Decimal | None:
+            reading = source.reading(PublicKey(mint))
+            if reading is None or reading.freshness is not Freshness.FRESH:
+                return None
+            return reading.volume_1h_usd
+
+        return volume
+
+    async def _read_token_markets(self, snapshots: Sequence[PoolSnapshot]) -> None:
+        """Jupiter's readings of the top ``jupiter_max_tokens`` tokens, ranked as the cycle
+        ranks them with what it already holds; a failure is each token's reading."""
+
+        source = self.jupiter
+        if source is None:
+            return
+        groups = token_groups(
+            snapshots,
+            token_volume_1h=self._held_token_volume(),
+            jupiter_volume_1h=self._jupiter_volume(),
+        )
+        mints = [group.base_mint for group in groups[: self.settings.jupiter_max_tokens]]
+        try:
+            await source.prefetch(mints)
+        except Exception as error:
+            # The source never raises by contract; a defect costs the readings, not the cycle.
+            self._log.error("token_market_prefetch_failed", **error_fields(error))
+
     # --- lifecycle --------------------------------------------------------------------
 
     async def refresh_health(self) -> None:
@@ -694,6 +775,10 @@ class WorkerRuntime:
         self.metrics.provider_state("solana", self._onchain.health)
         if self.gmgn is not None:
             self.metrics.provider_state("gmgn", self.gmgn.health)
+        if self.jupiter is not None:
+            self.metrics.provider_state("jupiter", self.jupiter.health)
+        if self.rugcheck is not None:
+            self.metrics.provider_state("rugcheck", self.rugcheck.health)
 
     async def run(self, stop: asyncio.Event) -> None:
         await self.refresh_health()
@@ -840,6 +925,7 @@ def build_runtime(
     market_transport: httpx.AsyncBaseTransport | None = None,
     rpc_transport: httpx.AsyncBaseTransport | None = None,
     gmgn_transport: httpx.AsyncBaseTransport | None = None,
+    token_sources_transport: httpx.AsyncBaseTransport | None = None,
 ) -> tuple[WorkerRuntime, list[httpx.AsyncClient]]:
     # The rule bundle (RULESET_VERSION, RULESET_OVERRIDES_FILE) is resolved first: an
     # unknown or invalid ruleset stops the start before any store or client is opened.
@@ -892,6 +978,10 @@ def build_runtime(
     gmgn, gmgn_client = build_gmgn(environ, clock=clock, transport=gmgn_transport)
     if gmgn_client is not None:
         clients.append(gmgn_client)
+    jupiter, rugcheck, source_clients = build_token_sources(
+        config, environ, clock=clock, transport=token_sources_transport
+    )
+    clients.extend(source_clients)
     runtime = WorkerRuntime(
         settings=settings,
         policy=policy,
@@ -911,6 +1001,8 @@ def build_runtime(
         # the browser bridge reads the creator's status as the OpenAPI does (G25).
         developer=gmgn,
         swap=swap,
+        jupiter=jupiter,
+        rugcheck=rugcheck,
     )
     return runtime, clients
 
@@ -1021,6 +1113,48 @@ def build_gmgn(
     )
     get_logger("worker.runtime").info("gmgn_source", source="browser", token=token is not None)
     return provider, client
+
+
+def build_token_sources(
+    config: AppConfig,
+    environ: Mapping[str, str],
+    *,
+    clock: Clock,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[JupiterTokensProvider | None, RugCheckProvider | None, list[httpx.AsyncClient]]:
+    """The free token sources (T22); each one is off while its URL is empty.
+
+    ``JUPITER_API_URL`` (compose: ``https://api.jup.ag``) with the optional free key
+    ``JUPITER_API_KEY`` (or ``JUPITER_API_KEY_FILE``: 1 request a second instead of 0.5) and
+    ``JUPITER_CACHE_SECONDS`` (120); ``RUGCHECK_API_URL`` (compose:
+    ``https://api.rugcheck.xyz``) with ``RUGCHECK_CACHE_SECONDS`` (1800).
+    """
+
+    clients: list[httpx.AsyncClient] = []
+    headers = {"Accept": "application/json", "User-Agent": "meteora-volume-bot"}
+    log = get_logger("worker.runtime")
+    jupiter: JupiterTokensProvider | None = None
+    url = (environ.get(JUPITER_API_URL_ENV) or "").strip()
+    if url:
+        client = httpx.AsyncClient(base_url=url, headers=headers, transport=transport)
+        clients.append(client)
+        jupiter = JupiterTokensProvider(
+            client,
+            clock=clock,
+            api_key=config.jupiter_api_key,
+            cache_ttl=_seconds(environ, JUPITER_CACHE_ENV, 120),
+        )
+        log.info("token_source", source="jupiter", key=config.jupiter_api_key is not None)
+    rugcheck: RugCheckProvider | None = None
+    url = (environ.get(RUGCHECK_API_URL_ENV) or "").strip()
+    if url:
+        client = httpx.AsyncClient(base_url=url, headers=headers, transport=transport)
+        clients.append(client)
+        rugcheck = RugCheckProvider(
+            client, clock=clock, cache_ttl=_seconds(environ, RUGCHECK_CACHE_ENV, 1800)
+        )
+        log.info("token_source", source="rugcheck")
+    return jupiter, rugcheck, clients
 
 
 async def run_worker() -> None:

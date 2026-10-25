@@ -13,8 +13,10 @@ MEME-SOL are pools of one token:
 * ``token_volume_1h`` - GMGN's hourly volume of the token (as in Trending), when the cycle
   already holds a reading of it: GMGN is asked only for tokens checked in depth, so only
   those it has read lately carry one (F5);
+* ``jupiter_volume_1h`` - Jupiter's hourly volume of the token, read for the cycle's tokens
+  before they are screened (T22);
 * ``rank_volume`` - what ranks the token among the cycle's candidates: GMGN's figure where
-  held, else the sum of its pools (``rank_source``);
+  held, else Jupiter's, else the sum of its pools (``rank_source``);
 * ``selection_for`` - what one pool needs to know about its siblings (``TokenSelection``).
 """
 
@@ -62,16 +64,22 @@ class TokenGroup:
     pools: tuple[PoolSnapshot, ...]
     volume_1h: Decimal
     token_volume_1h: Decimal | None = None
+    jupiter_volume_1h: Decimal | None = None
 
     @property
     def rank_source(self) -> TokenVolumeSource:
         if self.token_volume_1h is not None:
             return TokenVolumeSource.GMGN
+        if self.jupiter_volume_1h is not None:
+            return TokenVolumeSource.JUPITER
         return TokenVolumeSource.DLMM_POOLS
 
     @property
     def rank_volume(self) -> Decimal:
-        return self.token_volume_1h if self.token_volume_1h is not None else self.volume_1h
+        for volume in (self.token_volume_1h, self.jupiter_volume_1h):
+            if volume is not None:
+                return volume
+        return self.volume_1h
 
     def selection_for(
         self, pool_address: str, *, held: bool = False, enhanced_pending: bool = False
@@ -91,11 +99,14 @@ class TokenGroup:
 
 
 def token_groups(
-    snapshots: Sequence[PoolSnapshot], *, token_volume_1h: TokenVolumeLookup | None = None
+    snapshots: Sequence[PoolSnapshot],
+    *,
+    token_volume_1h: TokenVolumeLookup | None = None,
+    jupiter_volume_1h: TokenVolumeLookup | None = None,
 ) -> tuple[TokenGroup, ...]:
     """The latest snapshots grouped by token, ranked by the token's hourly volume:
-    ``token_volume_1h`` (GMGN's figure already held) where it knows one, else the sum of
-    the token's DLMM pools."""
+    ``token_volume_1h`` (GMGN's figure already held) where it knows one, else
+    ``jupiter_volume_1h`` (Jupiter's, T22), else the sum of the token's DLMM pools."""
 
     by_mint: defaultdict[str, list[PoolSnapshot]] = defaultdict(list)
     for snapshot in snapshots:
@@ -106,6 +117,7 @@ def token_groups(
             pools=tuple(sorted(pools, key=_priority)),
             volume_1h=sum((_hour_volume(item) for item in pools), Decimal(0)),
             token_volume_1h=None if token_volume_1h is None else token_volume_1h(mint),
+            jupiter_volume_1h=None if jupiter_volume_1h is None else jupiter_volume_1h(mint),
         )
         for mint, pools in by_mint.items()
     ]

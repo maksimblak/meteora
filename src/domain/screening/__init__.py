@@ -34,6 +34,7 @@ from src.domain.screening.screener import (
     refuse_candidate,
 )
 from src.domain.screening.selection import TokenGroup, token_groups
+from src.domain.screening.sources import assess_token_sources, merge_token_sources
 
 __all__ = [
     "DEFAULT_THEME_WORDS",
@@ -64,9 +65,11 @@ __all__ = [
     "VolumeIntegrityMode",
     "VolumeRegime",
     "assess_guide_thresholds",
+    "assess_token_sources",
     "assess_volume_integrity",
     "merge_enhanced_signals",
     "merge_pool_token_signals",
+    "merge_token_sources",
     "pair_token",
     "refuse_candidate",
     "token_groups",

@@ -58,7 +58,7 @@ REJECTION = {
     "VOLUME_TO_LIQUIDITY_BELOW_THRESHOLD": "объём к ликвидности ниже порога",
     "ARTIFICIAL_VOLUME_SUSPECTED": (
         "подозрение на накрутку: total fees малы для такой капы при обороте пула за час "
-        "≥ 10× TVL, или GMGN видит wash trading"
+        "≥ 10× TVL, или GMGN видит wash trading, или Jupiter оценил органичность как low"
     ),
     "TOTAL_FEES_BELOW_THRESHOLD": "total fees токена ниже порога",
     "GUIDE_SIGNAL_UNKNOWN": "обязательный сигнал guide-v1 недоступен",
@@ -95,6 +95,11 @@ REJECTION = {
         "bin step пула не даёт бид-аску глубины 70% в одной позиции SDK — пул не годится, "
         "плана нет"
     ),
+    # T22: the free token sources.
+    "RUGCHECK_DANGER": (
+        "RugCheck отмечает у токена риск уровня danger: кит среди холдеров, mint authority "
+        "или незалоченный LP"
+    ),
 }
 
 # D03 / D07 / G18 / D09: the operator-facing line for each non-blocking decision flag.
@@ -106,8 +111,8 @@ FLAG_NOTICES = {
         "APPROVAL и LIVE закрыты"
     ),
     "VOLUME_PARTICIPANTS_UNAVAILABLE": (
-        "нет числа сделок и участников: органичность объёма — по повторам всплесков и "
-        "total fees к капе"
+        "нет числа сделок и участников (ни у пула, ни свежего ответа Jupiter): органичность "
+        "объёма — по повторам всплесков и total fees к капе"
     ),
     "DEVELOPER_HOLDS_TOKENS": (
         "у девелопера есть доля токена — проверь вручную (в LIVE вход закрыт)"
@@ -117,12 +122,16 @@ FLAG_NOTICES = {
     "VOLUME_SPIKE": "всплеск объёма в окне 5m — плюс к баллу",
     "TOKEN_VOLUME_POOL_ONLY": (
         "объём токена — сумма его DLMM-пулов Meteora, а не объём токена GMGN, как в Trending "
-        "(нет ключа GMGN или свежего ответа): сверь объём в GMGN"
+        "(нет свежего ответа ни GMGN, ни Jupiter): сверь объём в GMGN"
     ),
     "SNIPERS_HIGH": "много снайперов по GMGN — автор советует подождать",
     "TOKEN_REVIVED": "токену 60+ дней: монета ожила, объёмы обычно быстро пропадают",
     "THEME_UNKNOWN": (
         "у токена нет ни имени, ни тикера: тема не проверена — APPROVAL и LIVE закрыты"
+    ),
+    # T22.
+    "RUGCHECK_UNAVAILABLE": (
+        "RugCheck не дал свежий отчёт — проверь токен на rugcheck.xyz вручную"
     ),
 }
 
@@ -424,18 +433,27 @@ _EVIDENCE_VALUES: dict[str, dict[str, str]] = {
     },
     "token_volume_source": {
         "GMGN": "объём токена GMGN, как в Trending",
-        "DLMM_POOLS": "сумма DLMM-пулов токена на Meteora (без GMGN)",
+        "JUPITER": "объём токена по Jupiter — все площадки, которые маршрутизирует Jupiter",
+        "DLMM_POOLS": "сумма DLMM-пулов токена на Meteora (без GMGN и Jupiter)",
         "PENDING": "GMGN спрашивается только после дешёвых фильтров — пока сумма пулов",
     },
     "token_volume_rank_source": {
         "GMGN": "ранг по объёму токена GMGN из кэша",
+        "JUPITER": "ранг по объёму токена Jupiter",
         "DLMM_POOLS": "ранг по сумме DLMM-пулов токена",
         "PENDING": "ранг по сумме DLMM-пулов токена",
     },
     "market_cap_source": {
         "GMGN": "капитализация из GMGN",
+        "JUPITER": "капитализация из Jupiter (по циркулирующему предложению)",
         "DATA_API": "капитализация из Meteora Data API",
         "UNKNOWN": "капитализацию не дал ни один источник",
+    },
+    "jupiter_organic_score_label": {
+        "low": "Jupiter: органичность low — объём почти весь от ботов",
+        "medium": "Jupiter: органичность medium",
+        "high": "Jupiter: органичность high",
+        "UNAVAILABLE": "органичность Jupiter неизвестна (нет свежего ответа)",
     },
     "developer_status": {
         "HOLDING": "девелопер держит монету",
@@ -499,6 +517,29 @@ _GMGN_STATES = {
 }
 _GMGN_GENERIC = "GMGN недоступен"
 
+# ``jupiter_status`` and ``rugcheck_status`` (T22): ``FRESH``, ``NOT_READ`` or
+# ``UNAVAILABLE:<reason>``, the reasons of ``src/providers/jupiter.py`` and ``rugcheck.py``.
+_SOURCE_NAMES = {"jupiter_status": "Jupiter", "rugcheck_status": "RugCheck"}
+_SOURCE_STATES = {
+    "FRESH": "данные {name} свежие",
+    "STALE": "данные {name} устарели",
+    "NOT_READ": (
+        "{name} не спрашивался: источник выключен (пустой URL), токен вне лимита цикла "
+        "или не дошёл до глубокой проверки"
+    ),
+}
+_SOURCE_REASONS = {
+    "NOT_LISTED": "{name} не знает этот токен",
+    "RATE_LIMITED": "превышен лимит запросов {name} — пауза до сброса",
+    "CIRCUIT_OPEN": "запросы к {name} приостановлены после серии отказов",
+    "API_TIMEOUT": "{name} не ответил вовремя",
+    "API_UNAVAILABLE": "{name} недоступен",
+    "API_PAYLOAD_INVALID": "ответ {name} в незнакомом формате",
+    "HTTP_401": "{name} отклонил ключ (401) — проверь JUPITER_API_KEY",
+    "HTTP_403": "{name} отказал в доступе (403)",
+    "PROVIDER_ERROR": "сбой клиента {name} в боте",
+}
+
 # Readiness (/health/ready, gateway, approval desk) shows codes from any of these tables.
 _READINESS_TABLES = (READINESS, APPROVAL_BLOCKERS, EXECUTOR)
 
@@ -560,11 +601,26 @@ def gmgn_status_label(value: str) -> str:
     return f"{_GMGN_GENERIC} ({reason or value})"
 
 
+def source_status_label(name: str, value: str) -> str:
+    """``jupiter_status`` / ``rugcheck_status`` in Russian (T22)."""
+
+    source = _SOURCE_NAMES.get(name, name)
+    if value in _SOURCE_STATES:
+        return _SOURCE_STATES[value].format(name=source)
+    _, _, reason = value.partition(":")
+    text = _SOURCE_REASONS.get(reason)
+    if text is not None:
+        return f"{source} недоступен: {text.format(name=source)}"
+    return f"{source} недоступен ({reason or value})"
+
+
 def evidence_note(name: str, value: str, threshold: str | None) -> str | None:
     """A Russian explanation of a code in an evidence row; ``None`` for plain numbers."""
 
     if name == "gmgn_status":
         return gmgn_status_label(value)
+    if name in _SOURCE_NAMES:
+        return source_status_label(name, value)
     if name == "depth_source" and threshold:
         return DEPTH_DETAIL.get(threshold) or executor_label(threshold)
     return _EVIDENCE_VALUES.get(name, {}).get(value)

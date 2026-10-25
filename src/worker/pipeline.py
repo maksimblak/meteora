@@ -21,8 +21,14 @@ recorded) for the pools of every token, main pool first, and ``complete`` for th
 per token it keeps - in depth only for the top-ranked candidates. ``evaluate`` is both at
 once. A ``TokenSelection`` brings what the cycle knows about the token beyond the pool; with
 an enhanced source (``enhanced_signals``) the token volume waits for its reading.
+
+The free token sources (T22): the Jupiter reading the cycle prefetched for the token
+(``token_market``, no request here) joins the token from the cheap filters on, so its token
+volume, cap, organic grade and authorities can reject before any request; RugCheck
+(``token_audit``) is asked only for a candidate checked in depth.
 """
 
+import asyncio
 from collections.abc import Awaitable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -49,17 +55,25 @@ from src.domain.screening import (
     TokenSelection,
     TokenVolumeSource,
     merge_pool_token_signals,
+    merge_token_sources,
     refuse_candidate,
 )
 from src.domain.strategy import StrategyPlan, StrategyPlanner, StrategyRejection
 from src.execution.contracts import QuoteDirection, QuoteRequestV1, QuoteResultV1
-from src.market.contracts import OnChainProvider, VolumeHistorySource
+from src.market.contracts import (
+    OnChainProvider,
+    TokenAuditSource,
+    TokenMarketSource,
+    VolumeHistorySource,
+)
 from src.market.models import (
     AuthorityStatus,
     DataQuality,
     Freshness,
+    JupiterTokenReading,
     PoolSnapshot,
     RiskSignal,
+    RugCheckReading,
     TokenRiskSnapshot,
     VolumeBucket,
 )
@@ -182,9 +196,13 @@ class CandidatePipeline:
         warmup: VolumeHistorySource | None = None,
         evidence: DailyEvidence | None = None,
         enhanced_signals: bool = False,
+        token_market: TokenMarketSource | None = None,
+        token_audit: TokenAuditSource | None = None,
     ) -> None:
         """``enhanced_signals``: an enhanced source (GMGN) reads the token of every deep
-        candidate, so its token-level volume decides the volume thresholds (G24)."""
+        candidate, so its token-level volume decides the volume thresholds (G24).
+        ``token_market`` holds the Jupiter readings the cycle prefetched and ``token_audit``
+        reads RugCheck for deep candidates (T22); each is optional."""
 
         self._history = history
         self._onchain = onchain
@@ -201,6 +219,8 @@ class CandidatePipeline:
         self._warmup = warmup
         self._evidence = evidence
         self._enhanced = enhanced_signals
+        self._token_market = token_market
+        self._token_audit = token_audit
         self._log = get_logger("worker.candidates")
 
     async def evaluate(
@@ -294,7 +314,10 @@ class CandidatePipeline:
             return CandidateOutcome(pool_address, str(correlation), reasons=("NO_HISTORY",))
         market = history[-1]
         features = VolumeFeatureEngine().compute(history, policy.features, decision_at=decision_at)
-        unchecked = merge_pool_token_signals(_unchecked_token(market, decision_at), market)
+        unchecked = merge_token_sources(
+            merge_pool_token_signals(_unchecked_token(market, decision_at), market),
+            jupiter=self._market_reading(market, decision_at),
+        )
         return ScreenedPool(
             pool_address=pool_address,
             decision_at=decision_at,
@@ -342,7 +365,13 @@ class CandidatePipeline:
         depth = _snapshot_depth(market, "NOT_A_CANDIDATE")
         selection = self._unread(screened.selection)
         if candidate:
-            token = merge_pool_token_signals(await self._token_risk(market, decision_at), market)
+            risk, report = await asyncio.gather(
+                self._token_risk(market, decision_at), self._rugcheck_report(market)
+            )
+            # The very Jupiter reading the cheap filters judged, even if the cache let it go.
+            token = merge_token_sources(
+                merge_pool_token_signals(risk, market), jupiter=unchecked.jupiter, rugcheck=report
+            )
             evaluated_at = _evaluation_instant(decision_at, token)
             if evaluated_at != decision_at:
                 features = engine.compute(
@@ -665,6 +694,36 @@ class CandidatePipeline:
                 )
             ),
         )
+
+    def _market_reading(
+        self, market: PoolSnapshot, decision_at: datetime
+    ) -> JupiterTokenReading | None:
+        """The Jupiter reading the cycle prefetched for the pool's base token; one newer
+        than the decision instant is not an input of it."""
+
+        if self._token_market is None:
+            return None
+        reading = self._token_market.reading(market.pool.base_mint)
+        if reading is None or reading.source_at > decision_at:
+            return None
+        return reading
+
+    async def _rugcheck_report(self, market: PoolSnapshot) -> RugCheckReading | None:
+        source = self._token_audit
+        if source is None:
+            return None
+        mint = market.pool.base_mint
+        try:
+            return await source.report(mint)
+        except Exception as error:
+            # The source never raises by contract; a defect still only costs the report.
+            self._log.warning("token_audit_failed", **error_fields(error))
+            return RugCheckReading(
+                mint=mint,
+                source_at=self._clock.now(),
+                freshness=Freshness.STALE,
+                detail="PROVIDER_ERROR",
+            )
 
     async def _token_risk(self, market: PoolSnapshot, decision_at: datetime) -> TokenRiskSnapshot:
         try:

@@ -25,13 +25,13 @@ PowerShell 5.1, из корня репозитория. Прогнано 2026-10
 - `src/domain/screening/screener.py` (коды отказов и флаги — `models.py` рядом) — отбор; `src/domain/strategy/planner.py` — стратегия, диапазон, выходы.
 - `src/worker/pipeline.py` / `positions.py` / `execution.py` — цикл кандидата, цикл позиций, денежный путь (`execution.py` — 2,3 тыс. строк, самый рискованный).
 - `src/api/app.py` (ASGI `src.api.main:app`), `src/api/routes.py` (`/api/v1`), `src/web/routes.py` + `src/web/templates/`; русские подписи кодов — `src/api/labels.py`.
-- `src/providers/meteora.py`, `src/providers/solana.py`, `src/gmgn/openapi.py` — внешние данные.
+- `src/providers/meteora.py`, `src/providers/solana.py`, `src/gmgn/openapi.py`, `src/providers/jupiter.py`, `src/providers/rugcheck.py` — внешние данные; что решают Jupiter и RugCheck в отборе — `src/domain/screening/sources.py`.
 - `executor/src/` (`server.ts`, `engine.ts`, `sdk.ts`) и общий корпус контрактов Python ↔ executor `contracts/execution/`.
 - `migrations/versions/` (0001–0004) и `src/persistence/factory.py` — схема и единственная фабрика хранилищ для api и worker.
 
 Архитектура (процессы, поток данных, границы, соглашения) — `docs/architecture.md`.
 Словарь предметных слов — `CONTEXT.md`.
-Почему так решено — `docs/adr/` (0001–0013).
+Почему так решено — `docs/adr/` (0001–0014).
 Эксплуатация — `docs/runbook.md`; все переменные и пороги — `docs/configuration.md`; контракты executor и devnet — `executor/README.md`.
 
 ## Подводные камни
@@ -67,6 +67,7 @@ PowerShell 5.1, из корня репозитория. Прогнано 2026-10
 - `EXECUTOR_INTERNAL_TOKEN` (+ `EXECUTOR_QUOTES_URL`) — доступ worker к `executor-quotes`; без него `DEPTH_UNAVAILABLE`.
 - `METEORA_DATA_API_BASE_URL`, `METEORA_UNIVERSE_FILTER` — источник universe; пусто = пулы с объёмом за 24 ч, `all` = полный sweep.
 - `GMGN_API_KEY` (+ `GMGN_API_URL`, `GMGN_API_PLAN`, `GMGN_API_CACHE_SECONDS`, `GMGN_TIMEOUT_SECONDS`, `GMGN_STALE_AFTER_SECONDS`) — метрики GMGN, только worker; `GMGN_URL` — сервис `gmgn` или посредник (+ `GMGN_BRIDGE_TOKEN`/`_FILE`; у посредника ещё `GMGN_BRIDGE_HOST`, `GMGN_BRIDGE_PORT`, `GMGN_BRIDGE_PROFILE_DIR`, `GMGN_BRIDGE_REQUESTS_PER_MINUTE`); `GMGN_REQUIRED_FOR_LIVE=false` открывает LIVE без GMGN; `GMGN_PAGE_TIMEOUT_SECONDS`, `GMGN_CACHE_TTL_SECONDS`, `GMGN_MAX_PAGES`, `GMGN_BREAKER_COOLDOWN_SECONDS` — сам сервис `gmgn`.
+- `JUPITER_API_URL`, `RUGCHECK_API_URL` — бесплатные источники токена (ADR 0014), compose включает оба по умолчанию, пустое значение в `.env` выключает; `JUPITER_API_KEY`/`_FILE` (необязательный бесплатный ключ, вдвое больше лимит), `JUPITER_CACHE_SECONDS`, `JUPITER_MAX_TOKENS`, `RUGCHECK_CACHE_SECONDS` — только worker. Без compose (тесты, `build_runtime`) оба выключены.
 - `RULESET_VERSION`, `RULESET_OVERRIDES_FILE`, `WORKER_UNIVERSE_INTERVAL_SECONDS`, `PRIORITY_FEE_MAX_LAMPORTS` — политика; compose даёт их и worker, и api — в override задавать обоим одинаково.
 - `TRADING_MODE`, `EXECUTOR_URL`, `EXECUTOR_MODE_TOKEN`, `EXECUTOR_APPROVAL_SECRET`, `EXECUTOR_TIMEOUT_SECONDS`, `WALLET_PUBLIC_KEY`, `WALLET_KEYPAIR_FILE`, `EXECUTOR_STATE_FILE`, `LIVE_PROMOTION_FILE` — только APPROVAL/LIVE (шлюз и executor профиля `live`).
 - `SWAP_*` — продажа монеты после выхода (worker); `PRIORITY_FEE_PERCENTILE`, `PRIORITY_FEE_MIN_MICRO_LAMPORTS` — цена compute unit (executor).
