@@ -70,8 +70,10 @@ code {
   color: var(--muted);
   padding: 1px 5px;
   border-radius: 5px;
-  word-break: break-all;
+  /* Break a code only when it cannot fit (a 44-char address), never a fitting name. */
+  overflow-wrap: anywhere;
 }
+td code { overflow-wrap: normal; white-space: nowrap; }
 pre { overflow-x: auto; background: var(--panel-2); border: 1px solid var(--line); padding: 10px 12px; border-radius: 10px; font: 12px/1.5 var(--mono); }
 h1 { font-size: 1.5rem; font-weight: 650; letter-spacing: -.01em; margin: 0; }
 h1 code { font-size: .8em; }
@@ -119,7 +121,10 @@ footer { width: 100%; max-width: 1320px; margin: 0 auto; padding: 0 28px 28px; f
 .page-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 8px 16px; margin-bottom: 18px; }
 .page-head .sub { color: var(--muted); font-size: 13px; margin: 4px 0 0; }
 .page-head .sub code { font-size: 11.5px; }
-.page-head > .pill { white-space: normal; max-width: 100%; }
+.page-head > div { min-width: 0; }
+/* A long label wraps as one text, not as separate flex columns. */
+.page-head > .pill { display: inline-block; white-space: normal; max-width: 100%; }
+.page-head > .pill::before { display: inline-block; margin-right: 6px; vertical-align: 2px; }
 
 /* --- pills & live status ----------------------------------------------------------- */
 .pill {
@@ -326,8 +331,8 @@ button:disabled { opacity: .45; cursor: not-allowed; filter: none; transform: no
     padding: 12px 16px 0; border-right: 0; border-bottom: 1px solid var(--line);
   }
   .brand { padding: 0; }
-  .nav { flex-direction: row; order: 3; width: calc(100% + 32px); margin: 0 -16px; padding: 0 12px 10px; overflow-x: auto; scrollbar-width: none; gap: 4px; }
-  .nav::-webkit-scrollbar { display: none; }
+  /* All sections stay in view (wrapping), never behind a hidden horizontal scroll. */
+  .nav { flex-direction: row; flex-wrap: wrap; order: 3; width: 100%; padding: 0 0 10px; gap: 4px; }
   .nav a { padding: 7px 11px; font-size: 13.5px; gap: 7px; }
   .nav a.active { box-shadow: inset 0 -2px 0 var(--accent); }
   .nav a svg.icon { width: 16px; height: 16px; }
@@ -347,6 +352,10 @@ button:disabled { opacity: .45; cursor: not-allowed; filter: none; transform: no
   h1 { font-size: 1.3rem; }
   th, td { padding: 9px 11px; }
   form:not(.filters):not(.inline) button { align-self: stretch; }
+}
+@media (max-width: 480px) {
+  .nav a { padding: 6px 9px; font-size: 13px; }
+  .nav a svg.icon { display: none; }
 }
 @media (max-width: 380px) {
   .tiles { grid-template-columns: minmax(0, 1fr); }

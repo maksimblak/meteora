@@ -167,6 +167,5 @@
     countdown();
     copyButtons();
     themeToggle();
-    liveOverview();
   });
 })();
