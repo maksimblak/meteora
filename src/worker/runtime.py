@@ -939,10 +939,10 @@ def build_runtime(
     onchain: OnChainProvider = UnavailableOnChainProvider(clock)
     pool_states: PoolStateReader | None = None
     if config.solana_rpc_url:
-        from src.providers.resilience import ResilientHttpClient
+        from src.providers.resilience import ResilientHttpClient, json_rpc_http_client
         from src.providers.solana import SolanaRpcProvider
 
-        client = httpx.AsyncClient(base_url=config.solana_rpc_url, transport=rpc_transport)
+        client = json_rpc_http_client(config.solana_rpc_url, transport=rpc_transport)
         clients.append(client)
         rpc = SolanaRpcProvider(ResilientHttpClient(client), clock=clock)
         pool_states = rpc

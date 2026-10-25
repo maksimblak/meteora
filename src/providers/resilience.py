@@ -128,6 +128,22 @@ class IntervalRateLimiter:
             self._next_allowed = max(now, self._next_allowed) + self._interval
 
 
+def json_rpc_http_client(
+    url: str, *, transport: httpx.AsyncBaseTransport | None = None
+) -> httpx.AsyncClient:
+    """An HTTP client for a JSON-RPC endpoint that may carry its key in the query string.
+
+    httpx appends ``/`` to the raw path of a base URL, query included, so
+    ``https://mainnet.helius-rpc.com/?api-key=K`` would be sent as ``?api-key=K/`` and
+    rejected with 401; the query therefore rides as the client's default ``params``.
+    """
+
+    parsed = httpx.URL(url)
+    return httpx.AsyncClient(
+        base_url=parsed.copy_with(query=None), params=parsed.params, transport=transport
+    )
+
+
 class ResilientHttpClient:
     """A JSON HTTP client with identical resilience behavior for all adapters."""
 

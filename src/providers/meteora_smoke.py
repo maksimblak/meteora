@@ -26,7 +26,11 @@ from src.market.models import PoolPage, PoolRef, PoolSnapshot, ProviderHealth
 from src.market.universe import InMemoryUniverseStore, UniverseSync
 from src.providers.contracts import JsonClient, PoolStateReader
 from src.providers.meteora import DATA_API_URL, MAX_PAGE_SIZE, MeteoraDataApiProvider
-from src.providers.resilience import IntervalRateLimiter, ResilientHttpClient
+from src.providers.resilience import (
+    IntervalRateLimiter,
+    ResilientHttpClient,
+    json_rpc_http_client,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +204,7 @@ async def _main(arguments: argparse.Namespace) -> int:
         if arguments.rpc and rpc_url:
             from src.providers.solana import SolanaRpcProvider
 
-            rpc_client = httpx.AsyncClient(base_url=rpc_url)
+            rpc_client = json_rpc_http_client(rpc_url)
             pool_states = SolanaRpcProvider(
                 ResilientHttpClient(rpc_client, timeout=arguments.timeout)
             )

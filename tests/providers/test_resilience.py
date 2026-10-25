@@ -9,6 +9,7 @@ from src.providers.resilience import (
     ProviderState,
     ResilientHttpClient,
     RetryPolicy,
+    json_rpc_http_client,
 )
 
 
@@ -165,5 +166,32 @@ def test_rpc_post_uses_the_same_bounded_retry_contract() -> None:
         assert attempts == 2
         assert delays == [0.1]
         assert client.health.state is ProviderState.HEALTHY
+
+    asyncio.run(exercise())
+
+
+def test_rpc_url_with_a_query_key_reaches_the_provider_unchanged() -> None:
+    async def exercise() -> None:
+        urls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            urls.append(str(request.url))
+            return httpx.Response(200, json={"result": "ok"})
+
+        transport = httpx.MockTransport(handler)
+        async with (
+            json_rpc_http_client(
+                "https://mainnet.helius-rpc.invalid/?api-key=K-1", transport=transport
+            ) as keyed,
+            json_rpc_http_client("https://rpc.invalid", transport=transport) as plain,
+        ):
+            await ResilientHttpClient(keyed).post_json({"method": "getHealth"})
+            await ResilientHttpClient(plain).post_json({"method": "getHealth"})
+
+        # httpx alone would send ``?api-key=K-1/`` and the provider would answer 401.
+        assert urls == [
+            "https://mainnet.helius-rpc.invalid/?api-key=K-1",
+            "https://rpc.invalid/",
+        ]
 
     asyncio.run(exercise())
