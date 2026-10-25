@@ -216,7 +216,7 @@ thresholds:                     # только поля GuidePolicySettings; н�
 | `minimum_tvl` / `minimum_depth` / `maximum_price_impact` | 10 000 / 5 000 / 0.01 | ликвидность и глубина; глубина — из котировки `executor-quotes` (D07), без неё `DEPTH_UNAVAILABLE` |
 | `minimum_pool_age` | 30 мин | только прогрев истории пула |
 | `minimum_short_ratio` / `minimum_long_ratio` / `minimum_robust_z_score` | 3 / 1.5 / 4 | всплеск объёма (§6.2): в `guide-v1` больше не фильтр, а флаг `VOLUME_SPIKE` и компонент балла |
-| `minimum_fee_tvl` / `minimum_score` | 0.002 / 0.5 | комиссии пула к TVL (`FEE_TVL_BELOW_THRESHOLD`) и итоговый балл (`SCORE_BELOW_THRESHOLD`) |
+| `minimum_score` | 0.5 | итоговый балл (`SCORE_BELOW_THRESHOLD`). Порога комиссий пула к TVL в `guide-v1` нет с 2026-10-25 (ADR 0016: у автора его нет) — fee/TVL только строка решения и компонент балла; `minimum_fee_tvl` в файле правил больше не принимается. Старые решения с `FEE_TVL_BELOW_THRESHOLD` остаются в журнале |
 | `baseline_points` / `minimum_baseline_points` | 12 / 6 | сколько окон истории нужно для базы; новый кандидат прогревается из `volume/history` |
 | `bid_ask_minimum_depth` / `bid_ask_target_depth` / `bid_ask_maximum_depth` | 0.70 / 0.75 / 0.80 | Bid-Ask от цены вниз (G15), только quote-токен; если 70 бинов пула не дают минимума — `RANGE_TOO_NARROW`, плана нет |
 | `maximum_position_bins` | 70 | ширина позиции в бинах — одна транзакция OPEN официального SDK (D10). Bid-Ask на 70% проходит только при bin step ≳ 176; шире 70 бинов SDK строит позицию цепочкой транзакций, восстановления после её обрыва в executor нет, поэтому поднимать значение **нельзя** |

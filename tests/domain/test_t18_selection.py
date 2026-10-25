@@ -31,6 +31,7 @@ from src.market.models import (
     RiskSignal,
     TokenRiskSnapshot,
 )
+from src.worker.policy import GuidePolicySettings, guide_policy
 from tests.domain.guide_fixtures import (
     CONFIG,
     NOW,
@@ -166,15 +167,29 @@ def test_a_spike_is_a_flag_and_a_score_bonus_never_a_requirement() -> None:
     assert spiked.score - steady.score == GuideScreeningRules().weights.volume_spike
 
 
-def test_the_fee_tvl_minimum_still_rejects_with_its_own_code() -> None:
-    # 30m LP fees 300 000 / 100 = 3 000 on 2 000 000 of TVL: 0.15% < 0.2%.
+def test_a_low_fee_tvl_is_no_reason_the_author_has_no_such_minimum() -> None:
+    # 30m LP fees 300 000 / 100 = 3 000 on 2 000 000 of TVL: 0.15%, below the 0.2% the bot
+    # demanded until 2026-10-25. The guide selects by volume; fee/TVL stays information.
     decision = screen(
         steady_history(short="1200000", long="300000", hour="1800000", tvl="2000000"),
         mode=TradingMode.SHADOW,
     )
 
-    assert RejectionCode.FEE_TVL_BELOW_THRESHOLD in decision.reasons
+    assert RejectionCode.FEE_TVL_BELOW_THRESHOLD not in decision.reasons
     assert RejectionCode.VOLUME_SIGNAL_BELOW_THRESHOLD not in decision.reasons
+    assert evidence(decision)["fee_tvl"] == ("0.0015", None)
+
+
+def test_guide_v1_carries_no_fee_tvl_minimum() -> None:
+    assert guide_policy().screening.minimum_fee_tvl is None
+    with pytest.raises(ValueError, match="minimum_fee_tvl"):
+        GuidePolicySettings.model_validate({"minimum_fee_tvl": "0.002"})
+
+
+def test_the_legacy_ruleset_still_needs_its_fee_tvl_minimum() -> None:
+    legacy = {**GUIDE.model_dump(), "guide": None, "minimum_fee_tvl": None}
+    with pytest.raises(ValueError, match="minimum_fee_tvl"):
+        ScreeningPolicy.model_validate(legacy)
 
 
 # --- metrics by token (criterion 3) -----------------------------------------------------

@@ -1157,12 +1157,9 @@ class PoolScreener:
             reasons.append(RejectionCode.VOLUME_INTEGRITY_UNKNOWN)
         if features.readiness is not SignalReadiness.READY:
             return reasons
-        if policy.guide is not None:
-            # guide-v1 (G24): the spike is a score bonus and a flag, not a filter; the fee
-            # opportunity of the pool keeps its minimum under its own code.
-            if features.fee_tvl is None or features.fee_tvl < policy.minimum_fee_tvl:
-                reasons.append(RejectionCode.FEE_TVL_BELOW_THRESHOLD)
-        elif (
+        # guide-v1 (G24): the spike is a score bonus and a flag, and the pool's fee/TVL only
+        # information and a score component - the author has no such minimum (ADR 0016).
+        if policy.guide is None and (
             features.short_ratio is None
             or features.long_ratio is None
             or features.robust_z_score is None
@@ -1170,7 +1167,7 @@ class PoolScreener:
             or features.short_ratio < policy.minimum_short_ratio
             or features.long_ratio < policy.minimum_long_ratio
             or features.robust_z_score < policy.minimum_robust_z_score
-            or features.fee_tvl < policy.minimum_fee_tvl
+            or (policy.minimum_fee_tvl is not None and features.fee_tvl < policy.minimum_fee_tvl)
         ):
             reasons.append(RejectionCode.VOLUME_SIGNAL_BELOW_THRESHOLD)
         return reasons
@@ -1399,7 +1396,12 @@ def _evidence(
             threshold=str(policy.minimum_robust_z_score),
         ),
         EvidenceItem(
-            name="fee_tvl", value=str(features.fee_tvl), threshold=str(policy.minimum_fee_tvl)
+            name="fee_tvl",
+            value=str(features.fee_tvl),
+            # A threshold only where one applies (the legacy spike); guide-v1 has none.
+            threshold=None
+            if policy.guide is not None or policy.minimum_fee_tvl is None
+            else str(policy.minimum_fee_tvl),
         ),
         EvidenceItem(
             name="price_impact", value=str(price_impact), threshold=str(policy.maximum_price_impact)

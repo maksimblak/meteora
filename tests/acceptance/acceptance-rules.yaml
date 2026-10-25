@@ -23,6 +23,5 @@ thresholds:
   minimum_short_ratio: "0"
   minimum_long_ratio: "0"
   minimum_robust_z_score: "0"
-  minimum_fee_tvl: "0"
   minimum_score: "0"
   bid_ask_minimum_depth: "0.10"

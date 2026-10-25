@@ -55,7 +55,6 @@ RELAXED = GuidePolicySettings(
     minimum_short_ratio=Decimal("0"),
     minimum_long_ratio=Decimal("0"),
     minimum_robust_z_score=Decimal("0"),
-    minimum_fee_tvl=Decimal("0"),
     minimum_score=Decimal("0"),
     # T19: live pools of every bin step and price path may open a Bid-Ask here.
     bid_ask_minimum_depth=Decimal("0.0001"),

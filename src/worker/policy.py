@@ -260,7 +260,8 @@ class GuidePolicySettings(BaseModel):
     overvolume), volume to liquidity and total fees; the author's selection (spec 6.8,
     G24): the hour's average volume per minute, total fees against the cap, the theme
     words, snipers, revivals and the deep-check limit. ``minimum_fee_efficiency`` now only
-    feeds the Spot-on-ATH organicity of the strategy; screening no longer uses it. Pool age only
+    feeds the Spot-on-ATH organicity of the strategy; screening no longer uses it. There is no
+    fee/TVL minimum (removed 2026-10-25, ADR 0016: not the author's). Pool age only
     guards history warm-up here: the guide trades tokens a few hours old, and token age
     has its own threshold. Price shock is widened to the deepest Bid-Ask range so the
     default strategy is invalidated by its range, not by the first 10% dip.
@@ -276,7 +277,6 @@ class GuidePolicySettings(BaseModel):
     minimum_short_ratio: Decimal = Decimal("3")
     minimum_long_ratio: Decimal = Decimal("1.5")
     minimum_robust_z_score: Decimal = Decimal("4")
-    minimum_fee_tvl: Decimal = Decimal("0.002")
     minimum_score: Decimal = Decimal("0.5")
     minimum_market_cap: Decimal = Decimal("500000")
     preferred_market_cap: Decimal = Decimal("1000000")
@@ -438,7 +438,6 @@ def guide_policy(
             minimum_short_ratio=values.minimum_short_ratio,
             minimum_long_ratio=values.minimum_long_ratio,
             minimum_robust_z_score=values.minimum_robust_z_score,
-            minimum_fee_tvl=values.minimum_fee_tvl,
             minimum_score=values.minimum_score,
             guide=GuideScreeningRules(
                 minimum_market_cap=values.minimum_market_cap,

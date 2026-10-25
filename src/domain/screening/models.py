@@ -78,7 +78,8 @@ class RejectionCode(StrEnum):
     # Selection as the author does it (G24, T18).
     # The token's average volume per minute over the last hour is below the guide minimum.
     HOURLY_VOLUME_PER_MINUTE_BELOW_THRESHOLD = "HOURLY_VOLUME_PER_MINUTE_BELOW_THRESHOLD"
-    # guide-v1 fee opportunity (30m LP fees / TVL); the spike is a score bonus, not a filter.
+    # guide-v1 fee opportunity (30m LP fees / TVL) until 2026-10-25 (ADR 0016): no longer
+    # given, kept for the decisions recorded with it.
     FEE_TVL_BELOW_THRESHOLD = "FEE_TVL_BELOW_THRESHOLD"
     # The token's name or ticker names an excluded theme (Elon, Trump, politics, streams).
     THEME_EXCLUDED = "THEME_EXCLUDED"
@@ -629,8 +630,10 @@ class ScreeningPolicy(BaseModel):
     minimum_short_ratio: Decimal
     minimum_long_ratio: Decimal
     minimum_robust_z_score: Decimal
-    minimum_fee_tvl: Decimal
     minimum_score: Decimal
+    # The legacy spike's fee floor (30m LP fees / TVL). guide-v1 has none since 2026-10-25:
+    # the author selects by volume (ADR 0016); its older records still carry 0.002.
+    minimum_fee_tvl: Decimal | None = None
     target_short_ratio: Decimal = Decimal("4")
     target_long_ratio: Decimal = Decimal("2")
     target_robust_z_score: Decimal = Decimal("6")
@@ -676,6 +679,8 @@ class ScreeningPolicy(BaseModel):
     def validate_policy(self) -> "ScreeningPolicy":
         if not Decimal(0) <= self.maximum_burst_spread < Decimal(1) or self.minimum_fee_support < 0:
             raise ValueError("artificial-volume thresholds are out of range")
+        if self.guide is None and self.minimum_fee_tvl is None:
+            raise ValueError("the legacy ruleset needs its minimum_fee_tvl")
         non_negative = (
             self.minimum_tvl,
             self.minimum_depth,
@@ -683,12 +688,13 @@ class ScreeningPolicy(BaseModel):
             self.minimum_short_ratio,
             self.minimum_long_ratio,
             self.minimum_robust_z_score,
-            self.minimum_fee_tvl,
             self.minimum_score,
             self.assumed_cost_rate,
             self.maximum_turnover,
         )
-        if any(value < 0 for value in non_negative):
+        if any(value < 0 for value in non_negative) or (
+            self.minimum_fee_tvl is not None and self.minimum_fee_tvl < 0
+        ):
             raise ValueError("screening thresholds cannot be negative")
         if not Decimal(0) <= self.maximum_holder_concentration <= Decimal(1):
             raise ValueError("maximum_holder_concentration must be in [0, 1]")
