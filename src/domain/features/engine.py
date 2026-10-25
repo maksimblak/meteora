@@ -333,7 +333,11 @@ def _guide_features(
     ):
         fee_efficiency = paid / (organic.volume * latest.base_fee_rate)
     window_start = decision_at - rules.local_high_lookback
-    local_high = max(item.price for item in ordered if item.observed_at >= window_start)
+    # No snapshot in the lookback (a restart on yesterday's universe): no local high, and the
+    # decision is stale anyway.
+    local_high = max(
+        (item.price for item in ordered if item.observed_at >= window_start), default=None
+    )
     prior = ordered[:-1]
     # An ATH is proven only by a history observed from pool creation without holes: a
     # peak inside an unobserved gap would make any later "breakout" a lower high.

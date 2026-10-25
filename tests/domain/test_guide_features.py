@@ -8,6 +8,7 @@ from tests.domain.guide_fixtures import (
     CONFIG,
     NOW,
     RULESET,
+    guide_feature_rules,
     guide_features,
     guide_history,
     guide_snapshot,
@@ -107,3 +108,16 @@ def test_legacy_rules_leave_guide_features_empty_and_quality_unchanged() -> None
     assert legacy.local_high_price is None
     assert legacy.missing_signals == guided.missing_signals == ()
     assert legacy.data_quality is guided.data_quality
+
+
+def test_a_history_older_than_the_lookback_has_no_local_high_and_is_stale() -> None:
+    # A restart on yesterday's universe: the newest snapshot is two hours old (it crashed the
+    # cycle with "max() iterable argument is empty" before).
+    history = guide_history()
+
+    features = VolumeFeatureEngine().compute(
+        history, guide_feature_rules(), decision_at=NOW + timedelta(hours=2)
+    )
+
+    assert features.local_high_price is None
+    assert features.freshness.value == "STALE"
