@@ -1,5 +1,6 @@
 """Russian server-rendered panel: pages, login, CSRF-protected forms, refresh safety."""
 
+import json
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -79,8 +80,25 @@ def test_first_screen_shows_services_mode_kill_switch_and_warm_up(panel: Panel) 
         'href="/decisions"',
     ):
         assert fragment in text
-    assert 'data-stream="/api/v1/stream/status"' in text
+    # One stream per page: the overview's own stream also carries the status pulse, so an
+    # overview tab holds one of the browser's six HTTP/1.1 connections per host, not two.
+    assert text.count("data-stream=") == 1
+    assert 'data-stream="/stream/overview"' in text
+    assert 'data-stream="/api/v1/stream/status"' in panel.get("/pools").text
     assert OPERATOR_TOKEN not in text
+
+
+def stream_events(text: str) -> dict[str, str]:
+    """``event: <name>`` -> its ``data:`` line, from a recorded SSE body."""
+
+    found: dict[str, str] = {}
+    name = ""
+    for line in text.splitlines():
+        if line.startswith("event: "):
+            name = line.removeprefix("event: ")
+        elif line.startswith("data: "):
+            found[name] = line.removeprefix("data: ")
+    return found
 
 
 def test_the_overview_tells_a_viewer_what_is_happening_now(panel: Panel) -> None:
@@ -92,7 +110,53 @@ def test_the_overview_tells_a_viewer_what_is_happening_now(panel: Panel) -> None
     assert "реальные деньги не тратятся" in text  # SHADOW in plain words
     assert "Последние решения бота" in text
     assert f'href="/decisions/{scenario.accepted.decision_id}"' in text
-    assert "data-autorefresh" in text
+
+
+def test_the_overview_stream_pushes_status_and_the_same_parts_without_a_reload(
+    panel: Panel,
+) -> None:
+    scenario = populated(panel.harness)
+
+    response = panel.get("/stream/overview")
+    events = stream_events(response.text)
+    parts = json.loads(events["overview"])
+    page = panel.get("/").text
+
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert '"universe_state":"FRESH"' in events["status"]
+    assert set(parts) == {"now", "feed"}
+    assert "реальные деньги не тратятся" in parts["now"]
+    assert f'href="/decisions/{scenario.accepted.decision_id}"' in parts["feed"]
+    # The stream renders with the page's own macros: what it pushes is what the page shows.
+    assert parts["feed"] in page
+
+
+def test_the_feed_shows_how_long_ago_not_a_bare_clock_time(panel: Panel) -> None:
+    populated(panel.harness)
+
+    feed = json.loads(stream_events(panel.get("/stream/overview").text)["overview"])["feed"]
+
+    # Decided at NOW and read at NOW: a viewer sees "0 с назад" and the full time on hover.
+    assert "0 с назад" in feed
+    assert f'title="{NOW:%Y-%m-%d %H:%M:%S} UTC"' in feed
+
+
+def test_before_the_first_sync_the_overview_says_the_bot_is_starting(panel: Panel) -> None:
+    now = json.loads(stream_events(panel.get("/stream/overview").text)["overview"])["now"]
+
+    assert "Запуск" in now
+    assert "реальные деньги не тратятся" not in now  # it is not watching the market yet
+
+
+def test_with_the_kill_switch_on_the_overview_says_the_bot_is_stopped(panel: Panel) -> None:
+    populated(panel.harness)
+    csrf = panel.login()
+    panel.post("/kill-switch/activate", data={"reason": "стоп", "csrf_token": csrf})
+
+    now = json.loads(stream_events(panel.get("/stream/overview").text)["overview"])["now"]
+
+    assert "Остановлен" in now
+    assert "реальные деньги не тратятся" not in now
 
 
 def test_every_screen_renders_in_russian_with_data(panel: Panel) -> None:
@@ -168,6 +232,9 @@ def test_approval_page_shows_checklist_flags_irreversibility_and_survives_refres
         "Подтверждение будет действовать до",
     ):
         assert fragment in page
+    # Before an irreversible on-chain operation the addresses are shown whole: a 4…4
+    # abbreviation is exactly what a look-alike (address-poisoning) address imitates.
+    assert f"<code>{POOL.address.root}</code>" in page
     assert 'name="organic_chart" required' in page
     assert 'name="theme_not_excluded" required' in page
     form = {

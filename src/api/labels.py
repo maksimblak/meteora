@@ -35,6 +35,23 @@ KILL_SWITCH_PLAIN = (
     "Включена аварийная остановка: новых сделок нет, открытые позиции ведутся по выбранной "
     "политике.",
 )
+# When the bot is not actually watching the market, saying the mode would mislead: these
+# take the lead over MODE_PLAIN (the kill switch still comes first).
+WORKER_DOWN_PLAIN = (
+    "Worker не отвечает",
+    "Бот сейчас не работает: worker не отвечает на проверку здоровья. Цифры ниже — на момент "
+    "последнего снимка.",
+)
+UNIVERSE_PLAIN = {
+    "NOT_SYNCED": (
+        "Запуск",
+        "Бот запускается: первая загрузка пулов Meteora ещё не завершена.",
+    ),
+    "STALE": (
+        "Нет свежих данных",
+        "Бот давно не присылал новый снимок рынка — цифры ниже устарели; см. «Сервисы».",
+    ),
+}
 
 CANDIDATE_STATUS = {
     "ACCEPT": "принят",

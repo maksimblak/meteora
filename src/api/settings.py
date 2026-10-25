@@ -30,8 +30,11 @@ class OperatorSettings:
     worker_health_url: str | None = None
     probe_timeout: timedelta = timedelta(seconds=2)
     stream_interval: timedelta = timedelta(seconds=5)
-    # A status stream is recycled after this many events (the browser reconnects), so
-    # no connection lives forever; ``None`` keeps it open until the client leaves.
+    # The overview's "what is happening now" re-reads the full status (~0.4 s), and its
+    # numbers move once per worker cycle: it goes on every 3rd tick (15 s), not every one.
+    overview_every_ticks: int = 3
+    # A stream is recycled after this many ticks (the browser reconnects), so no
+    # connection lives forever; ``None`` keeps it open until the client leaves.
     stream_max_events: int | None = 120
     maximum_sync_age: timedelta = timedelta(minutes=15)
 
@@ -44,6 +47,8 @@ class OperatorSettings:
             raise ValueError("session TTL must be positive")
         if self.stream_max_events is not None and self.stream_max_events < 1:
             raise ValueError("stream_max_events must be positive")
+        if self.overview_every_ticks < 1:
+            raise ValueError("overview_every_ticks must be positive")
 
     @classmethod
     def from_environment(cls, config: AppConfig, environ: Mapping[str, str]) -> "OperatorSettings":

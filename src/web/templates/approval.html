@@ -6,7 +6,7 @@
 <div class="page-head">
   <div>
     <h1>Команда {{ p.operation }} · {{ p.phase_label }}</h1>
-    <p class="sub">Пул {{ addr(p.pool_address, '/pools/' ~ p.pool_address) }} · кошелёк {{ addr(p.wallet_address) }}{% if p.position_address %} · позиция {{ addr(p.position_address) }}{% endif %}{% if p.decision_id %} · <a href="/decisions/{{ p.decision_id }}">решение</a>{% endif %}</p>
+    {% if p.decision_id %}<p class="sub"><a href="/decisions/{{ p.decision_id }}">Решение, из которого родилась команда →</a></p>{% endif %}
   </div>
   <span class="pill {% if p.seconds_left > 0 %}warn{% else %}bad{% endif %}">Осталось <strong data-countdown="{{ p.seconds_left }}">{{ p.seconds_left }}</strong> с</span>
 </div>
@@ -66,6 +66,12 @@
 
 <section class="card">
   <h2>План и команда</h2>
+  {# Whole addresses: the operator compares them before an irreversible operation. #}
+  <dl class="kv" style="margin-bottom: 12px">
+    <dt>Пул</dt><dd>{{ addr(p.pool_address, '/pools/' ~ p.pool_address, full=True) }}</dd>
+    <dt>Кошелёк</dt><dd>{{ addr(p.wallet_address, full=True) }}</dd>
+    {% if p.position_address %}<dt>Позиция</dt><dd>{{ addr(p.position_address, full=True) }}</dd>{% endif %}
+  </dl>
   <div class="table-wrap">
   <table>
     <tr><th>Поле</th><th>План</th><th>Команда</th><th>Симуляция</th><th></th></tr>

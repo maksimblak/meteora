@@ -29,9 +29,11 @@
 <svg class="icon {{ cls }}" viewBox="0 0 24 24" aria-hidden="true">{{ ICONS[name] | safe }}</svg>
 {%- endmacro %}
 
-{# A Solana address shortened to 4…4: full value in the tooltip and on the copy button. #}
-{% macro addr(value, href=None) -%}
-{% if value %}<span class="addr">{% if href %}<a href="{{ href }}" title="{{ value }}"><code>{{ value | short }}</code></a>{% else %}<code title="{{ value }}">{{ value | short }}</code>{% endif %}<button type="button" class="copy" data-copy="{{ value }}" title="Скопировать {{ value }}" aria-label="Скопировать адрес">{{ icon('copy') }}</button></span>{% else %}—{% endif %}
+{# A Solana address shortened to 4…4 (full value in the tooltip and on the copy button);
+   ``full=True`` where the operator verifies it, e.g. before an irreversible operation. #}
+{% macro addr(value, href=None, full=False) -%}
+{% set shown = value if full else value | short %}
+{% if value %}<span class="addr{% if full %} full{% endif %}">{% if href %}<a href="{{ href }}" title="{{ value }}"><code>{{ shown }}</code></a>{% else %}<code title="{{ value }}">{{ shown }}</code>{% endif %}<button type="button" class="copy" data-copy="{{ value }}" title="Скопировать {{ value }}" aria-label="Скопировать адрес">{{ icon('copy') }}</button></span>{% else %}—{% endif %}
 {%- endmacro %}
 
 {% macro pill(text, code=None) -%}

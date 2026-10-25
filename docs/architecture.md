@@ -34,7 +34,7 @@
 | `persistence` | SQLAlchemy-модели, Postgres-адаптеры, outbox, аудит, leases, retention | `open_repositories()` в `factory.py` — единственная фабрика для api и worker; протоколы — `contracts.py` |
 | `recovery` | разбор того, что оставил прерванный worker | `RecoveryService.reconcile` |
 | `worker` | сборка процесса (`runtime.py`), расписание (`scheduler.py`), циклы кандидатов (`pipeline.py`) и позиций (`positions.py`), денежный путь (`execution.py`), правила (`policy.py`), дневные evidence (`evidence.py`) | `build_runtime`, `load_pipeline_policy`, `build_gateway` |
-| `api`, `web` | HTTP-контракты, auth (Bearer / cookie `mvb_session` + `X-CSRF-Token`), approvals, русские подписи (`labels.py`), presenters, SSE `/api/v1/stream/status`; шаблоны `src/web/templates`, статика `src/web/static` | `create_operator_app` |
+| `api`, `web` | HTTP-контракты, auth (Bearer / cookie `mvb_session` + `X-CSRF-Token`), approvals, русские подписи (`labels.py`), presenters, SSE `/api/v1/stream/status` и веб-поток обзора `/stream/overview` (HTML из `_overview.html`); шаблоны `src/web/templates`, статика `src/web/static` | `create_operator_app` |
 | `observability`, `core` | health/readiness, метрики, алерты, переживающие сбой БД, HTTP-сервер worker; конфиг, реестр секретов, логи с вырезанием секретов, часы | `HealthMonitor`, `AppConfig.load`, `SECRETS` |
 
 Правила зависимостей (держатся кодом и тестами):

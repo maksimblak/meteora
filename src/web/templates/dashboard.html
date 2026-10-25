@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% from "_alerts.html" import alert_list %}
 {% from "_ui.html" import icon, pill %}
+{% from "_overview.html" import now_block, decision_feed %}
 {% block title %}Обзор{% endblock %}
 {% block content %}
 {% set risk = status.risk %}
@@ -13,51 +14,12 @@
   <a class="card-link" href="/mode">Режим и kill switch →</a>
 </div>
 
-{% set counts = universe.decision_counts %}
-{% set accepted = counts.get('ACCEPT', 0) %}
-{% set mode = status.mode.mode.value %}
-<section class="card now" data-autorefresh="60">
+<section class="card now">
   <div class="card-head">
     <h2>Что происходит сейчас</h2>
-    <span class="muted small" data-autorefresh-note>обновляется само раз в минуту</span>
+    <span class="pill bare" data-live-note>обновляется в реальном времени</span>
   </div>
-  {% if status.mode.kill_switch_active %}
-    {% set badge, sentence, tone = labels.KILL_SWITCH_PLAIN + ('bad',) %}
-  {% else %}
-    {% set badge, sentence = labels.MODE_PLAIN[mode] %}
-    {% set tone = mode | tone %}
-  {% endif %}
-  <p class="now-lead"><span class="pill {{ tone }}">{{ badge }}</span> {{ sentence }}</p>
-  <ol class="funnel">
-    <li>
-      <span class="step">1 · Сканирует</span>
-      <span class="count">{{ universe.pool_count | string | grp }}</span>
-      <span class="what">пулов Meteora в последнем снимке{% if universe.sync_age_seconds is not none %}, {{ universe.sync_age_seconds | ago }} назад{% endif %}</span>
-    </li>
-    <li>
-      <span class="step">2 · Отсеивает</span>
-      <span class="count">{{ counts.get('REJECT', 0) | string | grp }}</span>
-      <span class="what">не прошли строгие фильтры{% if counts.get('WARMING_UP', 0) %}; ещё {{ counts.get('WARMING_UP') | string | grp }} копят историю{% endif %}{% if counts.get('UNKNOWN', 0) %}; по {{ counts.get('UNKNOWN') | string | grp }} не хватает данных{% endif %}</span>
-    </li>
-    <li class="{% if accepted %}hit{% endif %}">
-      <span class="step">3 · Находит</span>
-      <span class="count">{{ accepted | string | grp }}</span>
-      <span class="what">{% if accepted %}подходят для входа{% else %}подходящих нет — бот ждёт, это нормально при строгих порогах{% endif %}</span>
-    </li>
-    <li class="{% if risk.open_positions %}hit{% endif %}">
-      <span class="step">4 · Держит</span>
-      <span class="count">{{ risk.open_positions }} <small>/ {{ risk.maximum_positions }}</small></span>
-      <span class="what">{% if risk.open_positions %}позиций открыто{% else %}позиций пока нет{% endif %}{% if risk.pending_entries %}, {{ risk.pending_entries }} ждут входа{% endif %}</span>
-    </li>
-  </ol>
-  {% if status.readiness or status.alerts or status.approvals_pending or risk.daily_stop_active %}
-  <div class="chips" style="margin-top: 14px">
-    {% if risk.daily_stop_active %}<span class="pill bad">дневной стоп сработал — новых входов сегодня нет</span>{% endif %}
-    {% if status.alerts %}<span class="pill bad">{{ status.alerts | length }} критич. событий</span>{% endif %}
-    {% if status.approvals_pending %}<a class="pill warn" href="/approvals">{{ status.approvals_pending }} ждут подтверждения</a>{% endif %}
-    {% if status.readiness %}<span class="pill warn">{{ status.readiness | length }} помех работе режима — ниже</span>{% endif %}
-  </div>
-  {% endif %}
+  <div data-live="now">{{ now_block(status) }}</div>
 </section>
 
 <section class="tiles">
@@ -102,20 +64,7 @@
 <section class="grid">
   <div class="card">
     <div class="card-head"><h2>Последние решения бота</h2><a class="card-link" href="/decisions">Все решения →</a></div>
-    {% if recent %}
-    <ul class="feed">
-      {% for d in recent %}
-      <li>
-        <span class="time">{{ d.decided_at.strftime('%H:%M:%S') }}</span>
-        <span class="pill {{ d.status | tone }}">{{ d.status_label }}</span>
-        <a href="/decisions/{{ d.decision_id }}" title="{{ d.pool_address }}"><code>{{ d.pool_address | short }}</code></a>
-        <span class="why" title="{{ d.reasons | map(attribute='message') | join('; ') }}">{% if d.reasons %}{{ d.reasons[0].message }}{% if d.reasons | length > 1 %} <span class="muted">и ещё {{ d.reasons | length - 1 }}</span>{% endif %}{% elif d.status == 'ACCEPT' %}прошёл все фильтры{% endif %}</span>
-      </li>
-      {% endfor %}
-    </ul>
-    {% else %}
-      <p class="muted">Решений пока нет: первые появятся после прогрева пулов (около 40 минут после старта).</p>
-    {% endif %}
+    <div data-live="feed">{{ decision_feed(recent, status.generated_at) }}</div>
   </div>
 
   <div class="card">

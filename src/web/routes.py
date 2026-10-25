@@ -6,6 +6,7 @@ page shows the state of the original request instead of repeating it (G02.2).
 """
 
 import hashlib
+import json
 import re
 from collections.abc import Callable
 from datetime import datetime
@@ -16,7 +17,7 @@ from urllib.parse import parse_qs, quote
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
@@ -27,12 +28,14 @@ from src.api.routes import CURSOR_PATTERN, OperatorServices, current_status
 from src.api.schemas import (
     AlertResolveRequest,
     ApprovalRequest,
+    DecisionSummary,
     KillSwitchActivateRequest,
     KillSwitchReleaseRequest,
     ModeTransitionRequest,
+    SystemStatus,
 )
 from src.api.security import CSRF_FIELD, SESSION_COOKIE, OperatorPrincipal
-from src.api.stream import status_pulse
+from src.api.stream import Feed, event_stream, status_feed, status_pulse
 from src.domain.screening import CandidateStatus
 
 _HERE = Path(__file__).resolve().parent
@@ -47,6 +50,11 @@ DONE_MESSAGES = {
     "kill_switch_released": "Kill switch снят",
     "alert_resolved": "Критическое событие закрыто, запись в аудите",
 }
+
+# A page holds one EventSource (``data-stream`` in base.html): the status pulse unless the
+# page has a stream of its own that carries the pulse too.
+STATUS_STREAM = "/api/v1/stream/status"
+OVERVIEW_STREAM = "/stream/overview"
 
 NAVIGATION = (
     ("/", "Обзор"),
@@ -116,6 +124,8 @@ def _ago(seconds: int | None) -> str:
 
     if seconds is None:
         return "—"
+    # A clock a little ahead of the database's is "just now", not a negative age.
+    seconds = max(seconds, 0)
     if seconds < 60:
         return f"{seconds} с"
     if seconds < 3600:
@@ -123,13 +133,17 @@ def _ago(seconds: int | None) -> str:
     return f"{seconds // 3600} ч {seconds % 3600 // 60} мин"
 
 
+# Token signals are already normalised by the domain (RiskSignal SAFE/UNSAFE, authority
+# REVOKED/PRESENT), so one code has one colour wherever it appears.
 _TONES = {
-    "good": frozenset("OK FRESH ACCEPT OPEN READY COMPLETE CLEAR".split()),
+    "good": frozenset("OK FRESH ACCEPT OPEN READY COMPLETE CLEAR SAFE REVOKED".split()),
     "warn": frozenset(
         "DEGRADED STALE WARMING_UP UNKNOWN NOT_CONFIGURED NOT_SYNCED PARTIAL INCOMPLETE"
         " NO_DECISION APPROVAL".split()
     ),
-    "bad": frozenset("DOWN REJECT MISSING UNAVAILABLE EXPIRED FAILED LIVE".split()),
+    "bad": frozenset(
+        "DOWN REJECT MISSING UNAVAILABLE EXPIRED FAILED LIVE UNSAFE PRESENT INVALID".split()
+    ),
     "info": frozenset({"SHADOW"}),
 }
 
@@ -191,6 +205,7 @@ async def render(
         "done": DONE_MESSAGES.get(request.query_params.get("done") or ""),
         "units": services.context.policy.quote_base_units_per_unit,
         "current_path": request.url.path,
+        "stream": STATUS_STREAM,
         **context,
     }
     return TEMPLATES.TemplateResponse(request, template, values, status_code=status_code)
@@ -270,10 +285,29 @@ def install_web(app: FastAPI) -> None:
 
     @router.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request) -> Response:
+        status, recent = await _overview(_services(request))
+        return await render(
+            request, "dashboard.html", status=status, recent=recent, stream=OVERVIEW_STREAM
+        )
+
+    @router.get(OVERVIEW_STREAM, response_class=StreamingResponse)
+    async def overview_stream(request: Request) -> StreamingResponse:
+        """The overview page's one stream: the status pulse and its live parts as HTML."""
+
         services = _services(request)
-        status = await current_status(services)
-        recent = await services.reads.decisions(cursor=None, limit=8, status=None, pool=None)
-        return await render(request, "dashboard.html", status=status, recent=recent.items)
+        ctx = services.context
+
+        async def payload() -> str:
+            status, recent = await _overview(services)
+            macros = vars(TEMPLATES.env.get_template("_overview.html").module)
+            parts = {
+                "now": macros["now_block"](status),
+                "feed": macros["decision_feed"](recent, status.generated_at),
+            }
+            return json.dumps({key: str(html) for key, html in parts.items()}, ensure_ascii=False)
+
+        overview = Feed("overview", payload, every=ctx.settings.overview_every_ticks)
+        return event_stream(ctx, request, [status_feed(ctx), overview])
 
     @router.get("/pools", response_class=HTMLResponse)
     async def pools(request: Request) -> Response:
@@ -498,6 +532,16 @@ def install_web(app: FastAPI) -> None:
 
     app.include_router(router)
     install_error_handlers(app, render_error)
+
+
+async def _overview(
+    services: OperatorServices,
+) -> tuple[SystemStatus, list[DecisionSummary]]:
+    """What the overview shows live: the full status and the eight latest decisions."""
+
+    status = await current_status(services)
+    recent = await services.reads.decisions(cursor=None, limit=8, status=None, pool=None)
+    return status, recent.items
 
 
 def _back_link(request: Request) -> str:

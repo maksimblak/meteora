@@ -22,12 +22,19 @@
     });
   }
 
-  function connectStatus() {
+  // The page's one stream (data-stream): over HTTP/1.1 a browser keeps six connections
+  // per host, so every live part of a page listens on this single EventSource.
+  function connectStream() {
     var bar = document.querySelector("[data-stream]");
     if (!bar || !window.EventSource) {
       return;
     }
     var source = new EventSource(bar.getAttribute("data-stream"));
+    listenStatus(source);
+    liveOverview(source);
+  }
+
+  function listenStatus(source) {
     source.addEventListener("status", function (event) {
       var pulse;
       try {
@@ -118,30 +125,48 @@
     });
   }
 
-  // Reloads a watch-only page (the overview) so viewers see fresh numbers; never while
-  // someone is typing into a form or has a section unfolded.
-  function autoRefresh() {
-    var node = document.querySelector("[data-autorefresh]");
-    if (!node) {
+  // The overview's live parts: each "overview" event carries server-rendered HTML for
+  // every [data-live="<part>"]; only changed parts are swapped, the page never reloads.
+  function liveOverview(source) {
+    if (!document.querySelector("[data-live]")) {
       return;
     }
-    var period = (parseInt(node.getAttribute("data-autorefresh"), 10) || 60) * 1000;
-    window.setInterval(function () {
-      var active = document.activeElement;
-      var editing = active && /^(INPUT|SELECT|TEXTAREA)$/.test(active.tagName);
-      if (document.hidden || editing || document.querySelector("details[open]")) {
+    var note = document.querySelector("[data-live-note]");
+    var shown = {};
+    source.addEventListener("overview", function (event) {
+      var parts;
+      try {
+        parts = JSON.parse(event.data);
+      } catch (error) {
         return;
       }
-      window.location.reload();
-    }, period);
+      Object.keys(parts).forEach(function (name) {
+        var node = document.querySelector('[data-live="' + name + '"]');
+        if (node && shown[name] !== parts[name]) {
+          node.innerHTML = parts[name];
+          shown[name] = parts[name];
+        }
+      });
+      if (note) {
+        note.className = "pill bare live";
+        // The panel shows time in UTC everywhere.
+        note.textContent = "обновлено " + new Date().toISOString().slice(11, 19) + " UTC";
+      }
+    });
+    source.addEventListener("error", function () {
+      if (note) {
+        note.className = "pill warn";
+        note.textContent = "нет связи — переподключение";
+      }
+    });
   }
 
   document.addEventListener("DOMContentLoaded", function () {
-    connectStatus();
+    connectStream();
     guardForms();
     countdown();
     copyButtons();
     themeToggle();
-    autoRefresh();
+    liveOverview();
   });
 })();

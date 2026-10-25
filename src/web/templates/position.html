@@ -18,7 +18,7 @@
   <div class="tile"><div class="label">Вложено</div><div class="value">{{ v.invested_base_units | dec(0) | grp }}</div></div>
   <div class="tile accent"><div class="label">Net P&amp;L</div><div class="value {{ v.net_pnl_base_units | sign }}">{{ v.net_pnl_base_units | dec(0) | grp }}</div></div>
   <div class="tile"><div class="label">Против HODL</div><div class="value {{ v.excess_vs_hodl_base_units | sign }}">{{ v.excess_vs_hodl_base_units | dec(0) | grp }}</div></div>
-  <div class="tile"><div class="label">Доход комиссий</div><div class="value pos">{{ v.fee_income_base_units | dec(0) | grp }}</div></div>
+  <div class="tile"><div class="label">Доход комиссий</div><div class="value {{ v.fee_income_base_units | sign }}">{{ v.fee_income_base_units | dec(0) | grp }}</div></div>
 </section>
 {% endif %}
 

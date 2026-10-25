@@ -1,7 +1,6 @@
 <!doctype html>
 {% from "_ui.html" import icon %}
 {% set NAV_ICONS = {'/': 'overview', '/pools': 'pools', '/decisions': 'decisions', '/approvals': 'approvals', '/positions': 'positions', '/performance': 'pnl', '/mode': 'mode', '/settings': 'settings'} %}
-{% set MODE_TONES = {'SHADOW': 'info', 'APPROVAL': 'warn', 'LIVE': 'bad'} %}
 <html lang="ru">
 <head>
   <meta charset="utf-8">
@@ -32,9 +31,9 @@
   <div class="content">
     <header class="topbar">
       {% if pulse %}
-      <div class="statusbar" data-stream="/api/v1/stream/status">
-        <span class="pill bare live"><span data-pulse="time">{{ pulse.generated_at | dt }}</span></span>
-        <span class="pill {{ MODE_TONES.get(pulse.mode.mode.value, '') }}">Режим <strong data-pulse="mode">{{ pulse.mode.mode.value }}</strong></span>
+      <div class="statusbar" data-stream="{{ stream }}">
+        <span class="pill live"><span data-pulse="time">{{ pulse.generated_at | dt }}</span></span>
+        <span class="pill {{ pulse.mode.mode | tone }}">Режим <strong data-pulse="mode">{{ pulse.mode.mode.value }}</strong></span>
         <span class="pill {% if pulse.mode.kill_switch_active %}bad{% else %}good{% endif %}">Kill switch <strong data-pulse="kill">{% if pulse.mode.kill_switch_active %}активен{% else %}выключен{% endif %}</strong></span>
         <span class="pill {% if pulse.open_alerts %}bad{% endif %}">Critical alerts <strong data-pulse="alerts">{{ pulse.open_alerts }}</strong></span>
         <span class="pill {% if pulse.approvals_pending %}warn{% endif %}">Ждут подтверждения <strong data-pulse="approvals">{{ pulse.approvals_pending }}</strong></span>
