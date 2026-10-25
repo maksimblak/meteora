@@ -688,7 +688,15 @@ class WorkerRuntime:
                 wide = [item for item in rest if bid_ask_range_fits(item.bin_step, rules)]
                 found = await first_candidate(group, wide, lambda: None)
                 if found is not None:
-                    await decide(found[1])
+                    _, wider = found
+                    self._log.info(
+                        "candidate_handed_over",
+                        pool_address=candidate.pool_address,
+                        bin_step=candidate.market.bin_step,
+                        to_pool_address=wider.pool_address,
+                        to_bin_step=wider.market.bin_step,
+                    )
+                    await decide(wider)
 
         await asyncio.gather(
             *(

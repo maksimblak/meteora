@@ -179,6 +179,27 @@ def test_a_main_pool_too_narrow_for_bid_ask_hands_over_to_a_pool_that_holds_the_
     assert world.onchain.reads == Counter({MINT_A.root: 2})  # the hand-over is checked in depth
 
 
+def test_the_hand_over_skips_a_wide_pool_failing_a_cheap_filter_and_records_its_reject() -> None:
+    world = World(
+        [
+            pool_history(P1, MINT_A, hour_fees="100", tvl="150000"),
+            # Wide enough, but below the 500 000 market-cap minimum.
+            pool_history(P2, MINT_A, hour_fees="300", tvl="150000", market_cap="100000"),
+            pool_history(P3, MINT_A, hour_fees="300", tvl="160000", bin_step=100),
+        ]
+    )
+
+    world.cycle()
+
+    (main,) = world.records(P3)
+    (skipped,) = world.records(P2)
+    (entered,) = world.records(P1)
+    assert main.decision.reasons == (RejectionCode.RANGE_TOO_NARROW,)
+    assert RejectionCode.MARKET_CAP_BELOW_THRESHOLD in skipped.decision.reasons
+    assert entered.decision.status is CandidateStatus.ACCEPT, entered.decision.reasons
+    assert len(world.repos.mode.open_positions()) == 1
+
+
 def test_no_hand_over_when_no_pool_holds_the_range_or_the_strategy_refused_more() -> None:
     narrow = World(
         [
