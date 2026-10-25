@@ -12,11 +12,13 @@ mints, comma-separated) answers a list of tokens, and of each, by ``id``:
   and ``devBalancePercentage`` (percent); ``firstPool.createdAt``.
 
 Jupiter leaves zeros and false flags out of its answer. A window with no trades is
-``{"volumeChange": -100}``, so inside a window that is there an absent volume or count is
-zero, and a missing window is unknown. ``mintAuthorityDisabled`` is absent while the
-authority is live, and ``mintAuthority`` then names it: an authority is REVOKED only on
-``...Disabled: true``, PRESENT only when the address is named, UNKNOWN otherwise. An absent
-percentage is unknown, never zero.
+``{"volumeChange": -100}``, or no ``stats5m`` at all when nothing changed either (150 of the
+500 top tokens of the live universe that day, each with its ``stats1h``): inside a window
+an absent volume or count is zero, and so is an absent window of a token that has any
+window; a token without one is unknown (a changed format). ``mintAuthorityDisabled`` is
+absent while the authority is live, and ``mintAuthority`` then names it: an authority is
+REVOKED only on ``...Disabled: true``, PRESENT only when the address is named, UNKNOWN
+otherwise. An absent percentage is unknown, never zero.
 
 Limits as documented on 2026-10-25: 0.5 requests a second without a key, 1 with a free key
 (header ``x-api-key``); the client keeps 80% of that. Nothing here raises into the cycle:
@@ -62,6 +64,7 @@ RATE_LIMIT_FALLBACK = timedelta(seconds=60)
 RATE_LIMIT_CEILING = timedelta(minutes=5)
 _HUNDRED = Decimal(100)
 _LABELS = {item.value: item for item in OrganicScoreLabel}
+_STATS = ("stats5m", "stats1h", "stats6h", "stats24h")
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -69,9 +72,12 @@ Sleep = Callable[[float], Awaitable[None]]
 class JupiterTokensProvider:
     """``prefetch(mints)`` for a cycle, then ``reading(mint)`` without a request (T22).
 
-    * one search per ``batch_size`` mints not held fresh, under one shared rate limiter;
-    * a good reading is held for ``cache_ttl``; a token Jupiter does not list, or a batch
-      that failed, is held as its failure reading for the same time, so the cycle shows why;
+    * one search per ``batch_size`` mints whose reading is older than ``cache_ttl`` (or that
+      have none), under one shared rate limiter;
+    * a reading is served for ``stale_after``: longer than ``cache_ttl``, so a reading the
+      cycle's prefetch kept is still there when the cycle screens its last pool; a token
+      Jupiter does not list, or a batch that failed, is held as its failure reading, so the
+      cycle shows why;
     * ``429``: no request until ``x-ratelimit-reset`` (or a minute), at most five minutes;
     * timeouts, outages, refusals and broken payloads count towards the circuit breaker.
     """
@@ -84,13 +90,14 @@ class JupiterTokensProvider:
         api_key: SecretStr | None = None,
         sleep: Sleep = asyncio.sleep,
         cache_ttl: timedelta = timedelta(minutes=2),
+        stale_after: timedelta = timedelta(minutes=5),
         batch_size: int = MAX_BATCH,
         timeout: float = 10,
         failure_threshold: int = 3,
         recovery_timeout: float = 60,
     ) -> None:
-        if cache_ttl <= timedelta(0):
-            raise ValueError("cache_ttl must be positive")
+        if cache_ttl <= timedelta(0) or stale_after < cache_ttl:
+            raise ValueError("cache_ttl must be positive and stale_after at least cache_ttl")
         if not 1 <= batch_size <= MAX_BATCH:
             raise ValueError(f"batch_size must be between 1 and {MAX_BATCH}")
         if timeout <= 0:
@@ -99,6 +106,7 @@ class JupiterTokensProvider:
         self._clock = clock
         self._api_key = api_key
         self._cache_ttl = cache_ttl
+        self._stale_after = stale_after
         self._batch_size = batch_size
         self._timeout = timeout
         rate = KEY_REQUESTS_PER_SECOND if api_key is not None else KEYLESS_REQUESTS_PER_SECOND
@@ -127,28 +135,29 @@ class JupiterTokensProvider:
         return self._breaker.health
 
     def reading(self, mint: PublicKey) -> JupiterTokenReading | None:
-        """The reading of ``mint`` held at most ``cache_ttl``: good or its failure."""
+        """The reading of ``mint`` held at most ``stale_after``: good or its failure."""
 
         held = self._readings.get(mint.root)
-        if held is None or self._clock.now() - held.source_at >= self._cache_ttl:
+        if held is None or self._clock.now() - held.source_at >= self._stale_after:
             return None
         return held
 
     async def prefetch(self, mints: Sequence[str]) -> None:
-        """Ask Jupiter for every mint without a good reading held; one cycle at a time."""
+        """Ask Jupiter for every mint without a good reading younger than ``cache_ttl``."""
 
         async with self._lock:
             now = self._clock.now()
             self._readings = {
                 key: item
                 for key, item in self._readings.items()
-                if now - item.source_at < self._cache_ttl
+                if now - item.source_at < self._stale_after
             }
             wanted = [
                 mint
                 for mint in dict.fromkeys(mints)
                 if (held := self._readings.get(mint)) is None
                 or held.freshness is not Freshness.FRESH
+                or now - held.source_at >= self._cache_ttl
             ]
             for start in range(0, len(wanted), self._batch_size):
                 await self._read_batch(wanted[start : start + self._batch_size])
@@ -225,6 +234,13 @@ class JupiterTokensProvider:
         if log:
             self._log.warning("jupiter_tokens_unavailable", detail=detail, tokens=len(mints))
         for mint in mints:
+            held = self._readings.get(mint)
+            if (
+                held is not None
+                and held.freshness is Freshness.FRESH
+                and now - held.source_at < self._stale_after
+            ):
+                continue  # a refresh failed: the good reading still serves until stale
             self._readings[mint] = JupiterTokenReading(
                 mint=PublicKey(mint),
                 provider=PROVIDER,
@@ -251,8 +267,11 @@ def _pause(response: httpx.Response, now: datetime) -> timedelta:
 def _reading(item: Mapping[str, Any], mint: str, source_at: datetime) -> JupiterTokenReading:
     """One listed token; a field in another shape is left unknown, never guessed."""
 
-    short = _mapping(item.get("stats5m"))
-    hour = _mapping(item.get("stats1h"))
+    # An absent window of a token with stats had nothing in it; no window at all is unknown.
+    has_stats = any(_mapping(item.get(name)) is not None for name in _STATS)
+    empty: Mapping[str, Any] | None = {} if has_stats else None
+    short = _mapping(item.get("stats5m")) or empty
+    hour = _mapping(item.get("stats1h")) or empty
     audit = _mapping(item.get("audit")) or {}
     label = item.get("organicScoreLabel")
     values: dict[str, Any] = {

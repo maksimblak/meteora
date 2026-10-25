@@ -1138,11 +1138,14 @@ def build_token_sources(
     if url:
         client = httpx.AsyncClient(base_url=url, headers=headers, transport=transport)
         clients.append(client)
+        cache_ttl = _seconds(environ, JUPITER_CACHE_ENV, 120)
         jupiter = JupiterTokensProvider(
             client,
             clock=clock,
             api_key=config.jupiter_api_key,
-            cache_ttl=_seconds(environ, JUPITER_CACHE_ENV, 120),
+            cache_ttl=cache_ttl,
+            # Served this long: a cycle screens its last pool well after its prefetch.
+            stale_after=max(timedelta(minutes=5), cache_ttl * 2),
         )
         log.info("token_source", source="jupiter", key=config.jupiter_api_key is not None)
     rugcheck: RugCheckProvider | None = None

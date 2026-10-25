@@ -163,6 +163,35 @@ def test_a_window_without_trades_is_zero_and_an_absent_percentage_is_unknown() -
     assert musk.developer_share == RAW["MUSK"]["audit"]["devBalancePercentage"] / 100
 
 
+def test_a_quiet_token_without_its_5m_window_traded_nothing_in_it() -> None:
+    # Live, 2026-10-25: 150 of the top 500 tokens came with stats1h/6h/24h and no stats5m.
+    quiet, bare = mint_number(81).root, mint_number(82).root
+    body = [
+        {
+            "id": quiet,
+            "stats1h": {"buyVolume": 4440.524725865277, "sellVolume": 10.51470129835926,
+                        "numBuys": 75, "numSells": 3, "numTraders": 5},
+            "stats24h": {"buyVolume": 9000.5, "numBuys": 120},
+        },
+        {"id": bare, "organicScore": 12.5},
+    ]
+    api = Api(lambda request: httpx.Response(200, json=body))
+
+    async def steps(provider: JupiterTokensProvider, clock: FrozenClock) -> Any:
+        await provider.prefetch([quiet, bare])
+        return read(provider, quiet), read(provider, bare)
+
+    quiet_reading, bare_reading = scenario(api, steps)
+
+    assert (quiet_reading.volume_5m_usd, quiet_reading.trades_5m) == (Decimal(0), 0)
+    assert quiet_reading.volume_1h_usd == Decimal("4440.524725865277") + Decimal(
+        "10.51470129835926"
+    )
+    # No window at all: unknown, not zero - a token Jupiter keeps no stats for.
+    assert (bare_reading.volume_5m_usd, bare_reading.volume_1h_usd) == (None, None)
+    assert bare_reading.freshness is Freshness.FRESH
+
+
 def test_more_tokens_than_one_search_takes_go_in_searches_of_a_hundred() -> None:
     api = Api(lambda request: httpx.Response(200, json=[]))
     mints = [mint_number(1000 + index).root for index in range(150)]
@@ -192,7 +221,7 @@ def test_the_keyless_rate_stays_below_half_a_request_a_second() -> None:
     assert waited == [timedelta(seconds=5)]
 
 
-def test_a_good_reading_is_held_and_asked_again_only_after_it_expires() -> None:
+def test_a_reading_is_asked_again_after_two_minutes_and_served_until_five() -> None:
     api = Api()
 
     async def steps(provider: JupiterTokensProvider, clock: FrozenClock) -> Any:
@@ -200,17 +229,42 @@ def test_a_good_reading_is_held_and_asked_again_only_after_it_expires() -> None:
         clock.advance(timedelta(seconds=119))
         await provider.prefetch([MINT["BTC"]])
         held = len(api.requests)
-        clock.advance(timedelta(seconds=1))
-        expired = provider.reading(PublicKey(MINT["BTC"]))
+        # The cycle that kept the 119 s old reading screens its last pool a minute later.
+        clock.advance(timedelta(seconds=61))
+        mid_cycle = read(provider, "BTC").source_at
         await provider.prefetch([MINT["BTC"]])
-        return held, expired, read(provider, "BTC").source_at
+        refreshed = read(provider, "BTC").source_at
+        clock.advance(timedelta(minutes=5))
+        return held, mid_cycle, refreshed, provider.reading(PublicKey(MINT["BTC"]))
 
-    held, expired, again = scenario(api, steps)
+    held, mid_cycle, refreshed, stale = scenario(api, steps)
 
     assert held == 1
-    assert expired is None  # two minutes old: no longer fresh, not served as fresh
+    assert mid_cycle == NOW  # 180 s old, still served: it broke whole cycles before
     assert len(api.requests) == 2
-    assert again == NOW + timedelta(seconds=120)
+    assert refreshed == NOW + timedelta(seconds=180)
+    assert stale is None  # five minutes without a prefetch: no longer served
+
+
+def test_a_failed_refresh_keeps_the_good_reading_until_it_is_stale() -> None:
+    answers = [Api.recorded]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return answers.pop(0)(request) if answers else httpx.Response(429)
+
+    async def steps(provider: JupiterTokensProvider, clock: FrozenClock) -> Any:
+        await provider.prefetch([MINT["BTC"]])
+        clock.advance(timedelta(seconds=150))
+        await provider.prefetch([MINT["BTC"]])  # refresh refused: 429
+        kept = read(provider, "BTC")
+        clock.advance(timedelta(minutes=3))
+        await provider.prefetch([MINT["BTC"]])  # the good one is stale now
+        return kept, read(provider, "BTC")
+
+    kept, failed = scenario(Api(handler), steps)
+
+    assert (kept.freshness, kept.source_at) == (Freshness.FRESH, NOW)
+    assert (failed.freshness, failed.detail) == (Freshness.STALE, "RATE_LIMITED")
 
 
 def test_a_429_pauses_every_search_until_the_reset() -> None:
