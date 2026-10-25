@@ -1,57 +1,75 @@
 {% extends "base.html" %}
 {% from "_alerts.html" import alert_list %}
+{% from "_ui.html" import icon, pill %}
 {% block title %}Настройки{% endblock %}
 {% block content %}
-<h1>Действующая конфигурация</h1>
-<p>Правила <strong>{{ config.ruleset_version }}</strong> · конфигурация {{ config.config_version }}</p>
-<p>Kill switch: {% if config.kill_switch.active %}<strong class="bad">{{ config.kill_switch.label }}</strong>{% else %}{{ config.kill_switch.label }}{% endif %}</p>
+<div class="page-head">
+  <div>
+    <h1>Действующая конфигурация</h1>
+    <p class="sub">Правила <strong>{{ config.ruleset_version }}</strong> · конфигурация {{ config.config_version }}</p>
+  </div>
+  <span class="pill {% if config.kill_switch.active %}bad{% else %}good{% endif %}">Kill switch: <strong>{{ config.kill_switch.label }}</strong></span>
+</div>
 
 <section class="grid">
   <div class="card">
     <h2>Секреты (только наличие)</h2>
+    <div class="table-wrap">
     <table>
       <tr><th>Имя</th><th>В этом api</th><th>Нужен сервису</th></tr>
       {% for item in config.secrets %}
-        <tr><td><code>{{ item.name }}</code></td><td>{% if item.configured %}<span class="ok">задан</span>{% else %}<span class="muted">не задан</span>{% endif %}</td><td class="muted small">{{ item.used_by | join(', ') or 'пока не используется' }}</td></tr>
+        <tr><td><code>{{ item.name }}</code></td><td>{% if item.configured %}<span class="pill good">задан</span>{% else %}<span class="pill">не задан</span>{% endif %}</td><td class="muted small">{{ item.used_by | join(', ') or 'пока не используется' }}</td></tr>
       {% endfor %}
     </table>
-    <p class="muted small">Значения секретов не показываются нигде: ни здесь, ни в API, ни в логах (и в трассах ошибок). Секрет сервиса, которому api его не передаёт (например, GMGN_API_KEY — только worker), здесь всегда «не задан»: проверяйте его в логах и статусе worker.</p>
+    </div>
+    <p class="muted small" style="margin-top: 10px">Значения секретов не показываются нигде: ни здесь, ни в API, ни в логах (и в трассах ошибок). Секрет сервиса, которому api его не передаёт (например, GMGN_API_KEY — только worker), здесь всегда «не задан»: проверяйте его в логах и статусе worker.</p>
   </div>
   <div class="card">
     <h2>Готовность режимов</h2>
+    <ul class="rows">
     {% for item in config.readiness %}
-      <h3>{{ item.mode.value }}: {% if item.ready %}<span class="ok">готов</span>{% else %}<span class="bad">не готов</span>{% endif %}</h3>
-      {% if item.missing %}<p>Не хватает переменных: {% for name in item.missing %}<code>{{ name }}</code> {% endfor %}</p>{% endif %}
-      {% for note in item.notes %}<p class="muted small">{{ note.message }} <code>{{ note.code }}</code></p>{% endfor %}
+      <li>
+        <strong>{{ item.mode.value }}</strong>
+        {% if item.ready %}<span class="pill good">готов</span>{% else %}<span class="pill bad">не готов</span>{% endif %}
+        {% if item.missing %}<div class="detail">Не хватает переменных: {% for name in item.missing %}<code>{{ name }}</code> {% endfor %}</div>{% endif %}
+        {% for note in item.notes %}<div class="detail">{{ note.message }} <code>{{ note.code }}</code></div>{% endfor %}
+      </li>
     {% endfor %}
+    </ul>
   </div>
 </section>
 
 <section class="card">
   <h2>Параметры</h2>
+  <div class="table-wrap">
   <table>
     {% for key, value in config.settings.items() %}
       <tr><td><code>{{ key }}</code></td><td>{{ value if value is not none else '—' }}</td></tr>
     {% endfor %}
   </table>
+  </div>
 </section>
 
 <section class="card">
   <h2>Пороги правил</h2>
+  <div class="stack">
   {% for group, values in config.thresholds.items() %}
     <details><summary>{{ group }}</summary><pre>{{ values | tojson(indent=2) }}</pre></details>
   {% endfor %}
+  </div>
 </section>
 
 <section class="card">
   <h2>Журнал режимов</h2>
   {% if journal.transitions %}
+    <div class="table-wrap">
     <table>
       <tr><th>Время</th><th>Из</th><th>В</th><th>Повышение</th><th>Причина</th><th>Evidence</th></tr>
       {% for t in journal.transitions %}
-        <tr><td>{{ t.occurred_at | dt }}</td><td>{{ t.from_mode.value }}</td><td>{{ t.to_mode.value }}</td><td>{{ 'да' if t.promotion else 'нет' }}</td><td>{{ t.reason }}</td><td><code>{{ t.evidence_id or '—' }}</code></td></tr>
+        <tr><td class="nowrap">{{ t.occurred_at | dt }}</td><td>{{ pill(t.from_mode.value) }}</td><td>{{ pill(t.to_mode.value) }}</td><td>{{ 'да' if t.promotion else 'нет' }}</td><td>{{ t.reason }}</td><td><code>{{ t.evidence_id or '—' }}</code></td></tr>
       {% endfor %}
     </table>
+    </div>
   {% else %}<p class="muted">Переходов не было: система работает в начальном режиме SHADOW.</p>{% endif %}
 </section>
 

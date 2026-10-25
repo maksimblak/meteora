@@ -1,25 +1,33 @@
 {% extends "base.html" %}
+{% from "_ui.html" import icon, pill %}
 {% block title %}P&amp;L{% endblock %}
 {% block content %}
-<h1>Результаты и сравнение с HODL</h1>
+<div class="page-head">
+  <div>
+    <h1>Результаты и сравнение с HODL</h1>
+    <p class="sub">{{ view.window_start | dt }} — {{ view.window_end | dt }} · открытых позиций сейчас: {{ view.open_positions }}</p>
+  </div>
+</div>
 <form method="get" action="/performance" class="filters">
   <label>Окно, дней <input type="number" name="days" min="1" max="365" value="{{ days }}"></label>
   <button type="submit">Показать</button>
 </form>
-<p class="muted">{{ view.window_start | dt }} — {{ view.window_end | dt }} · открытых позиций сейчас: {{ view.open_positions }}. Популяции (правила, режим) не смешиваются. Прошлый результат не обещает будущей прибыли.</p>
+<p class="muted small">Популяции (правила, режим) не смешиваются. Прошлый результат не обещает будущей прибыли.</p>
 {% if not view.groups %}
-  <p class="card muted">Закрытых позиций в окне нет — сравнивать пока нечего.</p>
+  <div class="card empty">{{ icon('pnl') }}<p>Закрытых позиций в окне нет — сравнивать пока нечего.</p></div>
 {% else %}
+<div class="table-wrap">
 <table>
-  <tr><th>Правила</th><th>Режим</th><th>Закрыто</th><th>В плюс</th><th>Net P&amp;L</th><th>HODL</th><th>vs HODL</th><th>Комиссии</th><th>Divergence</th><th>Издержки</th><th>Expectancy</th><th>Max DD</th></tr>
+  <tr><th>Правила</th><th>Режим</th><th class="num">Закрыто</th><th class="num">В плюс</th><th class="num">Net P&amp;L</th><th class="num">HODL</th><th class="num">vs HODL</th><th class="num">Комиссии</th><th class="num">Divergence</th><th class="num">Издержки</th><th class="num">Expectancy</th><th class="num">Max DD</th></tr>
   {% for g in view.groups %}
   <tr>
-    <td>{{ g.ruleset_version }}</td><td>{{ g.mode.value }}</td><td>{{ g.completed_positions }}</td><td>{{ g.winning_positions }}</td>
-    <td>{{ g.net_pnl_base_units | dec(0) }}</td><td>{{ g.hodl_pnl_base_units | dec(0) }}</td><td>{{ g.excess_vs_hodl_base_units | dec(0) }}</td>
-    <td>{{ g.fee_income_base_units | dec(0) }}</td><td>{{ g.divergence_loss_base_units | dec(0) }}</td><td>{{ g.total_costs_base_units | dec(0) }}</td>
-    <td>{{ g.expectancy_base_units | dec(0) }}</td><td>{{ g.maximum_drawdown_base_units | dec(0) }}</td>
+    <td class="nowrap">{{ g.ruleset_version }}</td><td>{{ pill(g.mode.value) }}</td><td class="num">{{ g.completed_positions }}</td><td class="num">{{ g.winning_positions }}</td>
+    <td class="num {{ g.net_pnl_base_units | sign }}">{{ g.net_pnl_base_units | dec(0) | grp }}</td><td class="num {{ g.hodl_pnl_base_units | sign }}">{{ g.hodl_pnl_base_units | dec(0) | grp }}</td><td class="num {{ g.excess_vs_hodl_base_units | sign }}">{{ g.excess_vs_hodl_base_units | dec(0) | grp }}</td>
+    <td class="num">{{ g.fee_income_base_units | dec(0) | grp }}</td><td class="num">{{ g.divergence_loss_base_units | dec(0) | grp }}</td><td class="num">{{ g.total_costs_base_units | dec(0) | grp }}</td>
+    <td class="num {{ g.expectancy_base_units | sign }}">{{ g.expectancy_base_units | dec(0) | grp }}</td><td class="num">{{ g.maximum_drawdown_base_units | dec(0) | grp }}</td>
   </tr>
   {% endfor %}
 </table>
+</div>
 {% endif %}
 {% endblock %}

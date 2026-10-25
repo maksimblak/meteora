@@ -1,9 +1,15 @@
 {% extends "base.html" %}
+{% from "_ui.html" import icon, addr, pill %}
 {% block title %}Пулы{% endblock %}
 {% block content %}
-<h1>DLMM-пулы</h1>
+<div class="page-head">
+  <div>
+    <h1>DLMM-пулы</h1>
+    <p class="sub">{{ pill(universe.state) }} Последняя синхронизация: {{ universe.last_sync_at | dt }} · всего пулов: {{ universe.pool_count | string | grp }}</p>
+  </div>
+</div>
 <form method="get" action="/pools" class="filters">
-  <label>Поиск по адресу или mint <input name="q" value="{{ query or '' }}" maxlength="64"></label>
+  <label>Поиск по адресу или mint <input name="q" value="{{ query or '' }}" maxlength="64" placeholder="адрес пула или mint токена"></label>
   <button type="submit">Найти</button>
 </form>
 
@@ -23,27 +29,31 @@
     {% endif %}
   </div>
 {% else %}
-  <p class="muted">Последняя синхронизация: {{ universe.last_sync_at | dt }} · всего пулов: {{ universe.pool_count }} · {{ universe.message }}</p>
+  <p class="muted small">{{ universe.message }}</p>
+  <div class="table-wrap">
   <table>
-    <tr><th>Пул</th><th>TVL</th><th>Объём 24ч</th><th>Цена</th><th>Bin step</th><th>Свежесть</th><th>Качество</th><th>Решение</th></tr>
+    <tr><th>Пул</th><th class="num">TVL</th><th class="num">Объём 24ч</th><th class="num">Цена</th><th class="num">Bin step</th><th>Свежесть</th><th>Качество</th><th>Решение</th></tr>
     {% for pool in page.items %}
     <tr>
-      <td><a href="/pools/{{ pool.address }}"><code>{{ pool.address }}</code></a></td>
-      <td>{{ pool.tvl | dec(2) }}</td>
-      <td>{{ pool.volume_24h | dec(2) }}</td>
-      <td>{{ pool.price | dec }}</td>
-      <td>{{ pool.bin_step }}</td>
-      <td>{{ pool.freshness }}</td>
-      <td>{{ pool.data_quality }}</td>
-      <td>{% if pool.decision_id %}<a href="/decisions/{{ pool.decision_id }}">{{ pool.decision_label }}</a>{% else %}<span class="muted">ещё не оценён</span>{% endif %}</td>
+      <td>{{ addr(pool.address, '/pools/' ~ pool.address) }}</td>
+      <td class="num">{{ pool.tvl | dec(2) | grp }}</td>
+      <td class="num">{{ pool.volume_24h | dec(2) | grp }}</td>
+      <td class="num">{{ pool.price | dec }}</td>
+      <td class="num">{{ pool.bin_step }}</td>
+      <td>{{ pill(pool.freshness) }}</td>
+      <td>{{ pill(pool.data_quality) }}</td>
+      <td>{% if pool.decision_id %}<a href="/decisions/{{ pool.decision_id }}" class="pill {{ pool.decision_status | tone }}">{{ pool.decision_label }}</a>{% else %}<span class="muted">ещё не оценён</span>{% endif %}</td>
     </tr>
     {% endfor %}
   </table>
+  </div>
+  {% if page.next_cursor %}<p class="pager"><a href="/pools?cursor={{ page.next_cursor }}{% if query %}&q={{ query | urlencode }}{% endif %}">Следующая страница →</a></p>{% endif %}
   {% if universe.reject_reasons %}
+    <div class="card">
     <details><summary>Причины отсева по категориям</summary>
       <ul>{% for item in universe.reject_reasons %}<li>{{ item.label }} <code>{{ item.code }}</code>: {{ item.count }}</li>{% endfor %}</ul>
     </details>
+    </div>
   {% endif %}
-  {% if page.next_cursor %}<p><a href="/pools?cursor={{ page.next_cursor }}{% if query %}&q={{ query | urlencode }}{% endif %}">Следующая страница →</a></p>{% endif %}
 {% endif %}
 {% endblock %}

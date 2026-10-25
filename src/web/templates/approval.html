@@ -1,8 +1,15 @@
 {% extends "base.html" %}
+{% from "_ui.html" import icon, addr, pill %}
 {% block title %}Подтверждение команды{% endblock %}
 {% block content %}
 {% set p = preview %}
-<h1>Команда {{ p.operation }} · {{ p.phase_label }}</h1>
+<div class="page-head">
+  <div>
+    <h1>Команда {{ p.operation }} · {{ p.phase_label }}</h1>
+    <p class="sub">Пул {{ addr(p.pool_address, '/pools/' ~ p.pool_address) }} · кошелёк {{ addr(p.wallet_address) }}{% if p.position_address %} · позиция {{ addr(p.position_address) }}{% endif %}{% if p.decision_id %} · <a href="/decisions/{{ p.decision_id }}">решение</a>{% endif %}</p>
+  </div>
+  <span class="pill {% if p.seconds_left > 0 %}warn{% else %}bad{% endif %}">Осталось <strong data-countdown="{{ p.seconds_left }}">{{ p.seconds_left }}</strong> с</span>
+</div>
 
 <section class="card danger">
   <h2>Необратимо</h2>
@@ -38,50 +45,59 @@
 <section class="grid">
   <div class="card">
     <h2>Срок</h2>
-    <p>Команда истекает: {{ p.command_expires_at | dt }}</p>
-    <p>Симуляция действительна до: {{ p.simulation_expires_at | dt }}</p>
-    <p>Подтверждение будет действовать до: <strong>{{ p.approval_expires_at | dt }}</strong></p>
-    <p>Осталось: <strong data-countdown="{{ p.seconds_left }}">{{ p.seconds_left }}</strong> с</p>
+    <dl class="kv">
+      <dt>Команда истекает</dt><dd>{{ p.command_expires_at | dt }}</dd>
+      <dt>Симуляция действительна до</dt><dd>{{ p.simulation_expires_at | dt }}</dd>
+      <dt>Подтверждение будет действовать до</dt><dd><strong>{{ p.approval_expires_at | dt }}</strong></dd>
+    </dl>
   </div>
   <div class="card">
     <h2>Издержки</h2>
     {% set c = p.costs %}
-    <p>Сетевая комиссия {{ c.network_fee_lamports }} lamports · priority {{ c.priority_fee_lamports }} lamports · compute units {{ c.compute_units }}</p>
-    <p>Price impact {{ c.price_impact_bps if c.price_impact_bps is not none else 'не измерен' }} bps при лимите {{ c.max_slippage_bps }} bps</p>
-    <p>Расчётный убыток при инвалидации: {{ c.estimated_loss_base_units if c.estimated_loss_base_units is not none else '—' }}</p>
+    <dl class="kv">
+      <dt>Сетевая комиссия</dt><dd class="num">{{ c.network_fee_lamports }} lamports</dd>
+      <dt>Priority</dt><dd class="num">{{ c.priority_fee_lamports }} lamports</dd>
+      <dt>Compute units</dt><dd class="num">{{ c.compute_units }}</dd>
+      <dt>Price impact</dt><dd class="num">{{ c.price_impact_bps if c.price_impact_bps is not none else 'не измерен' }} bps при лимите {{ c.max_slippage_bps }} bps</dd>
+      <dt>Расчётный убыток при инвалидации</dt><dd class="num">{{ c.estimated_loss_base_units if c.estimated_loss_base_units is not none else '—' }}</dd>
+    </dl>
   </div>
 </section>
 
 <section class="card">
   <h2>План и команда</h2>
-  <p>Пул <code>{{ p.pool_address }}</code> · кошелёк <code>{{ p.wallet_address }}</code>{% if p.position_address %} · позиция <code>{{ p.position_address }}</code>{% endif %}{% if p.decision_id %} · <a href="/decisions/{{ p.decision_id }}">решение</a>{% endif %}</p>
+  <div class="table-wrap">
   <table>
     <tr><th>Поле</th><th>План</th><th>Команда</th><th>Симуляция</th><th></th></tr>
     {% for row in p.plan_diff %}
       <tr class="{% if row.matches is false %}triggered{% endif %}"><td>{{ row.field }}</td><td>{{ row.planned or '—' }}</td><td>{{ row.command or '—' }}</td><td>{{ row.simulated or '—' }}</td>
-      <td>{% if row.matches is true %}<span class="ok">совпадает</span>{% elif row.matches is false %}<strong class="bad">расходится</strong>{% endif %}</td></tr>
+      <td>{% if row.matches is true %}<span class="pill good">совпадает</span>{% elif row.matches is false %}<span class="pill bad">расходится</span>{% endif %}</td></tr>
     {% endfor %}
   </table>
+  </div>
 </section>
 
 <section class="card">
-  <h2>Симуляция</h2>
-  <p>{% if p.simulation_success %}<span class="ok">успешна</span>{% else %}<strong class="bad">ошибка</strong>{% endif %}</p>
+  <div class="card-head"><h2>Симуляция</h2>{% if p.simulation_success %}<span class="pill good">успешна</span>{% else %}<span class="pill bad">ошибка</span>{% endif %}</div>
+  <div class="table-wrap">
   <table>{% for field in p.simulation %}<tr><td><code>{{ field.name }}</code></td><td>{{ field.value }}</td></tr>{% endfor %}</table>
-  {% for error in p.simulation_errors %}<p class="bad">{{ error.code }}: {{ error.message }}</p>{% endfor %}
-  <p class="muted small">command digest <code>{{ p.command_digest }}</code><br>simulation digest <code>{{ p.simulation_digest }}</code></p>
+  </div>
+  {% for error in p.simulation_errors %}<p class="bad" style="margin-top: 8px">{{ error.code }}: {{ error.message }}</p>{% endfor %}
+  <p class="muted small" style="margin-top: 10px">command digest <code>{{ p.command_digest }}</code><br>simulation digest <code>{{ p.simulation_digest }}</code></p>
 </section>
 
 {% if p.gmgn %}
 <section class="card">
   <h2>Метрики GMGN</h2>
+  <div class="table-wrap">
   <table><tr><th>Метрика</th><th>Значение</th><th>Порог</th></tr>
   {% for item in p.gmgn %}<tr><td>{{ item.name }}</td><td>{{ item.value }}</td><td>{{ item.threshold or '—' }}</td></tr>{% endfor %}
   </table>
+  </div>
 </section>
 {% endif %}
 
-<section class="card">
+<section class="card {% if p.phase == 'AWAITING_APPROVAL' and logged_in %}danger{% endif %}">
   <h2>Ручная проверка и подтверждение</h2>
   {% if p.phase != 'AWAITING_APPROVAL' %}
     <p>Команда уже в состоянии «{{ p.phase_label }}» — повторное подтверждение не создаётся.</p>

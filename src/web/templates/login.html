@@ -1,16 +1,26 @@
 {% extends "base.html" %}
+{% from "_ui.html" import icon %}
 {% block title %}Вход{% endblock %}
 {% block content %}
-<h1>Вход оператора</h1>
+<div class="login-wrap">
 {% if not auth_configured %}
-  <p class="card warn">Вход закрыт: не задан токен оператора (APP_OPERATOR_TOKEN). Просмотр доступен без входа.</p>
+  <div class="card warn">
+    <h1>Вход оператора</h1>
+    <p>Вход закрыт: не задан токен оператора (APP_OPERATOR_TOKEN). Просмотр доступен без входа.</p>
+  </div>
 {% else %}
-  {% if failed %}<p class="flash bad">Неверный токен оператора.</p>{% endif %}
-  <form method="post" action="/login" class="card">
-    <input type="hidden" name="next" value="{{ next }}">
-    <label>Токен оператора <input type="password" name="token" autocomplete="off" required autofocus></label>
-    <button type="submit">Войти</button>
-  </form>
+  <div class="card">
+    <div style="margin-bottom: 14px"><span class="brand-mark">{{ icon('lock') }}</span></div>
+    <h1>Вход оператора</h1>
+    <p class="muted small">Токен из APP_OPERATOR_TOKEN открывает действия: режим, kill switch, подтверждения.</p>
+    {% if failed %}<p class="flash bad" style="margin-top: 12px">Неверный токен оператора.</p>{% endif %}
+    <form method="post" action="/login">
+      <input type="hidden" name="next" value="{{ next }}">
+      <label>Токен оператора <input type="password" name="token" autocomplete="off" required autofocus></label>
+      <button type="submit">{{ icon('login') }}Войти</button>
+    </form>
+  </div>
   <p class="muted small">Сессия хранится в HttpOnly-cookie; каждое действие дополнительно защищено CSRF-токеном.</p>
 {% endif %}
+</div>
 {% endblock %}

@@ -1,7 +1,13 @@
 {% extends "base.html" %}
+{% from "_ui.html" import icon, addr, pill %}
 {% block title %}Подтверждения{% endblock %}
 {% block content %}
-<h1>Очередь подтверждений</h1>
+<div class="page-head">
+  <div>
+    <h1>Очередь подтверждений</h1>
+    <p class="sub">В режиме APPROVAL каждая on-chain команда ждёт ручного подтверждения по свежей симуляции.</p>
+  </div>
+</div>
 {% if queue.blockers %}
 <section class="card warn">
   <h2>Почему команды сейчас не готовы к подтверждению</h2>
@@ -12,26 +18,30 @@
 <section class="card">
   <h2>Ждут подтверждения</h2>
   {% if queue.pending %}
+  <div class="table-wrap">
   <table>
     <tr><th>Команда</th><th>Операция</th><th>Пул</th><th>Симуляция</th><th>Истекает</th></tr>
     {% for item in queue.pending %}
-      <tr><td><a href="/approvals/{{ item.command_id }}"><code>{{ item.command_id }}</code></a></td><td>{{ item.operation }}</td><td><code>{{ item.pool_address[:8] }}…</code></td><td>{{ item.simulated_at | dt }}</td><td>{{ item.command_expires_at | dt }}</td></tr>
+      <tr><td><a href="/approvals/{{ item.command_id }}"><code>{{ item.command_id }}</code></a></td><td>{{ pill(item.operation) }}</td><td>{{ addr(item.pool_address, '/pools/' ~ item.pool_address) }}</td><td class="nowrap">{{ item.simulated_at | dt }}</td><td class="nowrap">{{ item.command_expires_at | dt }}</td></tr>
     {% endfor %}
   </table>
+  </div>
   {% else %}
-    <p class="muted">Нет команд, ждущих подтверждения.</p>
+    <div class="empty">{{ icon('approvals') }}<p>Нет команд, ждущих подтверждения.</p></div>
   {% endif %}
 </section>
 
 <section class="card">
   <h2>Недавние</h2>
   {% if queue.recent %}
+  <div class="table-wrap">
   <table>
     <tr><th>Команда</th><th>Операция</th><th>Состояние</th><th>Симуляция</th></tr>
     {% for item in queue.recent %}
-      <tr><td><a href="/approvals/{{ item.command_id }}"><code>{{ item.command_id }}</code></a></td><td>{{ item.operation }}</td><td>{{ item.phase_label }}</td><td>{{ item.simulated_at | dt }}</td></tr>
+      <tr><td><a href="/approvals/{{ item.command_id }}"><code>{{ item.command_id }}</code></a></td><td>{{ pill(item.operation) }}</td><td>{{ item.phase_label }}</td><td class="nowrap">{{ item.simulated_at | dt }}</td></tr>
     {% endfor %}
   </table>
+  </div>
   {% else %}<p class="muted">Нет.</p>{% endif %}
 </section>
 {% endblock %}

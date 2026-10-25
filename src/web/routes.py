@@ -5,6 +5,7 @@ and its CSRF token; successful actions redirect (POST -> 303 -> GET), so refresh
 page shows the state of the original request instead of repeating it (G02.2).
 """
 
+import hashlib
 import re
 from collections.abc import Callable
 from datetime import datetime
@@ -83,11 +84,87 @@ def _percent(value: Decimal | None) -> str:
     return f"{_format_decimal(value * 100, 2)}%"
 
 
+_PLAIN_NUMBER = re.compile(r"(-?)(\d+)(\.\d+)?")
+
+
+def _grouped(text: str) -> str:
+    """``1234567.5`` -> ``1 234 567.5`` (narrow no-break spaces); anything else as is."""
+
+    match = _PLAIN_NUMBER.fullmatch(text)
+    if match is None:
+        return text
+    sign, whole, fraction = match.groups()
+    return f"{sign}{int(whole):,}".replace(",", " ") + (fraction or "")
+
+
+def _short_address(value: str | None) -> str:
+    if not value:
+        return "—"
+    return value if len(value) <= 12 else f"{value[:4]}…{value[-4:]}"
+
+
+def _sign(value: Decimal | int | None) -> str:
+    """CSS class of a money value: gains green, losses red, zero and unknown plain."""
+
+    if value is None or value == 0:
+        return ""
+    return "pos" if value > 0 else "neg"
+
+
+def _ago(seconds: int | None) -> str:
+    """``95`` -> ``1 мин 35 с``: an age a viewer reads at a glance."""
+
+    if seconds is None:
+        return "—"
+    if seconds < 60:
+        return f"{seconds} с"
+    if seconds < 3600:
+        return f"{seconds // 60} мин {seconds % 60} с"
+    return f"{seconds // 3600} ч {seconds % 3600 // 60} мин"
+
+
+_TONES = {
+    "good": frozenset("OK FRESH ACCEPT OPEN READY COMPLETE CLEAR".split()),
+    "warn": frozenset(
+        "DEGRADED STALE WARMING_UP UNKNOWN NOT_CONFIGURED NOT_SYNCED PARTIAL INCOMPLETE"
+        " NO_DECISION APPROVAL".split()
+    ),
+    "bad": frozenset("DOWN REJECT MISSING UNAVAILABLE EXPIRED FAILED LIVE".split()),
+    "info": frozenset({"SHADOW"}),
+}
+
+
+def _tone(value: object) -> str:
+    """Colour of a status pill for a code (``FRESH`` -> ``good``); unknown codes are plain."""
+
+    code = str(getattr(value, "value", value) or "").upper()
+    for tone, codes in _TONES.items():
+        if code in codes:
+            return tone
+    return "plain"
+
+
+def _static_version() -> str:
+    """Digest of the panel's CSS/JS: ``?v=`` makes browsers drop a cached old version."""
+
+    digest = hashlib.sha256()
+    for path in sorted((_HERE / "static").iterdir()):
+        if path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
 TEMPLATES.env.filters["dt"] = _format_datetime
 TEMPLATES.env.filters["dec"] = _format_decimal
 TEMPLATES.env.filters["pct"] = _percent
+TEMPLATES.env.filters["grp"] = _grouped
+TEMPLATES.env.filters["short"] = _short_address
+TEMPLATES.env.filters["sign"] = _sign
+TEMPLATES.env.filters["tone"] = _tone
+TEMPLATES.env.filters["ago"] = _ago
 TEMPLATES.env.globals["labels"] = labels
 TEMPLATES.env.globals["navigation"] = NAVIGATION
+TEMPLATES.env.globals["static_version"] = _static_version()
 
 
 def _services(request: Request) -> OperatorServices:
@@ -193,8 +270,10 @@ def install_web(app: FastAPI) -> None:
 
     @router.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request) -> Response:
-        status = await current_status(_services(request))
-        return await render(request, "dashboard.html", status=status)
+        services = _services(request)
+        status = await current_status(services)
+        recent = await services.reads.decisions(cursor=None, limit=8, status=None, pool=None)
+        return await render(request, "dashboard.html", status=status, recent=recent.items)
 
     @router.get("/pools", response_class=HTMLResponse)
     async def pools(request: Request) -> Response:

@@ -1,49 +1,67 @@
 <!doctype html>
+{% from "_ui.html" import icon %}
+{% set NAV_ICONS = {'/': 'overview', '/pools': 'pools', '/decisions': 'decisions', '/approvals': 'approvals', '/positions': 'positions', '/performance': 'pnl', '/mode': 'mode', '/settings': 'settings'} %}
+{% set MODE_TONES = {'SHADOW': 'info', 'APPROVAL': 'warn', 'LIVE': 'bad'} %}
 <html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0a0d14">
   {% if csrf_token %}<meta name="csrf-token" content="{{ csrf_token }}">{% endif %}
   <title>{% block title %}Операторская панель{% endblock %} · Meteora Volume Bot</title>
-  <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="/static/app.css">
-  <script src="/static/app.js" defer></script>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23ffc046'/%3E%3Cstop offset='.5' stop-color='%23ff6a3d'/%3E%3Cstop offset='1' stop-color='%23ec3f6b'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='9' fill='url(%23g)'/%3E%3Cpath d='M9 22L21 10M14 23l7-7M9 17l5-5' stroke='%23fff' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+  <script src="/static/theme.js?v={{ static_version }}"></script>
+  <link rel="stylesheet" href="/static/app.css?v={{ static_version }}">
+  <script src="/static/app.js?v={{ static_version }}" defer></script>
 </head>
 <body>
-<header class="topbar">
-  <a class="brand" href="/">Meteora Volume Bot</a>
-  <nav>
-    {% for path, title in navigation %}
-      <a href="{{ path }}" class="{% if current_path == path or (path != '/' and current_path.startswith(path)) %}active{% endif %}">{{ title }}</a>
-    {% endfor %}
-  </nav>
-  <div class="session">
-    {% if logged_in %}
-      <form method="post" action="/logout" class="inline">
-        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
-        <button type="submit" class="link">Выйти</button>
-      </form>
-    {% elif auth_configured %}
-      <a href="/login?next={{ current_path | urlencode }}">Вход оператора</a>
-    {% else %}
-      <span class="muted" title="APP_OPERATOR_TOKEN не задан">действия закрыты</span>
-    {% endif %}
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="/">
+      <span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 17L16 7M10.5 18l6-6M6 12.5l4-4"/></svg></span>
+      <span class="brand-name">Meteora<small>Volume Bot · DLMM</small></span>
+    </a>
+    <nav class="nav" aria-label="Разделы панели">
+      {% for path, title in navigation %}
+        <a href="{{ path }}" class="{% if current_path == path or (path != '/' and current_path.startswith(path)) %}active{% endif %}">{{ icon(NAV_ICONS.get(path, 'overview')) }}<span>{{ title }}</span></a>
+      {% endfor %}
+    </nav>
+    <div class="sidebar-foot">Время — UTC</div>
+  </aside>
+
+  <div class="content">
+    <header class="topbar">
+      {% if pulse %}
+      <div class="statusbar" data-stream="/api/v1/stream/status">
+        <span class="pill bare live"><span data-pulse="time">{{ pulse.generated_at | dt }}</span></span>
+        <span class="pill {{ MODE_TONES.get(pulse.mode.mode.value, '') }}">Режим <strong data-pulse="mode">{{ pulse.mode.mode.value }}</strong></span>
+        <span class="pill {% if pulse.mode.kill_switch_active %}bad{% else %}good{% endif %}">Kill switch <strong data-pulse="kill">{% if pulse.mode.kill_switch_active %}активен{% else %}выключен{% endif %}</strong></span>
+        <span class="pill {% if pulse.open_alerts %}bad{% endif %}">Critical alerts <strong data-pulse="alerts">{{ pulse.open_alerts }}</strong></span>
+        <span class="pill {% if pulse.approvals_pending %}warn{% endif %}">Ждут подтверждения <strong data-pulse="approvals">{{ pulse.approvals_pending }}</strong></span>
+        <span class="pill {{ pulse.universe_state | tone }}">Universe <strong data-pulse="universe">{{ pulse.universe_state }}</strong></span>
+      </div>
+      {% endif %}
+      <div class="tools">
+        <button type="button" class="ghost icon-btn theme-toggle" data-theme-toggle title="Светлая / тёмная тема" aria-label="Переключить тему">{{ icon('moon', 'moon') }}{{ icon('sun', 'sun') }}</button>
+        {% if logged_in %}
+          <form method="post" action="/logout" class="inline">
+            <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+            <button type="submit" class="ghost">{{ icon('logout') }}Выйти</button>
+          </form>
+        {% elif auth_configured %}
+          <a class="ghost" href="/login?next={{ current_path | urlencode }}">{{ icon('login') }}Вход оператора</a>
+        {% else %}
+          <span class="pill bare" title="APP_OPERATOR_TOKEN не задан">{{ icon('lock') }}действия закрыты</span>
+        {% endif %}
+      </div>
+    </header>
+
+    <main>
+      {% if done %}<div class="flash ok">{{ icon('check') }}{{ done }}</div>{% endif %}
+      {% block content %}{% endblock %}
+    </main>
+    <footer>Время — UTC. Денежные значения — base units котируемого токена ({{ units | dec }} base units = 1 единица), если не указано иное.</footer>
   </div>
-</header>
-{% if pulse %}
-<div class="statusbar" data-stream="/api/v1/stream/status">
-  <span>Режим: <strong data-pulse="mode">{{ pulse.mode.mode.value }}</strong></span>
-  <span>Kill switch: <strong data-pulse="kill" class="{% if pulse.mode.kill_switch_active %}bad{% else %}ok{% endif %}">{% if pulse.mode.kill_switch_active %}активен{% else %}выключен{% endif %}</strong></span>
-  <span>Critical alerts: <strong data-pulse="alerts">{{ pulse.open_alerts }}</strong></span>
-  <span>Ждут подтверждения: <strong data-pulse="approvals">{{ pulse.approvals_pending }}</strong></span>
-  <span>Universe: <strong data-pulse="universe">{{ pulse.universe_state }}</strong></span>
-  <span class="muted" data-pulse="time">{{ pulse.generated_at | dt }}</span>
 </div>
-{% endif %}
-<main>
-  {% if done %}<div class="flash ok">{{ done }}</div>{% endif %}
-  {% block content %}{% endblock %}
-</main>
-<footer class="muted">Время — UTC. Денежные значения — base units котируемого токена ({{ units | dec }} base units = 1 единица), если не указано иное.</footer>
 </body>
 </html>

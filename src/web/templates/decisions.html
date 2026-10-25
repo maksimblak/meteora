@@ -1,7 +1,13 @@
 {% extends "base.html" %}
+{% from "_ui.html" import icon, addr, pill %}
 {% block title %}Решения{% endblock %}
 {% block content %}
-<h1>Решения</h1>
+<div class="page-head">
+  <div>
+    <h1>Решения</h1>
+    <p class="sub">Журнал отбора: каждый цикл кандидатов worker записывает решение по пулу.</p>
+  </div>
+</div>
 <form method="get" action="/decisions" class="filters">
   <label>Статус
     <select name="status">
@@ -9,28 +15,30 @@
       {% for item in statuses %}<option value="{{ item }}" {% if status == item %}selected{% endif %}>{{ labels.label(labels.CANDIDATE_STATUS, item) }}</option>{% endfor %}
     </select>
   </label>
-  <label>Пул <input name="pool" value="{{ pool or '' }}" maxlength="44"></label>
+  <label>Пул <input name="pool" value="{{ pool or '' }}" maxlength="44" placeholder="адрес пула"></label>
   <button type="submit">Показать</button>
 </form>
 {% if not page.items %}
-  <p class="card muted">Решений{% if status or pool %} по фильтру{% endif %} пока нет: worker записывает решение после каждого цикла кандидатов.</p>
+  <div class="card empty">{{ icon('inbox') }}<p>Решений{% if status or pool %} по фильтру{% endif %} пока нет: worker записывает решение после каждого цикла кандидатов.</p></div>
 {% else %}
+<div class="table-wrap">
 <table>
-  <tr><th>Время</th><th>Пул</th><th>Статус</th><th>Score</th><th>Причины</th><th>Нет сигналов</th><th>Флаги</th><th>Правила</th><th>Свежесть</th></tr>
+  <tr><th>Время</th><th>Пул</th><th>Статус</th><th class="num">Score</th><th>Причины</th><th>Нет сигналов</th><th>Флаги</th><th>Правила</th><th>Свежесть</th></tr>
   {% for d in page.items %}
   <tr>
-    <td><a href="/decisions/{{ d.decision_id }}">{{ d.decided_at | dt }}</a></td>
-    <td><a href="/pools/{{ d.pool_address }}"><code>{{ d.pool_address[:8] }}…</code></a></td>
-    <td class="status-{{ d.status | lower }}">{{ d.status_label }}</td>
-    <td>{{ d.score | dec(4) }}</td>
-    <td>{% for reason in d.reasons %}<span class="tag" title="{{ reason.code }}">{{ reason.message }}</span>{% endfor %}</td>
-    <td>{{ d.missing_signals | join(', ') or '—' }}</td>
-    <td>{% for flag in d.flags %}<span class="tag warn">{{ flag.message }}</span>{% endfor %}</td>
-    <td>{{ d.ruleset_version }}</td>
-    <td>{{ d.freshness }}</td>
+    <td class="nowrap"><a href="/decisions/{{ d.decision_id }}">{{ d.decided_at | dt }}</a></td>
+    <td>{{ addr(d.pool_address, '/pools/' ~ d.pool_address) }}</td>
+    <td class="status-{{ d.status | lower }}"><span class="pill {{ d.status | tone }}">{{ d.status_label }}</span></td>
+    <td class="num">{{ d.score | dec(4) }}</td>
+    <td class="wide">{% for reason in d.reasons %}<span class="tag" title="{{ reason.code }}">{{ reason.message }}</span>{% endfor %}</td>
+    <td class="small muted mid">{{ d.missing_signals | join(', ') or '—' }}</td>
+    <td class="mid">{% for flag in d.flags %}<span class="tag warn">{{ flag.message }}</span>{% endfor %}</td>
+    <td class="nowrap small">{{ d.ruleset_version }}</td>
+    <td>{{ pill(d.freshness) }}</td>
   </tr>
   {% endfor %}
 </table>
-{% if page.next_cursor %}<p><a href="/decisions?cursor={{ page.next_cursor }}{% if status %}&status={{ status }}{% endif %}{% if pool %}&pool={{ pool }}{% endif %}">Следующая страница →</a></p>{% endif %}
+</div>
+{% if page.next_cursor %}<p class="pager"><a href="/decisions?cursor={{ page.next_cursor }}{% if status %}&status={{ status }}{% endif %}{% if pool %}&pool={{ pool }}{% endif %}">Следующая страница →</a></p>{% endif %}
 {% endif %}
 {% endblock %}

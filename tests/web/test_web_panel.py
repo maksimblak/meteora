@@ -83,6 +83,18 @@ def test_first_screen_shows_services_mode_kill_switch_and_warm_up(panel: Panel) 
     assert OPERATOR_TOKEN not in text
 
 
+def test_the_overview_tells_a_viewer_what_is_happening_now(panel: Panel) -> None:
+    scenario = populated(panel.harness)
+
+    text = panel.get("/").text
+
+    assert "Что происходит сейчас" in text
+    assert "реальные деньги не тратятся" in text  # SHADOW in plain words
+    assert "Последние решения бота" in text
+    assert f'href="/decisions/{scenario.accepted.decision_id}"' in text
+    assert "data-autorefresh" in text
+
+
 def test_every_screen_renders_in_russian_with_data(panel: Panel) -> None:
     scenario = populated(panel.harness)
     position_id = scenario.accepted.entry.position_id

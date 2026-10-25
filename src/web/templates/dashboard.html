@@ -1,67 +1,92 @@
 {% extends "base.html" %}
 {% from "_alerts.html" import alert_list %}
+{% from "_ui.html" import icon, pill %}
 {% block title %}Обзор{% endblock %}
 {% block content %}
-<h1>Обзор</h1>
-
-<section class="grid">
-  <div class="card">
-    <h2>Режим</h2>
-    <p class="big">{{ status.mode.mode.value }}</p>
-    <p>{{ status.mode.label }}</p>
-    <p>Kill switch: {% if status.mode.kill_switch_active %}<strong class="bad">активен</strong>{% else %}<span class="ok">выключен</span>{% endif %}</p>
-    <p>Дневной стоп: {% if status.risk.daily_stop_active %}<strong class="bad">сработал</strong>{% else %}нет{% endif %}</p>
-    <p class="muted">Правила {{ status.ruleset_version }} · конфигурация {{ status.config_version }}</p>
-    <p><a href="/mode">Режим и kill switch →</a></p>
+{% set risk = status.risk %}
+{% set universe = status.universe %}
+<div class="page-head">
+  <div>
+    <h1>Обзор</h1>
+    <p class="sub">Правила {{ status.ruleset_version }} · конфигурация {{ status.config_version }}</p>
   </div>
+  <a class="card-link" href="/mode">Режим и kill switch →</a>
+</div>
 
-  <div class="card">
-    <h2>Сервисы</h2>
-    <ul class="plain">
-    {% for service in status.services %}
-      <li><strong>{{ service.name }}</strong>:
-        <span class="state-{{ service.status | lower }}">{{ service.status }}</span>
-        {% for reason in service.reasons %}<div class="muted small">{{ reason.message }} <code>{{ reason.code }}</code></div>{% endfor %}
-      </li>
-    {% endfor %}
-    </ul>
+{% set counts = universe.decision_counts %}
+{% set accepted = counts.get('ACCEPT', 0) %}
+{% set mode = status.mode.mode.value %}
+<section class="card now" data-autorefresh="60">
+  <div class="card-head">
+    <h2>Что происходит сейчас</h2>
+    <span class="muted small" data-autorefresh-note>обновляется само раз в минуту</span>
   </div>
-
-  <div class="card">
-    <h2>Universe</h2>
-    <p><strong>{{ status.universe.state }}</strong> — {{ status.universe.message }}</p>
-    <p>Пулов в последнем снимке: {{ status.universe.pool_count }}</p>
-    <p>Последняя синхронизация: {{ status.universe.last_sync_at | dt }}{% if status.universe.sync_age_seconds is not none %} ({{ status.universe.sync_age_seconds }} с назад){% endif %}</p>
-    {% if status.universe.decision_counts %}
-      <p>Последние решения по пулам:
-      {% for code, count in status.universe.decision_counts.items() %}
-        <span class="tag">{{ labels.label(labels.CANDIDATE_STATUS, code) }}: {{ count }}</span>
-      {% endfor %}</p>
-    {% endif %}
-    {% if status.universe.reject_reasons %}
-      <h3>Причины отсева</h3>
-      <ul class="plain">
-      {% for item in status.universe.reject_reasons[:8] %}
-        <li>{{ item.label }} <code>{{ item.code }}</code>: {{ item.count }}</li>
-      {% endfor %}
-      </ul>
-    {% endif %}
-    {% if status.universe.state != "FRESH" %}
-      <p class="muted">Синхронизацию выполняет worker по расписанию (WORKER_UNIVERSE_INTERVAL_SECONDS); страница обновит статус сама.</p>
-    {% endif %}
-    <p><a href="/pools">Пулы →</a></p>
+  {% if status.mode.kill_switch_active %}
+    {% set badge, sentence, tone = labels.KILL_SWITCH_PLAIN + ('bad',) %}
+  {% else %}
+    {% set badge, sentence = labels.MODE_PLAIN[mode] %}
+    {% set tone = mode | tone %}
+  {% endif %}
+  <p class="now-lead"><span class="pill {{ tone }}">{{ badge }}</span> {{ sentence }}</p>
+  <ol class="funnel">
+    <li>
+      <span class="step">1 · Сканирует</span>
+      <span class="count">{{ universe.pool_count | string | grp }}</span>
+      <span class="what">пулов Meteora в последнем снимке{% if universe.sync_age_seconds is not none %}, {{ universe.sync_age_seconds | ago }} назад{% endif %}</span>
+    </li>
+    <li>
+      <span class="step">2 · Отсеивает</span>
+      <span class="count">{{ counts.get('REJECT', 0) | string | grp }}</span>
+      <span class="what">не прошли строгие фильтры{% if counts.get('WARMING_UP', 0) %}; ещё {{ counts.get('WARMING_UP') | string | grp }} копят историю{% endif %}{% if counts.get('UNKNOWN', 0) %}; по {{ counts.get('UNKNOWN') | string | grp }} не хватает данных{% endif %}</span>
+    </li>
+    <li class="{% if accepted %}hit{% endif %}">
+      <span class="step">3 · Находит</span>
+      <span class="count">{{ accepted | string | grp }}</span>
+      <span class="what">{% if accepted %}подходят для входа{% else %}подходящих нет — бот ждёт, это нормально при строгих порогах{% endif %}</span>
+    </li>
+    <li class="{% if risk.open_positions %}hit{% endif %}">
+      <span class="step">4 · Держит</span>
+      <span class="count">{{ risk.open_positions }} <small>/ {{ risk.maximum_positions }}</small></span>
+      <span class="what">{% if risk.open_positions %}позиций открыто{% else %}позиций пока нет{% endif %}{% if risk.pending_entries %}, {{ risk.pending_entries }} ждут входа{% endif %}</span>
+    </li>
+  </ol>
+  {% if status.readiness or status.alerts or status.approvals_pending or risk.daily_stop_active %}
+  <div class="chips" style="margin-top: 14px">
+    {% if risk.daily_stop_active %}<span class="pill bad">дневной стоп сработал — новых входов сегодня нет</span>{% endif %}
+    {% if status.alerts %}<span class="pill bad">{{ status.alerts | length }} критич. событий</span>{% endif %}
+    {% if status.approvals_pending %}<a class="pill warn" href="/approvals">{{ status.approvals_pending }} ждут подтверждения</a>{% endif %}
+    {% if status.readiness %}<span class="pill warn">{{ status.readiness | length }} помех работе режима — ниже</span>{% endif %}
   </div>
+  {% endif %}
+</section>
 
-  <div class="card">
-    <h2>Риск</h2>
-    <p>Позиции: {{ status.risk.open_positions }} открыто, {{ status.risk.pending_entries }} в очереди из {{ status.risk.maximum_positions }}</p>
-    {% if status.risk.risk_day %}
-      <p>Risk day {{ status.risk.risk_day }}: стартовый equity {{ status.risk.starting_equity | dec }}, консервативный P&amp;L {{ status.risk.conservative_pnl | dec }}</p>
-      <p>Использовано дневного стопа {{ status.risk.daily_stop_fraction | pct }}: <strong>{{ status.risk.daily_stop_used | pct }}</strong></p>
+<section class="tiles">
+  <div class="tile accent">
+    <div class="label">{{ icon('mode') }}Режим</div>
+    <div class="value">{{ status.mode.mode.value }}</div>
+    <div class="hint">{{ status.mode.label }}</div>
+  </div>
+  <div class="tile {% if status.mode.kill_switch_active %}bad{% else %}good{% endif %}">
+    <div class="label">{{ icon('power') }}Kill switch</div>
+    <div class="value">{% if status.mode.kill_switch_active %}активен{% else %}выключен{% endif %}</div>
+    <div class="hint">Дневной стоп: {% if risk.daily_stop_active %}<strong class="bad">сработал</strong>{% else %}нет{% endif %}</div>
+  </div>
+  <div class="tile">
+    <div class="label">{{ icon('shield') }}Дневной стоп</div>
+    {% if risk.daily_stop_used is not none %}
+      {% set share = (risk.daily_stop_used / risk.daily_stop_fraction * 100) if risk.daily_stop_fraction else 0 %}
+      {% set share = [[share, 0] | max, 100] | min %}
+      <div class="value">{{ risk.daily_stop_used | pct }} <small>из {{ risk.daily_stop_fraction | pct }}</small></div>
+      <div class="meter {% if share >= 75 %}bad{% elif share >= 40 %}warn{% endif %}"><span style="width: {{ share | round(1) }}%"></span></div>
     {% else %}
-      <p class="muted">Risk day ещё не открыт: новые входы закрыты до первой оценки портфеля.</p>
+      <div class="value">— <small>из {{ risk.daily_stop_fraction | pct }}</small></div>
+      <div class="hint">risk day не открыт</div>
     {% endif %}
-    <p><a href="/positions">Позиции →</a> · <a href="/performance">P&amp;L →</a></p>
+  </div>
+  <div class="tile">
+    <div class="label">{{ icon('pnl') }}Консерв. P&amp;L дня</div>
+    <div class="value {{ risk.conservative_pnl | sign }}">{{ risk.conservative_pnl | dec(0) | grp }}</div>
+    <div class="hint">equity {{ risk.starting_equity | dec(0) | grp }}</div>
   </div>
 </section>
 
@@ -74,10 +99,90 @@
 </section>
 {% endif %}
 
+<section class="grid">
+  <div class="card">
+    <div class="card-head"><h2>Последние решения бота</h2><a class="card-link" href="/decisions">Все решения →</a></div>
+    {% if recent %}
+    <ul class="feed">
+      {% for d in recent %}
+      <li>
+        <span class="time">{{ d.decided_at.strftime('%H:%M:%S') }}</span>
+        <span class="pill {{ d.status | tone }}">{{ d.status_label }}</span>
+        <a href="/decisions/{{ d.decision_id }}" title="{{ d.pool_address }}"><code>{{ d.pool_address | short }}</code></a>
+        <span class="why" title="{{ d.reasons | map(attribute='message') | join('; ') }}">{% if d.reasons %}{{ d.reasons[0].message }}{% if d.reasons | length > 1 %} <span class="muted">и ещё {{ d.reasons | length - 1 }}</span>{% endif %}{% elif d.status == 'ACCEPT' %}прошёл все фильтры{% endif %}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+      <p class="muted">Решений пока нет: первые появятся после прогрева пулов (около 40 минут после старта).</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Сервисы</h2></div>
+    <ul class="rows">
+    {% for service in status.services %}
+      <li>
+        <strong>{{ service.name }}</strong>
+        <span class="pill {{ service.status | tone }} state-{{ service.status | lower }}">{{ service.status }}</span>
+        {% for reason in service.reasons %}<div class="detail">{{ reason.message }} <code>{{ reason.code }}</code></div>{% endfor %}
+      </li>
+    {% endfor %}
+    </ul>
+  </div>
+</section>
+
+<section class="grid">
+  <div class="card">
+    <div class="card-head"><h2>Universe</h2><a class="card-link" href="/pools">Пулы →</a></div>
+    <p>{{ pill(universe.state) }} {{ universe.message }}</p>
+    <dl class="kv">
+      <dt>Пулов в последнем снимке</dt><dd class="num">{{ universe.pool_count | string | grp }}</dd>
+      <dt>Последняя синхронизация</dt><dd>{{ universe.last_sync_at | dt }}{% if universe.sync_age_seconds is not none %} <span class="muted">({{ universe.sync_age_seconds }} с назад)</span>{% endif %}</dd>
+    </dl>
+    {% if universe.state != "FRESH" %}
+      <p class="muted small" style="margin-top: 10px">Синхронизацию выполняет worker по расписанию (WORKER_UNIVERSE_INTERVAL_SECONDS); страница обновит статус сама.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Риск</h2><span class="card-link"><a href="/positions">Позиции →</a> · <a href="/performance">P&amp;L →</a></span></div>
+    <dl class="kv">
+      <dt>Открыто позиций</dt><dd class="num">{{ risk.open_positions }} из {{ risk.maximum_positions }}</dd>
+      <dt>В очереди на вход</dt><dd class="num">{{ risk.pending_entries }}</dd>
+      {% if risk.risk_day %}
+      <dt>Risk day</dt><dd>{{ risk.risk_day }}</dd>
+      <dt>Стартовый equity</dt><dd class="num">{{ risk.starting_equity | dec | grp }}</dd>
+      <dt>Консервативный P&amp;L</dt><dd class="num {{ risk.conservative_pnl | sign }}">{{ risk.conservative_pnl | dec | grp }}</dd>
+      <dt>Использовано дневного стопа {{ risk.daily_stop_fraction | pct }}</dt><dd class="num"><strong>{{ risk.daily_stop_used | pct }}</strong></dd>
+      {% endif %}
+    </dl>
+    {% if not risk.risk_day %}
+      <p class="muted small" style="margin-top: 10px">Risk day ещё не открыт: новые входы закрыты до первой оценки портфеля.</p>
+    {% endif %}
+  </div>
+</section>
+
+{% if universe.reject_reasons %}
+{% set top = universe.reject_reasons[:8] %}
+{% set peak = top | map(attribute='count') | max %}
 <section class="card">
-  <h2>Critical alerts</h2>
+  <div class="card-head"><h2>Почему пулы отсеяны</h2><a class="card-link" href="/decisions?status=REJECT">Решения →</a></div>
+  <ul class="bars">
+  {% for item in top %}
+    <li>
+      <div class="bar-head"><span>{{ item.label }} <code>{{ item.code }}</code></span><span>{{ item.count | string | grp }}</span></div>
+      <div class="meter"><span style="width: {{ ((item.count / peak * 100) if peak else 0) | round(1) }}%"></span></div>
+    </li>
+  {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<section class="card">
+  <div class="card-head"><h2>Critical alerts</h2><a class="card-link" href="/settings">Журнал и настройки →</a></div>
   {{ alert_list(status.alerts, logged_in, csrf_field, csrf_token) }}
-  <p>Ждут подтверждения: {{ status.approvals_pending }} · <a href="/approvals">Подтверждения →</a> · <a href="/settings">Журнал и настройки →</a></p>
+  <p style="margin-top: 12px">Ждут подтверждения: <strong>{{ status.approvals_pending }}</strong> · <a href="/approvals">Подтверждения →</a></p>
 </section>
 
 {% if logged_in %}
@@ -85,12 +190,14 @@
   <h2>Аварийная остановка</h2>
   <form method="post" action="/kill-switch/activate" data-confirm="Включить kill switch? Новые входы остановятся немедленно.">
     <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
-    <label>Причина <input name="reason" required maxlength="500" value="ручная остановка оператором"></label>
-    <label>Открытые позиции
-      <select name="policy"><option value="HOLD_AND_ALERT">держать и оповестить</option><option value="ORDERLY_EXIT">упорядоченный выход</option></select>
-    </label>
-    <p class="muted">Выбор действует, пока kill switch включён. «Держать»: позиции не трогаются, бот только оповещает. «Упорядоченный выход»: каждая открытая позиция закрывается через свежую симуляцию; позицию режима APPROVAL — после вашего подтверждения.</p>
-    <button type="submit" class="danger">Включить kill switch</button>
+    <div class="grid" style="margin: 0">
+      <label>Причина <input name="reason" required maxlength="500" value="ручная остановка оператором"></label>
+      <label>Открытые позиции
+        <select name="policy"><option value="HOLD_AND_ALERT">держать и оповестить</option><option value="ORDERLY_EXIT">упорядоченный выход</option></select>
+      </label>
+    </div>
+    <p class="muted small">Выбор действует, пока kill switch включён. «Держать»: позиции не трогаются, бот только оповещает. «Упорядоченный выход»: каждая открытая позиция закрывается через свежую симуляцию; позицию режима APPROVAL — после вашего подтверждения.</p>
+    <button type="submit" class="danger">{{ icon('power') }}Включить kill switch</button>
   </form>
 </section>
 {% endif %}

@@ -1,12 +1,13 @@
 {# Open critical alerts with their IDs and, for a logged-in operator, the closing form. #}
 {% macro alert_list(alerts, logged_in, csrf_field, csrf_token) %}
   {% if alerts %}
+    <div class="table-wrap">
     <table>
       <tr><th>Время</th><th>Событие</th><th>Сообщение</th><th>ID</th></tr>
       {% for alert in alerts %}
-        <tr>
-          <td>{{ alert.created_at | dt }}</td>
-          <td>{{ alert.label or alert.code }} <code>{{ alert.code }}</code></td>
+        <tr class="triggered">
+          <td class="nowrap">{{ alert.created_at | dt }}</td>
+          <td><strong>{{ alert.label or alert.code }}</strong> <code>{{ alert.code }}</code></td>
           <td>{{ alert.message }}</td>
           <td><code>{{ alert.alert_id }}</code></td>
         </tr>
@@ -21,12 +22,13 @@
               <label class="check"><input type="checkbox" name="confirm" required> Подтверждаю: причина события разобрана</label>
               <button type="submit">Закрыть</button>
             </form>
-            <p class="muted small">Открытое критическое событие закрывает допуск в APPROVAL. Событие kill switch закрывается снятием kill switch.</p>
+            <p class="muted small" style="margin-top: 8px">Открытое критическое событие закрывает допуск в APPROVAL. Событие kill switch закрывается снятием kill switch.</p>
           </details>
         </td></tr>
         {% endif %}
       {% endfor %}
     </table>
+    </div>
   {% else %}
     <p class="muted">Открытых критических событий нет.</p>
   {% endif %}

@@ -1,28 +1,37 @@
 {% extends "base.html" %}
+{% from "_ui.html" import icon, addr, pill %}
 {% block title %}Позиции{% endblock %}
 {% block content %}
-<h1>Позиции</h1>
+<div class="page-head">
+  <div>
+    <h1>Позиции</h1>
+    <p class="sub">Net P&amp;L и сравнение с HODL — в base units котируемого токена.</p>
+  </div>
+  <a class="card-link" href="/performance">P&amp;L по правилам →</a>
+</div>
 {% if not page.items %}
-  <p class="card muted">Позиций пока нет: в SHADOW они появляются после принятого кандидата и paper-входа.</p>
+  <div class="card empty">{{ icon('positions') }}<p>Позиций пока нет: в SHADOW они появляются после принятого кандидата и paper-входа.</p></div>
 {% else %}
+<div class="table-wrap">
 <table>
-  <tr><th>Позиция</th><th>Пул</th><th>Статус</th><th>Режим</th><th>Открыта</th><th>Закрыта</th><th>Вложено</th><th>Net P&amp;L</th><th>HODL P&amp;L</th><th>vs HODL</th><th>Оценка</th></tr>
+  <tr><th>Позиция</th><th>Пул</th><th>Статус</th><th>Режим</th><th>Открыта</th><th>Закрыта</th><th class="num">Вложено</th><th class="num">Net P&amp;L</th><th class="num">HODL P&amp;L</th><th class="num">vs HODL</th><th>Оценка</th></tr>
   {% for p in page.items %}
   <tr>
-    <td><a href="/positions/{{ p.position_id }}"><code>{{ p.position_id[:10] }}…</code></a></td>
-    <td><a href="/pools/{{ p.pool_address }}"><code>{{ p.pool_address[:8] }}…</code></a></td>
-    <td>{{ p.status }}</td>
-    <td>{{ p.mode.value }}</td>
-    <td>{{ p.opened_at | dt }}</td>
-    <td>{{ p.closed_at | dt }}</td>
-    <td>{{ p.invested_base_units | dec(0) }}</td>
-    <td>{{ p.net_pnl_base_units | dec(0) }}</td>
-    <td>{{ p.hodl_pnl_base_units | dec(0) }}</td>
-    <td>{{ p.excess_vs_hodl_base_units | dec(0) }}</td>
-    <td>{% if p.valuation_source == 'UNAVAILABLE' %}<span class="bad">нет цены</span>{% elif p.valuation_source == 'OUTCOME' %}итог{% else %}по рынку{% endif %}</td>
+    <td><span class="addr"><a href="/positions/{{ p.position_id }}" title="{{ p.position_id }}"><code>{{ p.position_id[:10] }}…</code></a></span></td>
+    <td>{{ addr(p.pool_address, '/pools/' ~ p.pool_address) }}</td>
+    <td>{{ pill(p.status) }}</td>
+    <td>{{ pill(p.mode.value) }}</td>
+    <td class="nowrap">{{ p.opened_at | dt }}</td>
+    <td class="nowrap">{{ p.closed_at | dt }}</td>
+    <td class="num">{{ p.invested_base_units | dec(0) | grp }}</td>
+    <td class="num {{ p.net_pnl_base_units | sign }}">{{ p.net_pnl_base_units | dec(0) | grp }}</td>
+    <td class="num {{ p.hodl_pnl_base_units | sign }}">{{ p.hodl_pnl_base_units | dec(0) | grp }}</td>
+    <td class="num {{ p.excess_vs_hodl_base_units | sign }}">{{ p.excess_vs_hodl_base_units | dec(0) | grp }}</td>
+    <td>{% if p.valuation_source == 'UNAVAILABLE' %}<span class="pill bad">нет цены</span>{% elif p.valuation_source == 'OUTCOME' %}<span class="pill">итог</span>{% else %}<span class="pill info">по рынку</span>{% endif %}</td>
   </tr>
   {% endfor %}
 </table>
-{% if page.next_cursor %}<p><a href="/positions?cursor={{ page.next_cursor }}">Следующая страница →</a></p>{% endif %}
+</div>
+{% if page.next_cursor %}<p class="pager"><a href="/positions?cursor={{ page.next_cursor }}">Следующая страница →</a></p>{% endif %}
 {% endif %}
 {% endblock %}

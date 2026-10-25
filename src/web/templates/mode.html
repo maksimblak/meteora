@@ -1,10 +1,26 @@
 {% extends "base.html" %}
+{% from "_ui.html" import icon, pill %}
 {% block title %}Режим{% endblock %}
 {% block content %}
 {% set m = journal.mode %}
-<h1>Режим: {{ m.mode.value }}</h1>
-<p>{{ m.label }} · версия состояния {{ m.version }} · kill switch {% if m.kill_switch_active %}<strong class="bad">активен</strong>{% else %}выключен{% endif %}{% if m.daily_stop_date %} · дневной стоп {{ m.daily_stop_date }}{% endif %}</p>
-<p class="muted">SHADOW → APPROVAL → LIVE; понижение и аварийная остановка доступны всегда и применяются сразу, повышение требует evidence, повторного ввода токена и подтверждения.</p>
+{% set steps = ['SHADOW', 'APPROVAL', 'LIVE'] %}
+<div class="page-head">
+  <div>
+    <h1>Режим: {{ m.mode.value }}</h1>
+    <p class="sub">{{ m.label }} · версия состояния {{ m.version }} · kill switch {% if m.kill_switch_active %}<strong class="bad">активен</strong>{% else %}выключен{% endif %}{% if m.daily_stop_date %} · дневной стоп {{ m.daily_stop_date }}{% endif %}</p>
+  </div>
+</div>
+
+<section class="tiles">
+  {% for step in steps %}
+  <div class="tile {% if step == m.mode.value %}accent{% endif %}">
+    <div class="label">Шаг {{ loop.index }}</div>
+    <div class="value" style="{% if step != m.mode.value %}color: var(--faint){% endif %}">{{ step }}</div>
+    <div class="hint">{% if step == m.mode.value %}текущий режим{% elif loop.index0 < steps.index(m.mode.value) %}пройден{% else %}впереди{% endif %}</div>
+  </div>
+  {% endfor %}
+</section>
+<p class="muted small">SHADOW → APPROVAL → LIVE; понижение и аварийная остановка доступны всегда и применяются сразу, повышение требует evidence, повторного ввода токена и подтверждения.</p>
 
 {% if not logged_in %}
   <p class="card warn">{% if auth_configured %}<a href="/login?next=/mode">Войдите</a>, чтобы менять режим.{% else %}Действия закрыты: не задан APP_OPERATOR_TOKEN.{% endif %}</p>
@@ -13,19 +29,28 @@
 <section class="grid">
   <div class="card">
     <h2>Допуск в APPROVAL</h2>
-    <p>Записано дней shadow-наблюдений: {{ promotion.observation_days }} (минимум {{ promotion.minimum_days }}, рекомендуется {{ promotion.recommended_days }}).</p>
+    {% set days_share = [promotion.observation_days / (promotion.minimum_days or 1) * 100, 100] | min %}
+    <p>Записано дней shadow-наблюдений: <strong>{{ promotion.observation_days }}</strong> (минимум {{ promotion.minimum_days }}, рекомендуется {{ promotion.recommended_days }}).</p>
+    <div class="meter {% if days_share < 100 %}accent{% endif %}"><span style="width: {{ days_share | round(1) }}%"></span></div>
     {% if evidence %}
       <h3>Evidence <code>{{ evidence.evidence_id }}</code></h3>
-      <p>Полных дней {{ evidence.full_shadow_days }} · до минимума {{ evidence.minimum_days_remaining }} · до рекомендуемых {{ evidence.recommended_days_remaining }}</p>
-      <p>Позиции {{ evidence.completed_positions }}{% if evidence.insufficient_statistics %} (статистики недостаточно){% endif %} · решения {{ evidence.decision_count }} · net expectancy {{ evidence.net_expectancy | dec }} · max DD {{ evidence.maximum_drawdown | pct }} · покрытие {{ evidence.data_coverage | pct }}</p>
-      {% if evidence.allowed %}<p class="ok">Gate пройден.</p>{% else %}
-        <ul>{% for r in evidence.reasons %}<li>{{ r.message }} <code>{{ r.code }}</code></li>{% endfor %}</ul>
+      <dl class="kv">
+        <dt>Полных дней</dt><dd class="num">{{ evidence.full_shadow_days }}</dd>
+        <dt>До минимума / рекомендуемых</dt><dd class="num">{{ evidence.minimum_days_remaining }} / {{ evidence.recommended_days_remaining }}</dd>
+        <dt>Позиции</dt><dd class="num">{{ evidence.completed_positions }}{% if evidence.insufficient_statistics %} <span class="muted">(статистики недостаточно)</span>{% endif %}</dd>
+        <dt>Решения</dt><dd class="num">{{ evidence.decision_count }}</dd>
+        <dt>Net expectancy</dt><dd class="num {{ evidence.net_expectancy | sign }}">{{ evidence.net_expectancy | dec }}</dd>
+        <dt>Max DD</dt><dd class="num">{{ evidence.maximum_drawdown | pct }}</dd>
+        <dt>Покрытие</dt><dd class="num">{{ evidence.data_coverage | pct }}</dd>
+      </dl>
+      {% if evidence.allowed %}<p class="ok" style="margin-top: 10px">Gate пройден.</p>{% else %}
+        <ul style="margin-top: 10px">{% for r in evidence.reasons %}<li>{{ r.message }} <code>{{ r.code }}</code></li>{% endfor %}</ul>
       {% endif %}
     {% endif %}
     {% if logged_in and m.mode.value == 'SHADOW' %}
       <form method="post" action="/mode/evidence">
         <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
-        <button type="submit">Собрать evidence</button>
+        <button type="submit" class="secondary">Собрать evidence</button>
       </form>
       {% if evidence and evidence.allowed %}
       <form method="post" action="/mode/transitions" data-confirm="Повысить режим до APPROVAL?">
@@ -44,7 +69,7 @@
   <div class="card">
     <h2>Допуск в LIVE</h2>
     {% set live = promotion.live %}
-    <p>{% if live.ready %}<span class="ok">Evidence действителен</span>{% else %}<span class="bad">Не готов</span>{% endif %}{% if live.approval_cycles is not none %} · циклов APPROVAL {{ live.approval_cycles }}{% endif %}{% if live.expires_at %} · истекает {{ live.expires_at | dt }}{% endif %}</p>
+    <p>{% if live.ready %}<span class="pill good">Evidence действителен</span>{% else %}<span class="pill bad">Не готов</span>{% endif %}{% if live.approval_cycles is not none %} · циклов APPROVAL {{ live.approval_cycles }}{% endif %}{% if live.expires_at %} · истекает {{ live.expires_at | dt }}{% endif %}</p>
     <ul>{% for r in live.reasons %}<li>{{ r.message }} <code>{{ r.code }}</code></li>{% endfor %}</ul>
     {% if logged_in and m.mode.value == 'APPROVAL' and live.ready %}
       <form method="post" action="/mode/transitions" data-confirm="Повысить режим до LIVE? Сделки пойдут без ручного подтверждения.">
@@ -87,8 +112,8 @@
         <label>Открытые позиции
           <select name="policy"><option value="HOLD_AND_ALERT">держать и оповестить</option><option value="ORDERLY_EXIT">упорядоченный выход</option></select>
         </label>
-        <p class="muted">Выбор действует, пока kill switch включён. «Держать»: позиции не трогаются, бот только оповещает. «Упорядоченный выход»: каждая открытая позиция закрывается через свежую симуляцию; позицию режима APPROVAL — после вашего подтверждения.</p>
-        <button type="submit" class="danger">Включить kill switch</button>
+        <p class="muted small">Выбор действует, пока kill switch включён. «Держать»: позиции не трогаются, бот только оповещает. «Упорядоченный выход»: каждая открытая позиция закрывается через свежую симуляцию; позицию режима APPROVAL — после вашего подтверждения.</p>
+        <button type="submit" class="danger">{{ icon('power') }}Включить kill switch</button>
       </form>
     {% else %}
       <form method="post" action="/kill-switch/release" data-confirm="Снять kill switch? Новые входы снова станут возможны.">
@@ -106,10 +131,12 @@
 <section class="card">
   <h2>Журнал переходов</h2>
   {% if journal.transitions %}
+    <div class="table-wrap">
     <table>
       <tr><th>Время</th><th>Из</th><th>В</th><th>Причина</th></tr>
-      {% for t in journal.transitions %}<tr><td>{{ t.occurred_at | dt }}</td><td>{{ t.from_mode.value }}</td><td>{{ t.to_mode.value }}</td><td>{{ t.reason }}</td></tr>{% endfor %}
+      {% for t in journal.transitions %}<tr><td class="nowrap">{{ t.occurred_at | dt }}</td><td>{{ pill(t.from_mode.value) }}</td><td>{{ pill(t.to_mode.value) }}</td><td>{{ t.reason }}</td></tr>{% endfor %}
     </table>
+    </div>
   {% else %}<p class="muted">Переходов не было.</p>{% endif %}
 </section>
 {% endblock %}
